@@ -6,12 +6,24 @@
 #undef __HIP_NO_HALF_CONVERSIONS__
 #endif
 
-#define MMQ_USE_ROLLED_Q2_K
+#define MMQ_USE_ROLLED_Q2_K_LEGACY
 #include "mmq_core.cuh"
 
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+
+void launch_deepseek_q2_final_projection(
+    const char * packed,
+    const int * activations,
+    __hip_bfloat16 * output,
+    const int64_t * expert_indices,
+    const int32_t * expert_offsets,
+    int num_experts,
+    int num_groups,
+    int rows,
+    int64_t bytes_per_expert,
+    hipStream_t stream);
 
 namespace {
 
@@ -88,16 +100,31 @@ void launch_deepseek_grouped_projection(
                 stream);
         }
     } else if (type == GGML_TYPE_Q2_K && out_features == 4096 && in_features == 2048) {
-        launch_projection<GGML_TYPE_Q2_K, MMQ_J_TINY, 4096, 8>(
-            packed,
-            activations,
-            output,
-            expert_indices,
-            expert_offsets,
-            num_experts,
-            num_groups,
-            rows,
-            bytes_per_expert,
-            stream);
+        // Preserve the original factor-1 device instantiation and code-object layout.
+        if (rows < 0) {
+            launch_projection<GGML_TYPE_Q2_K, MMQ_J_TINY, 4096, 8>(
+                packed,
+                activations,
+                output,
+                expert_indices,
+                expert_offsets,
+                num_experts,
+                num_groups,
+                rows,
+                bytes_per_expert,
+                stream);
+        } else {
+            launch_deepseek_q2_final_projection(
+                packed,
+                activations,
+                output,
+                expert_indices,
+                expert_offsets,
+                num_experts,
+                num_groups,
+                rows,
+                bytes_per_expert,
+                stream);
+        }
     }
 }

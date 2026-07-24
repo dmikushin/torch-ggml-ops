@@ -325,6 +325,12 @@ Adding compile-time `N=4096` and eight K blocks to J32 reduced private storage f
 
 The gfx1151 compiler fully unrolled the eight Q2_K `k01` scale/min phases, generating a 34 KiB kernel with 404 private bytes and 109 spills even at J32. A generator-owned `#pragma unroll 1` on that Q2_K AMD WMMA loop reduces the exact kernel to 14 KiB, 122 VGPRs, 30 SGPRs, zero private bytes, zero spills, and no dynamic stack. It improves all 12 route points again: `24.052-26.861 ms` at batch 1, `79.920-87.187 ms` at batch 4, and `324.683-335.600 ms` at batch 16. Packed beats AITER at nine points, is within 6% at the other three batch-4 distributions, and remains bitwise exact. This is the first Q2_K candidate satisfying the production arithmetic resource gate.
 
+#### D3.8 partial Q2_K scale-loop unroll: factor 4 retained
+
+A fresh same-session `unroll 1` control at `/tmp/grouped_mmq_fwd_ds4_q2_unroll1_control.json` measured `23.954-26.719 ms`, `78.069-85.444 ms`, and `319.110-333.089 ms` for physical batches 1, 4, and 16. Explicit `unroll 2` remained spill-free at 158 VGPRs and 28 SGPRs, with a roughly 19 KiB arithmetic symbol. Its artifact `/tmp/grouped_mmq_fwd_ds4_q2_unroll2.json` is bitwise exact and improves the 12-point geometric mean by `1.28%`, but is rejected because factor 4 is uniformly faster.
+
+Explicit `unroll 4` uses 208 VGPRs and 38 SGPRs, has a roughly 24 KiB arithmetic symbol, and retains zero private bytes, zero spills, and no dynamic stack. `/tmp/grouped_mmq_fwd_ds4_q2_unroll4.json` is bitwise exact and improves every route: `17.5-19.1%` at batch 1 and `10.7-13.9%` at batches 4/16. Its 12-point geometric speedup is `1.145x` over factor 1 and `1.130x` over factor 2. Factor 4 is retained; the already-rejected automatic full unroll remains over the spill cliff at 404 private bytes and 109 spills.
+
 ### Phase D4: simple heuristics and integration
 
 After the three families have independent winners:
@@ -341,18 +347,18 @@ After the three families have independent winners:
 The accepted static dispatch is:
 - fixed Q8_0 `(1024,4096)`: J64.
 - routed IQ2_XXS `(2048,4096)`: exact J64 below `rows = 512 * num_groups`, exact J80 at and above that threshold.
-- routed Q2_K `(4096,2048)`: exact J32 with the rolled Q2_K scale/min loop.
+- routed Q2_K `(4096,2048)`: exact J32 with factor-4 Q2_K scale/min-loop unrolling; use a J16 tail body only when `rows < 64 * num_groups`.
 - every other supported shape: the existing bounds-safe generic path.
 
-The final 27-point artifact is `/tmp/grouped_mmq_fwd_ds4_final_isolated_full.json`. Every point remains bitwise exact against dense packed MMQ. Independent BF16 NRMSE is approximately `0.0060-0.0061` for Q8_0/IQ2_XXS and `0.0107-0.0114` for Q2_K.
+The final pre-bundle 27-point artifact is `/tmp/grouped_mmq_fwd_ds4_last_version_baseline.json`. All 39 fixed and paired projection checks remain bitwise exact against dense packed MMQ. Independent BF16 NRMSE is `0.006022-0.006062` for Q8_0/IQ2_XXS and `0.010685-0.011403` for Q2_K.
 
 | Family | Batch 1 packed ms | Batch 4 packed ms | Batch 16 packed ms | Baseline-to-final geometric speedup |
 | --- | ---: | ---: | ---: | ---: |
-| Fixed Q8_0 | `11.030` | `44.540` | `177.343` | `0.99x` |
-| IQ2_XXS pair | `32.278-35.664` | `84.627-100.815` | `338.571-346.709` | `1.53x` |
-| Q2_K down | `26.051-28.349` | `83.130-90.611` | `334.505-342.238` | `1.86x` |
+| Fixed Q8_0 | `11.030` | `44.488` | `176.170` | `1.00x` |
+| IQ2_XXS pair | `31.884-35.055` | `84.010-99.779` | `334.909-344.324` | `1.54x` |
+| Q2_K down | `18.421-21.496` | `72.219-76.700` | `290.493-295.563` | `2.27x` |
 
-Across all 27 points the geometric-mean baseline-to-final speedup is `1.59x`. IQ2_XXS beats AITER at all 12 points. Q2_K beats AITER at batch 1 and batch 16, matches uniform batch 4, and is `8-10%` behind on the three nonuniform batch-4 routes. Fixed Q8_0 remains approximately `0.75x` the independently dequantized BF16 BMM reference.
+Across all 27 points the geometric-mean baseline-to-final speedup is `1.75x`. IQ2_XXS and Q2_K beat AITER at all 24 routed points. Fixed Q8_0 remains approximately `0.74-0.76x` the independently dequantized BF16 BMM reference.
 
 #### D4.2 Qwen code-object isolation and acceptance: complete
 
@@ -369,7 +375,8 @@ The final 60-point Qwen artifact is `/tmp/grouped_mmq_fwd_qwen_post_ds4_isolated
 | Fixed Q8_0 full-N | 64 | 213 | 48 | 0 | 0 | no |
 | IQ2_XXS small/medium rows | 64 | 229 | 77 | 0 | 0 | no |
 | IQ2_XXS large rows | 80 | 253 | 51 | 0 | 0 | no |
-| Q2_K production | 32 | 122 | 30 | 0 | 0 | no |
+| Q2_K fixed-tail production | 32 | 208 | 38 | 0 | 0 | no |
+| Q2_K J32/J16 small-row production | 32/16 | 213 | 43 | 0 | 0 | no |
 
 All retained DeepSeek arithmetic kernels satisfy the zero-private, zero-spill, zero-dynamic-stack gate.
 
@@ -1197,6 +1204,52 @@ The source cleanup increases down VGPR allocation to 229 for Q3_K, 244 for Q4_K,
 
 Production down IQ2_S batch-1 sparse and Q5_K batch-4 boundary remained bit-exact against dense MMQ. IQ2_S sparse improved to 3.745 ms in the correctness run but still trails 2.846 ms AITER, identifying the remaining final deficit.
 
+### G12: partial IQ2_S dot-loop unroll
+
+Status: rejected.
+
+The exact Qwen down `(N,K,J)=(2048,512,64)` candidate is isolated in a separate HIP translation unit so the established Qwen device code object remains unchanged. The fresh automatic-unroll control is `/tmp/grouped_mmq_fwd_qwen_iq2s_auto_control.json`. Explicit `unroll 1` remains spill-free at 232 VGPRs and 46 SGPRs and is bitwise exact in `/tmp/grouped_mmq_fwd_qwen_iq2s_unroll1.json`. Its 12-point geometric speedup is `1.018x`, but most of the movement is batch-1 uniform (`13.46%`); the target nonuniform routes move only `-0.29%` to `+2.16%`.
+
+Explicit `unroll 2` is rejected before timing. It reaches 256 VGPRs, 8 private bytes, and one VGPR spill, while growing the arithmetic symbol from about 61 KiB to 64 KiB. Factor 4 is also rejected before timing at 256 VGPRs, 352 private bytes, and 94 VGPR spills. Because factor 1 had several apparent movements above 1%, final acceptance used a sequential 25-repeat comparison against automatic unrolling in the same isolated translation unit, removing code-object placement as a confounder. The matched artifacts are `/tmp/grouped_mmq_fwd_qwen_iq2s_auto_isolated_25.json` and `/tmp/grouped_mmq_fwd_qwen_iq2s_unroll1_isolated_25.json`. Factor 1 is `0.41%` slower geometrically, including regressions of `1.33%` at batch-1 uniform and `1.29%` at batch-16 sparse; only batch-4 skew improves just over 1%. The initial apparent gain came from moving the kernel into a different code object, not loop rolling. The rolled IQ2_S helper is removed.
+
+### G13: same-launch mixed-size tails
+
+Status: complete; bounded two-size policies retained for small rows.
+
+The literal IQ2_S variant keeps J64 for full tiles and selects J16/J32/J48 for the final partial expert tile inside the same kernel launch. It fails the resource gate before timing: the arithmetic symbol grows from about 61 KiB to 149 KiB, reaches 256 VGPRs, allocates 1,644 private bytes, and reports 455 VGPR spills. Compiling all four accumulator/decode bodies behind the device tail branch is not viable.
+
+The narrower IQ2_S J64/J32 candidate passes at 231 VGPRs and 47 SGPRs with zero private bytes, zero spills, and no dynamic stack. Matched 25-repeat artifacts are `/tmp/grouped_mmq_fwd_qwen_iq2s_auto_isolated_post_tail_25.json` and `/tmp/grouped_mmq_fwd_qwen_iq2s_j64_j32_tail_25.json`. The candidate improves batch-1 nonuniform routes by `2.8-9.0%` and batch-1 uniform by `0.45%`. Applying it to all rows also regresses batch-4 uniform by `1.01%` and batch-16 uniform by `1.05%`. The retained static policy therefore uses J64/J32 only when `rows < 128 * num_groups`, selecting Qwen physical batch 1, and keeps the established J64 body otherwise.
+
+The DeepSeek Q2_K J32/J16 candidate passes the resource gate at 213 VGPRs and 43 SGPRs with zero private bytes, zero spills, and no dynamic stack; its symbol is about 31 KiB. The initial nine-repeat artifact `/tmp/grouped_mmq_fwd_ds4_q2_unroll4_mixed_tail.json` is bitwise exact and improves all 12 routes over factor-4 J32 alone.
+
+The matched 25-repeat artifacts are `/tmp/grouped_mmq_fwd_ds4_q2_unroll4_fixed_j32_25.json` and `/tmp/grouped_mmq_fwd_ds4_q2_unroll4_mixed_tail_25.json`. Mixed tails improve batch 1 by `5.1-15.7%`, but batch-4 uniform regresses `1.64%` and batch 16 ranges from `0.8%` slower to `0.1%` faster. The retained static policy therefore uses J32/J16 only when `rows < 64 * num_groups`, selecting DeepSeek physical batch 1, and factor-4 fixed J32 otherwise. This keeps the strong small-row gain without accepting the repeatable large-row regression.
+
+### G14: pre-bundle last-version checkpoint
+
+Status: benchmarked and committed as the comparison point for standalone kernel packaging. It is not an acceptable long-term artifact-layout contract.
+
+This checkpoint preserves the established Qwen object first, keeps an unreachable factor-1 DeepSeek Q2_K instantiation as a layout anchor, and links the final factor-4 Q2_K kernels after the Qwen object. The small-row Qwen IQ2_S specialization also has its own translation unit. This arrangement makes the arithmetic experiments reproducible enough to hand off, but it intentionally records the translation-unit and link-order dependency that the standalone HSACO bundle must remove.
+
+The exact benchmarked extension at `build/lib.linux-x86_64-cpython-314/torch_ggml_ops/_C.abi3.so` has SHA-256 `2b3e5f9e222ded44bd27e06408794d2bb96aacf9bf3034f4ed0738d09970fddc`.
+
+Fresh nine-repeat source-of-record artifacts are:
+
+```text
+/tmp/grouped_mmq_fwd_ds4_last_version_baseline.json
+/tmp/grouped_mmq_fwd_qwen_last_version_baseline.json
+```
+
+Their SHA-256 digests are `607bb3b0e6d7b2efd8a2851a55bc0787d7526bcb4bcfab75d849ba45c03b79fc` and `306f6bb3009604c76147d99fa8835fbf6fb4d42282b3423eac3ccb595dacd98f`. DeepSeek completes 27 points with 39/39 exact packed-reference checks and wins all 24 routed comparisons. Qwen completes its five-case, 60-point matrix with 84/84 exact checks and wins 54/60 AITER comparisons.
+
+The adjacent full Qwen 25-repeat A/B artifacts are:
+
+```text
+/tmp/grouped_mmq_fwd_qwen_last_version_pre_control_25.json
+/tmp/grouped_mmq_fwd_qwen_last_version_post_control_25.json
+```
+
+Relative to detached `efca259`, the checkpoint has `+0.54%` median and `+0.23%` geometric-mean latency movement. The retained small-row IQ2_S path improves batch-1 uniform/sparse by `10.8%/9.6%` in this packaged comparison. Conversely, unchanged Q3_K gate/up batch-4 points regress `1.2-4.3%`, and unchanged IQ2_S gate/up batch-4 points regress `0.9-2.5%`. Twenty-five of 60 individual points move by more than 1% despite unchanged arithmetic for most of them. This confirms that translation-unit separation, filename order, and the unreachable layout anchor are not valid performance contracts. The post-control artifact is the authoritative last-version Qwen baseline for the standalone module conversion; the packaged implementation must be compared against it in both production sequence and cold-instruction-cache conditions.
+
 ## Final retained evaluation
 
 The complete retained 60-point artifact after G11 is:
@@ -1311,7 +1364,7 @@ The only material remaining per-point deficit is nonuniform IQ2_S down at batch 
 - cross-call decoded-weight reuse.
 - a transient project-owned decoded dense stage.
 
-Any future implementation must preserve device-resident routing metadata, batch-1 sparse launch behavior, exact grouped-versus-dense BF16 output, and complete-operator timing. It must compare against `/tmp/grouped_mmq_fwd_final_full_v2.json`, not the historical baseline.
+Any future implementation must preserve device-resident routing metadata, batch-1 sparse launch behavior, exact grouped-versus-dense BF16 output, and complete-operator timing. Representation-level Qwen work still compares against `/tmp/grouped_mmq_fwd_final_full_v2.json`. The standalone bundle conversion compares against the G14 DeepSeek source-of-record matrix and the 25-repeat Qwen post-control artifact.
 
 If grouped source changes resume, validation remains:
 

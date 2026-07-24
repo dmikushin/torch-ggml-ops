@@ -16,6 +16,7 @@ static constexpr int MMQ_J = 128;
 static constexpr int MMQ_J_MEDIUM = 80;
 static constexpr int MMQ_J_SMALL = 64;
 static constexpr int MMQ_J_TINY = 32;
+static constexpr int MMQ_J_MIN = 16;
 static constexpr int MMQ_NTHREADS = 128;
 static constexpr int MMQ_NWARPS = MMQ_NTHREADS / WARP_SIZE;
 
@@ -69,7 +70,7 @@ template <ggml_type type, int J, bool fallback>
 static constexpr __host__ __device__ int ggml_cuda_mmq_get_nthreads() {
     static_assert(
         J == MMQ_J || J == MMQ_J_MEDIUM || J == MMQ_J_SMALL ||
-        J == MMQ_J_TINY);
+        J == MMQ_J_TINY || J == MMQ_J_MIN);
     return MMQ_NTHREADS;
 }
 
@@ -77,7 +78,7 @@ template <ggml_type type, int J, bool fallback>
 static constexpr __host__ __device__ int ggml_cuda_mmq_get_I() {
     static_assert(
         J == MMQ_J || J == MMQ_J_MEDIUM || J == MMQ_J_SMALL ||
-        J == MMQ_J_TINY);
+        J == MMQ_J_TINY || J == MMQ_J_MIN);
     return MMQ_I;
 }
 
@@ -85,7 +86,7 @@ template <ggml_type type, int J, bool fallback>
 static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride() {
     static_assert(
         J == MMQ_J || J == MMQ_J_MEDIUM || J == MMQ_J_SMALL ||
-        J == MMQ_J_TINY);
+        J == MMQ_J_TINY || J == MMQ_J_MIN);
     return mmq_sram_stride(type);
 }
 
@@ -93,7 +94,7 @@ template <ggml_type type, int J, bool fallback>
 static constexpr __host__ __device__ int ggml_cuda_mmq_get_rows_per_warp() {
     static_assert(
         J == MMQ_J || J == MMQ_J_MEDIUM || J == MMQ_J_SMALL ||
-        J == MMQ_J_TINY);
+        J == MMQ_J_TINY || J == MMQ_J_MIN);
     return 16;
 }
 
@@ -113,6 +114,9 @@ enum mmq_q8_1_ds_layout {
 #include "vendor/llama_cpp/mmq-vec-dot-targets.cuh"
 #ifdef MMQ_USE_ROLLED_Q2_K
 #include "vendor/llama_cpp/mmq-vec-dot-q2-k-rolled.cuh"
+#endif
+#ifdef MMQ_USE_ROLLED_Q2_K_LEGACY
+#include "vendor/llama_cpp/mmq-vec-dot-q2-k-rolled-legacy.cuh"
 #endif
 
 template <ggml_type type, int J, bool fallback = true>
@@ -150,7 +154,10 @@ static __device__ __forceinline__ void mmq_vec_dot_target(
         ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<
             type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>(x, y, sum, k00);
     } else if constexpr (type == GGML_TYPE_Q2_K) {
-#ifdef MMQ_USE_ROLLED_Q2_K
+#ifdef MMQ_USE_ROLLED_Q2_K_LEGACY
+        ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma_rolled_legacy<type, J, fallback>(
+            x, y, sum, k00);
+#elif defined(MMQ_USE_ROLLED_Q2_K)
         ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma_rolled<type, J, fallback>(x, y, sum, k00);
 #else
         ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma<type, J, fallback>(x, y, sum, k00);
@@ -597,6 +604,64 @@ static __device__ __forceinline__ void grouped_mmq_row_tile(
     __syncthreads();
 }
 
+template <ggml_type type, int J, int fixed_nrows_weight, int fixed_blocks_per_weight_row>
+static __device__ __forceinline__ void grouped_mmq_tail_tile(
+        const char * __restrict__ expert_weights,
+        const int * __restrict__ activations,
+        __hip_bfloat16 * __restrict__ dst,
+        int * __restrict__ tile_x,
+        int * __restrict__ tile_y,
+        int tile_i,
+        int row_start,
+        int row_end,
+        int nrows_weight,
+        int nrows_activation,
+        int blocks_per_weight_row) {
+#if defined(MMQ_USE_MIXED_IQ2_S_TAILS)
+    if constexpr (type == GGML_TYPE_IQ2_S && J == MMQ_J_SMALL) {
+        const int tail_rows = row_end - row_start;
+        if (tail_rows <= MMQ_J_TINY) {
+            grouped_mmq_row_tile<
+                type, MMQ_J_TINY, fixed_nrows_weight, fixed_blocks_per_weight_row, false>(
+                    expert_weights, activations, dst, tile_x, tile_y, tile_i,
+                    row_start, row_end, nrows_weight, nrows_activation,
+                    blocks_per_weight_row);
+        } else {
+            grouped_mmq_row_tile<
+                type, J, fixed_nrows_weight, fixed_blocks_per_weight_row, false>(
+                    expert_weights, activations, dst, tile_x, tile_y, tile_i,
+                    row_start, row_end, nrows_weight, nrows_activation,
+                    blocks_per_weight_row);
+        }
+    } else
+#endif
+#if defined(MMQ_USE_MIXED_Q2_K_TAILS)
+    if constexpr (type == GGML_TYPE_Q2_K && J == MMQ_J_TINY) {
+        const int tail_rows = row_end - row_start;
+        if (tail_rows <= MMQ_J_MIN) {
+            grouped_mmq_row_tile<
+                type, MMQ_J_MIN, fixed_nrows_weight, fixed_blocks_per_weight_row, false>(
+                    expert_weights, activations, dst, tile_x, tile_y, tile_i,
+                    row_start, row_end, nrows_weight, nrows_activation,
+                    blocks_per_weight_row);
+        } else {
+            grouped_mmq_row_tile<
+                type, J, fixed_nrows_weight, fixed_blocks_per_weight_row, false>(
+                    expert_weights, activations, dst, tile_x, tile_y, tile_i,
+                    row_start, row_end, nrows_weight, nrows_activation,
+                    blocks_per_weight_row);
+        }
+    } else
+#endif
+    {
+        grouped_mmq_row_tile<
+            type, J, fixed_nrows_weight, fixed_blocks_per_weight_row, false>(
+                expert_weights, activations, dst, tile_x, tile_y, tile_i,
+                row_start, row_end, nrows_weight, nrows_activation,
+                blocks_per_weight_row);
+    }
+}
+
 template <ggml_type type, int J, int fixed_nrows_weight = 0, int fixed_blocks_per_weight_row = 0>
 __launch_bounds__(MMQ_NTHREADS, 2)
 static __global__ void grouped_mmq_bf16_kernel(
@@ -647,8 +712,8 @@ static __global__ void grouped_mmq_bf16_kernel(
                 blocks_per_weight_row);
     }
     if (row_start < row_end) {
-        grouped_mmq_row_tile<
-            type, J, fixed_nrows_weight, fixed_blocks_per_weight_row, false>(
+        grouped_mmq_tail_tile<
+            type, J, fixed_nrows_weight, fixed_blocks_per_weight_row>(
                 expert_weights,
                 activations,
                 dst,

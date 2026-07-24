@@ -45,6 +45,18 @@ void launch_deepseek_grouped_projection(
     int64_t bytes_per_expert,
     hipStream_t stream);
 
+void launch_qwen_iq2_s_down_projection(
+    const char * packed,
+    const int * activations,
+    __hip_bfloat16 * output,
+    const int64_t * expert_indices,
+    const int32_t * expert_offsets,
+    int num_experts,
+    int num_groups,
+    int rows,
+    int64_t bytes_per_expert,
+    hipStream_t stream);
+
 namespace {
 
 using torch::headeronly::ScalarType;
@@ -331,6 +343,26 @@ void launch_grouped_projection(
         int out_features,
         int64_t bytes_per_expert,
         hipStream_t stream) {
+    if constexpr (type == GGML_TYPE_IQ2_S) {
+        if (
+            out_features == 2048 && in_features == 512 &&
+            rows < num_groups * (2 * MMQ_J_SMALL)
+        ) {
+            launch_qwen_iq2_s_down_projection(
+                packed,
+                activations,
+                output,
+                expert_indices,
+                expert_offsets,
+                num_experts,
+                num_groups,
+                rows,
+                bytes_per_expert,
+                stream);
+            return;
+        }
+    }
+
     if (out_features == 512 && in_features == 2048) {
         launch_grouped_projection_kernel<type, MMQ_J_SMALL, 512, 8>(
             packed,

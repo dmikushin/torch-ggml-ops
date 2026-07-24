@@ -5,7 +5,12 @@ from torch.utils import cpp_extension
 
 ROOT = Path(__file__).resolve().parent
 CSRC = ROOT / "csrc"
-SOURCES = ["csrc/mmq_hip.cu", "csrc/deepseek_mmq_hip.cu"]
+SOURCES = [
+    "csrc/mmq_hip.cu",
+    "csrc/deepseek_mmq_hip.cu",
+    "csrc/qwen_iq2s_mmq_hip.cu",
+    "csrc/zz_deepseek_q2_final_mmq_hip.cu",
+]
 HEADER_DEPENDENCIES = [
     path.relative_to(ROOT).as_posix() for path in sorted(CSRC.rglob("*.cuh"))
 ]
