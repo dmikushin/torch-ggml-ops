@@ -11,7 +11,7 @@ The production operators are:
 
 Dense MMQ forward and backward are documented separately in `docs/mmq_fwd_optimization.md` and `docs/mmq_bwd_optimization.md`.
 
-The grouped optimization pass is complete for the current Qwen packed representation. The original spill-heavy baseline and all experiment logs remain below for provenance, but the source of record is the spill-free G11 dispatch and `/tmp/grouped_mmq_fwd_final_full_v2.json`. DeepSeek-V4-Flash forward correctness and benchmark coverage are implemented; its three new production families are not yet performance-tuned.
+The grouped optimization pass is complete for the current Qwen and DeepSeek-V4-Flash packed representations. The original spill-heavy baselines and all experiment logs remain below for provenance. Qwen's source of record remains the spill-free G11 dispatch; the accepted DeepSeek artifact is `/tmp/grouped_mmq_fwd_ds4_final_isolated_full.json`, with its same-build Qwen control at `/tmp/grouped_mmq_fwd_qwen_post_ds4_isolated_final.json`.
 
 ## Qwen current status
 
@@ -192,6 +192,35 @@ Start with at most two row buckets per routed DeepSeek family: small groups and 
 
 The current routed DeepSeek paths use the general `J=128` kernel because their shapes do not match the Qwen exact branches. The first question is therefore whether generic shape state and `J=128` create spills or excessive full/tail control, not whether a new persistent scheduler is needed.
 
+#### D0 baseline checkpoint: complete
+
+The same-session baseline artifacts are:
+- DeepSeek 27-point baseline: `/tmp/grouped_mmq_fwd_ds4_baseline_full.json`.
+- Qwen 60-point pre-tuning control: `/tmp/grouped_mmq_fwd_qwen_pre_ds4_control.json`.
+- source commit: `aa3ebd4`.
+
+DeepSeek baseline summary:
+
+| Family | Batch 1 packed/reference | Batch 4 packed/reference | Batch 16 packed/reference | Main observation |
+| --- | ---: | ---: | ---: | --- |
+| Fixed Q8_0 | `10.990/8.162 ms` | `44.336/32.874 ms` | `175.484/129.540 ms` | stable `0.74x`; throughput-bound rather than launch-bound |
+| IQ2_XXS pair | `66.104-77.549/56.055-73.039 ms` | `135.713-148.871/134.315-138.103 ms` | `335.363-400.420/654.188-735.394 ms` | small groups lag AITER; large uniform groups already reach `1.95x` |
+| Q2_K down | `62.426-76.312/31.472-40.433 ms` | `155.004-162.014/81.587-82.465 ms` | `421.356-482.628/434.581-477.845 ms` | roughly `0.5x` at batches 1/4; approaches parity only at batch 16 |
+
+Every DeepSeek point remained bitwise exact against dense packed MMQ. Independent-reference NRMSE stayed near `0.0061` for Q8_0/IQ2_XXS and `0.0107-0.0114` for Q2_K.
+
+The fresh Qwen control is the acceptance baseline for this tuning session. Relative to the older July G11 artifact, unchanged Qwen code measured a median `4.9%` slower with a `-0.3%` to `+17.1%` point range. That historical movement is too large for per-point acceptance; all retained changes therefore use sequential fresh pre/post controls, while `/tmp/grouped_mmq_fwd_final_full_v2.json` remains qualitative history.
+
+D0 code-object and operator-only trace results:
+
+| Kernel | J | VGPR | SGPR | Private bytes | VGPR spills | Batch-1 quantize ms | Batch-1 arithmetic ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Fixed Q8_0 production full-N | 64 | 213 | 48 | 0 | 0 | 0.964 | 10.052 |
+| IQ2_XXS pair, per projection | 128 | 256 | 72 | 360 | 117 | 0.723 total | 38.279 each |
+| Q2_K down | 128 | 256 | 61 | 576 | 230 | 0.365 | 75.731 |
+
+All three quantizers are spill-free. Quantization is only about 9% of fixed Q8_0, 1% of the IQ2_XXS pair, and 0.5% of Q2_K at batch 1. The routed baseline bottleneck is therefore the spilled generic arithmetic kernel. D1-D3 start with exact `J=64` specializations; quantizer restructuring is deferred unless the arithmetic fixes expose it as material.
+
 ### Phase D1: fixed-group Q8_0 output A
 
 Production geometry is eight always-active groups, `N=1024`, `K=4096`, and 16 MMQ K iterations. Start from the current llama.cpp-style Q8_1/Q8_0 implementation and compare it with the relevant DwarfStar grouped-Q8 implementation on this machine; do not assume either source is faster.
@@ -204,6 +233,22 @@ Measure a bounded candidate set:
 - current Q8_1 prequantization versus a direct BF16/Q8_0 DwarfStar-style path, judged by complete public-operator latency and workspace allocation.
 
 Keep group as an explicit grid dimension and preserve token-major contiguous output. Avoid a host loop over eight public MMQ calls. Output-A has no routing imbalance, so route descriptors and persistent expert traversal are non-priorities. Its likely first-order choices are activation quantization cost at `8*M` rows, fixed K traversal, and Q8_0 weight/scale staging.
+
+#### D1.1 J=128 fixed token tile: rejected
+
+`J=128` increased the fixed production full-N kernel from 213 to 256 VGPRs, introduced 88 private bytes and 21 reported VGPR spills, and regressed complete latency at every physical batch: `10.990 -> 15.153 ms`, `44.336 -> 60.563 ms`, and `175.484 -> 242.127 ms`. The approximately 38% loss shows that halving Q8_0 weight reloads does not repay accumulator pressure. Spill-free `J=64` is restored.
+
+#### D1.2 DwarfStar grouped-Q8 schedule: rejected for this contract
+
+DwarfStar's retained grouped output-A kernel stages F32 activations and computes directly against dequantized Q8_0 values with per-wave DP4A/scalar accumulation. It does not apply this operator's Q8_1 activation quantization, so it cannot preserve bitwise equality with dense packed MMQ. Its prequantized Q8 path assigns one output row/token to a wave and provides no 64-token by 64-output weight reuse; the current spill-free WMMA kernel is structurally stronger for physical batches 1/4/16. A direct port is therefore rejected on semantics and reuse before source integration. The comparison can be reopened only if quantization becomes dominant; D0 measured it at 9% of fixed batch-1 time.
+
+#### D1.3 rolled Q8_0 dot loop: rejected
+
+Keeping the Q8_0/IQ2_XXS `k01` loop rolled did not clean up J96 IQ2_XXS or improve the production fixed kernel's resource counts. Fixed latency also moved from `10.990/44.336/175.484 ms` to `11.066/44.595/177.793 ms`. The original compiler schedule is retained.
+
+#### D1.4 J=32 fixed token tile: rejected
+
+J32 unexpectedly reaches 256 VGPRs, 344 private bytes, and 85 reported spills despite its smaller accumulator. It fails the production resource gate before timing. The tested J32/J64/J128 family therefore retains spill-free J64.
 
 ### Phase D2: routed IQ2_XXS gate/up
 
@@ -219,6 +264,24 @@ Start with:
 
 `IQ2_XXS` optimization should focus on the natural decode-sharing unit: grid lookup, sign unpacking, scale formation, and aligned packed loads. Keep project-specific cooperative decode helpers outside vendored source. Do not fuse the two forward arithmetic outputs unless a resource analysis shows two accumulator sets remain spill-free; unlike backward, forward must produce two separate tensors and cannot share one accumulator.
 
+#### D2.1 exact J=64 specialization: retained candidate
+
+Specializing production `(N,K)=(2048,4096)` with `J=64` reduced the arithmetic kernel from 256 to 229 VGPRs, removed all 360 private bytes and all 117 reported VGPR spills, and preserved zero dynamic stack. Batch-1 uniform complete pair latency improved from `77.549 ms` to `33.581 ms`, a `2.31x` packed-path improvement. Correctness remained bitwise exact.
+
+The complete 12-point route matrix has a `1.52x` geometric-mean speedup. Batches 1 and 4 improve by `29.3-56.7%`; batch-16 skewed/sparse/boundary improve by `8.9-9.4%`. Batch-16 uniform regresses `2.8%`, from `335.363 ms` to `344.635 ms`, because perfectly full 768-row groups make the doubled J=64 weight-tile traversal visible.
+
+#### D2.2 J=96 large-row specialization: rejected
+
+`J=96` uses 256 VGPRs, 76 private bytes, and 18 reported VGPR spills. It is `58-62%` slower than J64 at batch 1 and loses on batch-4 skew. It improves batch-16 uniform strongly but only improves the other batch-16 distributions by `0.3-1.7%`. Rolling the shared Q8_0/IQ2_XXS dot loop did not remove any J96 spill state. J96 is rejected by the production resource gate.
+
+#### D2.3 J=80 large-row specialization: retained
+
+`J=80` uses 253 VGPRs, 51 SGPRs, zero private bytes, zero spills, and no dynamic stack. At batch 16 it improves every distribution over J64: uniform `344.635 -> 333.184 ms`, skewed `358.908 -> 338.649 ms`, sparse `360.531 -> 342.558 ms`, and boundary `363.622 -> 344.836 ms`. At batch 4 it is consistently `1.2-2.2%` slower than J64. The final static heuristic therefore uses J80 only when `rows >= 512 * num_groups`, selecting batch 16 from coarse host-visible geometry without reading device offsets; batch 1/4 retain J64.
+
+#### D2.4 J=32 small-group specialization: rejected
+
+Exact J32 reaches 256 VGPRs, 156 private bytes, and 48 reported spills. It fails the resource gate before batch-1 timing. J64 remains the smallest retained IQ2_XXS tile.
+
 ### Phase D3: routed Q2_K down
 
 Production geometry is `N=4096`, `K=2048` with eight packed blocks per row and 64 output tiles per active expert. Its activation metadata uses the distinct Q8_1 `D2S6` layout.
@@ -232,6 +295,36 @@ Start with:
 
 Tune Q2_K scale/min reconstruction and LDS placement independently of IQ2_XXS. A common schedule may be selected only if both complete matrices support it; a common decoder abstraction is not a performance goal.
 
+#### D3.1 exact J=64 specialization: rejected
+
+The direct `J=64`, `(N,K)=(4096,2048)` specialization increased private storage from 576 to 2,784 bytes and reported VGPR spills from 230 to 1,188. Batch-1 uniform latency regressed from `76.312 ms` to `104.589 ms` (`37.1%`). The branch was removed. Q2_K cannot use the IQ2_XXS tile rule; its decode and 64 output tiles require a different resource reduction.
+
+#### D3.2 J=64 with runtime shape: rejected
+
+Leaving N and K-block count runtime-valued did not isolate the spill problem. The resulting J=64 kernel used 3,068 private bytes and 1,132 VGPR spills, and batch-1 uniform regressed `9.9%`, from `76.312 ms` to `83.862 ms`. This branch was also removed.
+
+#### D3.3 J=32 runtime-shape specialization: retained candidate
+
+`J=32` reduced the generic Q2_K kernel from 576 to 500 private bytes and from 230 to 135 reported VGPR spills. Despite fourfold weight-tile traversal relative to J=128, batch-1 uniform improved `76.312 -> 37.029 ms` (`2.06x`).
+
+The complete route matrix improves every baseline point: `48-51%` at batch 1, `33-40%` at batch 4, and `8-17%` at batch 16. Packed Q2_K now beats AITER at 7 of 12 points. The branch remains bounds-safe and bitwise exact, but 500 private bytes still fail the final resource target. Further D3 work keeps J=32 and targets Q2 scale/min correction lifetime or a distinct decoder body.
+
+#### D3.4 split full/tail launches: rejected
+
+Splitting J32 into separate compiler entry points reduced the full-body kernel to 72 private bytes/17 spills, while the bounded tail remained at 460 bytes/114 spills. The extra launch regressed batch 1 by `4.9-5.6%`, was neutral to 1% slower at batch 4, and improved batch 16 by only `0.5-1.1%`. This is insufficient to retain the split. It does establish that tail bounds, not the full Q2 arithmetic body, account for most remaining compiler spill state.
+
+#### D3.5 replicated tail activation lanes: rejected
+
+For Q2_K tails only, clamping invalid lanes to the last valid activation reduced the tail entry point to 168 private bytes/41 spills without changing valid output fragments. Runtime nevertheless regressed further: batch-1 uniform/boundary reached `41.509/41.710 ms`, boundary batch 4 reached `112.189 ms`, and batch 16 did not improve. Extra clamp/address work dominates the lower scratch count. Replication and split launches were both removed; zero-filled bounded loads in the single J32 kernel remain faster.
+
+#### D3.6 exact J32 production geometry: retained
+
+Adding compile-time `N=4096` and eight K blocks to J32 reduced private storage from 500 to 404 bytes and reported spills from 135 to 109. It improved all six uniform/boundary probes by `5.6-7.6%`, then improved every point in the complete matrix. Candidate ranges were `30.897-35.053 ms` at batch 1, `92.034-101.358 ms` at batch 4, and `366.258-376.947 ms` at batch 16.
+
+#### D3.7 rolled Q2_K scale loop: retained
+
+The gfx1151 compiler fully unrolled the eight Q2_K `k01` scale/min phases, generating a 34 KiB kernel with 404 private bytes and 109 spills even at J32. A generator-owned `#pragma unroll 1` on that Q2_K AMD WMMA loop reduces the exact kernel to 14 KiB, 122 VGPRs, 30 SGPRs, zero private bytes, zero spills, and no dynamic stack. It improves all 12 route points again: `24.052-26.861 ms` at batch 1, `79.920-87.187 ms` at batch 4, and `324.683-335.600 ms` at batch 16. Packed beats AITER at nine points, is within 6% at the other three batch-4 distributions, and remains bitwise exact. This is the first Q2_K candidate satisfying the production arithmetic resource gate.
+
 ### Phase D4: simple heuristics and integration
 
 After the three families have independent winners:
@@ -242,6 +335,54 @@ After the three families have independent winners:
 5. Run `torch.compile`, FakeTensor, allocation, current-stream, sparse-route, and partial-tile tests.
 6. Produce `/tmp/grouped_mmq_fwd_ds4_final_full.json` and a same-build `/tmp/grouped_mmq_fwd_qwen_post_ds4_control.json`.
 7. Compare fresh pre/post Qwen controls as well as the historical G11 artifact.
+
+#### D4.1 final dispatch and DeepSeek matrix: complete
+
+The accepted static dispatch is:
+- fixed Q8_0 `(1024,4096)`: J64.
+- routed IQ2_XXS `(2048,4096)`: exact J64 below `rows = 512 * num_groups`, exact J80 at and above that threshold.
+- routed Q2_K `(4096,2048)`: exact J32 with the rolled Q2_K scale/min loop.
+- every other supported shape: the existing bounds-safe generic path.
+
+The final 27-point artifact is `/tmp/grouped_mmq_fwd_ds4_final_isolated_full.json`. Every point remains bitwise exact against dense packed MMQ. Independent BF16 NRMSE is approximately `0.0060-0.0061` for Q8_0/IQ2_XXS and `0.0107-0.0114` for Q2_K.
+
+| Family | Batch 1 packed ms | Batch 4 packed ms | Batch 16 packed ms | Baseline-to-final geometric speedup |
+| --- | ---: | ---: | ---: | ---: |
+| Fixed Q8_0 | `11.030` | `44.540` | `177.343` | `0.99x` |
+| IQ2_XXS pair | `32.278-35.664` | `84.627-100.815` | `338.571-346.709` | `1.53x` |
+| Q2_K down | `26.051-28.349` | `83.130-90.611` | `334.505-342.238` | `1.86x` |
+
+Across all 27 points the geometric-mean baseline-to-final speedup is `1.59x`. IQ2_XXS beats AITER at all 12 points. Q2_K beats AITER at batch 1 and batch 16, matches uniform batch 4, and is `8-10%` behind on the three nonuniform batch-4 routes. Fixed Q8_0 remains approximately `0.75x` the independently dequantized BF16 BMM reference.
+
+#### D4.2 Qwen code-object isolation and acceptance: complete
+
+Adding the new routed specializations to the monolithic HIP translation unit produced a repeatable `2-4%` Q5_K batch-1 regression even though the Q5 arithmetic kernel, Q5 quantizer, and specialized host launcher had instruction-identical hashes. The regression followed code-object layout. The candidate was rejected in that form.
+
+The retained implementation places DeepSeek-only J64/J80 IQ2_XXS and rolled-Q2 J32 instantiations in `csrc/deepseek_mmq_hip.cu`. The original generated Q2_K dot function and all Qwen arithmetic remain in `csrc/mmq_hip.cu`; a separate generator-owned rolled Q2_K helper is included only by the DeepSeek translation unit. The sensitive 25-repeat Q5_K batch-1 medians then matched baseline within `0.2%`, and the complete 25-repeat Q5 family control had no repeatable regression.
+
+The final 60-point Qwen artifact is `/tmp/grouped_mmq_fwd_qwen_post_ds4_isolated_final.json`. Relative to `/tmp/grouped_mmq_fwd_qwen_pre_ds4_control.json`, median point movement is `+0.11%` and geometric-mean movement is `+0.16%`. Checkpoint-weighted bucket movement is `-0.22%` to `+0.88%`. The two nine-repeat movements above 1% were cleared by sequential 25-repeat controls: Q5_K batch-16 sparse improved to `24.459 ms` versus `24.914-25.336 ms` baseline, and down IQ2_S batch-16 sparse measured `30.645 ms` versus `30.665 ms` baseline. All 60 points remain bitwise exact.
+
+#### D4.3 final production resources
+
+| Kernel | J | VGPR | SGPR | Private bytes | VGPR spills | Dynamic stack |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Fixed Q8_0 full-N | 64 | 213 | 48 | 0 | 0 | no |
+| IQ2_XXS small/medium rows | 64 | 229 | 77 | 0 | 0 | no |
+| IQ2_XXS large rows | 80 | 253 | 51 | 0 | 0 | no |
+| Q2_K production | 32 | 122 | 30 | 0 | 0 | no |
+
+All retained DeepSeek arithmetic kernels satisfy the zero-private, zero-spill, zero-dynamic-stack gate.
+
+#### D4.4 measured remaining bottleneck
+
+Fresh accepted-build traces are `/tmp/rocprof_ds4_final_q2k_b1/q2k_final_results.db` and `/tmp/rocprof_ds4_final_iq2xxs_b16/iq2xxs_final_results.db`:
+- Q2_K batch 1 averages `25.946 ms` arithmetic and `0.351 ms` quantization; arithmetic is about `98.7%` of those operator kernels.
+- IQ2_XXS batch 16 averages `157.216 ms` per projection and `11.469 ms` for shared quantization; the two arithmetic launches are about `96.5%` of operator kernel time.
+- The unchanged fixed-Q8 trace averages `10.052 ms` arithmetic and `0.964 ms` quantization; arithmetic is about `91%`.
+
+The remaining limitation is packed arithmetic and repeated decode, not activation quantization, spilling, or launch setup. Q2_K nonuniform batch-4 routes pay one bounded J32 tail per active expert and repeat packed scale/min reconstruction across 64 output tiles. Fixed Q8_0 repeats Q8_0 scale staging while the BF16 BMM reference starts from already dequantized weights; the tested J32/J128 and direct DwarfStar schedules do not improve this contract. IQ2_XXS is already well ahead of AITER, and J80 is at the spill-free VGPR limit.
+
+The bounded local schedule space is exhausted: fixed J32/J128, IQ J32/J96, Q2 J64, exact/runtime J64, split full/tail launches, tail replication, and shared Q8 loop rolling all failed either resource or complete-operator timing gates. More headroom requires a representation-level design such as a compact reusable decoded-weight cache or a transient dense stage, with separate memory and end-to-end evaluation.
 
 ### Closed neighborhoods carried forward from prior logs
 

@@ -96,6 +96,26 @@ def generate(root: Path) -> None:
     )
 
     dot_text = (source / "ggml-cuda/mmq-vec-dot.cuh").read_text()
+    q2_dot = _extract_region(
+        dot_text,
+        "ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma(",
+        "ggml_cuda_mmq_vec_dot_q3_K_q8_1_dp4a(",
+    )
+    q2_name = "ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma("
+    if q2_name not in q2_dot:
+        raise ValueError("Q2_K MMQ function name changed upstream")
+    q2_rolled_dot = q2_dot.replace(
+        q2_name,
+        "ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma_rolled(",
+        1,
+    )
+    q2_k_loop = "    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {"
+    if q2_k_loop not in q2_rolled_dot:
+        raise ValueError("Q2_K MMQ scale loop changed upstream")
+    q2_rolled_dot = q2_rolled_dot.replace(
+        q2_k_loop, "#pragma unroll 1\n" + q2_k_loop, 1
+    )
+
     dot_parts = [
         _extract_region(
             dot_text,
@@ -112,11 +132,7 @@ def generate(root: Path) -> None:
             "ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma(",
             "ggml_cuda_mmq_vec_dot_q2_K_q8_1_dp4a(",
         ),
-        _extract_region(
-            dot_text,
-            "ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma(",
-            "ggml_cuda_mmq_vec_dot_q3_K_q8_1_dp4a(",
-        ),
+        q2_dot,
         _extract_region(
             dot_text,
             "ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma(",
@@ -129,6 +145,13 @@ def generate(root: Path) -> None:
         "#pragma once\n\nusing namespace ggml_cuda_mma;\n\n"
         "// Selectively vendored target-format int8-WMMA dot products.\n\n"
         + "\n".join(dot_parts),
+    )
+    _write_generated(
+        OUT / "mmq-vec-dot-q2-k-rolled.cuh",
+        commit,
+        "#pragma once\n\nusing namespace ggml_cuda_mma;\n\n"
+        "// DeepSeek gfx1151 Q2_K specialization with bounded compiler unrolling.\n\n"
+        + q2_rolled_dot,
     )
 
     common_text = (source / "ggml-common.h").read_text()

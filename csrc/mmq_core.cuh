@@ -13,7 +13,9 @@
 
 static constexpr int MMQ_I = 64;
 static constexpr int MMQ_J = 128;
+static constexpr int MMQ_J_MEDIUM = 80;
 static constexpr int MMQ_J_SMALL = 64;
+static constexpr int MMQ_J_TINY = 32;
 static constexpr int MMQ_NTHREADS = 128;
 static constexpr int MMQ_NWARPS = MMQ_NTHREADS / WARP_SIZE;
 
@@ -65,25 +67,33 @@ static constexpr __host__ __device__ int mmq_sram_stride(ggml_type type) {
 
 template <ggml_type type, int J, bool fallback>
 static constexpr __host__ __device__ int ggml_cuda_mmq_get_nthreads() {
-    static_assert(J == MMQ_J || J == MMQ_J_SMALL);
+    static_assert(
+        J == MMQ_J || J == MMQ_J_MEDIUM || J == MMQ_J_SMALL ||
+        J == MMQ_J_TINY);
     return MMQ_NTHREADS;
 }
 
 template <ggml_type type, int J, bool fallback>
 static constexpr __host__ __device__ int ggml_cuda_mmq_get_I() {
-    static_assert(J == MMQ_J || J == MMQ_J_SMALL);
+    static_assert(
+        J == MMQ_J || J == MMQ_J_MEDIUM || J == MMQ_J_SMALL ||
+        J == MMQ_J_TINY);
     return MMQ_I;
 }
 
 template <ggml_type type, int J, bool fallback>
 static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride() {
-    static_assert(J == MMQ_J || J == MMQ_J_SMALL);
+    static_assert(
+        J == MMQ_J || J == MMQ_J_MEDIUM || J == MMQ_J_SMALL ||
+        J == MMQ_J_TINY);
     return mmq_sram_stride(type);
 }
 
 template <ggml_type type, int J, bool fallback>
 static constexpr __host__ __device__ int ggml_cuda_mmq_get_rows_per_warp() {
-    static_assert(J == MMQ_J || J == MMQ_J_SMALL);
+    static_assert(
+        J == MMQ_J || J == MMQ_J_MEDIUM || J == MMQ_J_SMALL ||
+        J == MMQ_J_TINY);
     return 16;
 }
 
@@ -101,6 +111,9 @@ enum mmq_q8_1_ds_layout {
 
 #include "vendor/llama_cpp/mmq-load-targets.cuh"
 #include "vendor/llama_cpp/mmq-vec-dot-targets.cuh"
+#ifdef MMQ_USE_ROLLED_Q2_K
+#include "vendor/llama_cpp/mmq-vec-dot-q2-k-rolled.cuh"
+#endif
 
 template <ggml_type type, int J, bool fallback = true>
 static __device__ __forceinline__ void mmq_load_target(
@@ -137,7 +150,11 @@ static __device__ __forceinline__ void mmq_vec_dot_target(
         ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<
             type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>(x, y, sum, k00);
     } else if constexpr (type == GGML_TYPE_Q2_K) {
+#ifdef MMQ_USE_ROLLED_Q2_K
+        ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma_rolled<type, J, fallback>(x, y, sum, k00);
+#else
         ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma<type, J, fallback>(x, y, sum, k00);
+#endif
     } else if constexpr (type == GGML_TYPE_Q3_K || type == GGML_TYPE_IQ2_S) {
         ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>(x, y, sum, k00);
     } else if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {

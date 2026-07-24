@@ -5,7 +5,7 @@ from torch.utils import cpp_extension
 
 ROOT = Path(__file__).resolve().parent
 CSRC = ROOT / "csrc"
-SOURCE = "csrc/mmq_hip.cu"
+SOURCES = ["csrc/mmq_hip.cu", "csrc/deepseek_mmq_hip.cu"]
 HEADER_DEPENDENCIES = [
     path.relative_to(ROOT).as_posix() for path in sorted(CSRC.rglob("*.cuh"))
 ]
@@ -17,7 +17,7 @@ class BuildExtension(cpp_extension.BuildExtension):
     def get_source_files(self) -> list[str]:
         # CUDAExtension eagerly rewrites ext.sources to hipify-generated files
         # on ROCm. Source distributions should contain only the canonical input.
-        return [SOURCE, *HEADER_DEPENDENCIES]
+        return [*SOURCES, *HEADER_DEPENDENCIES]
 
 
 stable_defines = [
@@ -30,7 +30,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             name="torch_ggml_ops._C",
-            sources=[SOURCE],
+            sources=SOURCES,
             include_dirs=[str(CSRC)],
             depends=HEADER_DEPENDENCIES,
             extra_compile_args={

@@ -30,6 +30,21 @@
 #include <utility>
 #include <vector>
 
+void launch_deepseek_grouped_projection(
+    ggml_type type,
+    const char * packed,
+    const int * activations,
+    __hip_bfloat16 * output,
+    const int64_t * expert_indices,
+    const int32_t * expert_offsets,
+    int num_experts,
+    int num_groups,
+    int rows,
+    int in_features,
+    int out_features,
+    int64_t bytes_per_expert,
+    hipStream_t stream);
+
 namespace {
 
 using torch::headeronly::ScalarType;
@@ -344,6 +359,40 @@ void launch_grouped_projection(
             out_features,
             bytes_per_expert,
             stream);
+    } else if constexpr (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q2_K) {
+        const bool production_shape =
+            (type == GGML_TYPE_IQ2_XXS && out_features == 2048 && in_features == 4096) ||
+            (type == GGML_TYPE_Q2_K && out_features == 4096 && in_features == 2048);
+        if (production_shape) {
+            launch_deepseek_grouped_projection(
+                type,
+                packed,
+                activations,
+                output,
+                expert_indices,
+                expert_offsets,
+                num_experts,
+                num_groups,
+                rows,
+                in_features,
+                out_features,
+                bytes_per_expert,
+                stream);
+        } else {
+            launch_grouped_projection_kernel<type, MMQ_J>(
+                packed,
+                activations,
+                output,
+                expert_indices,
+                expert_offsets,
+                num_experts,
+                num_groups,
+                rows,
+                in_features,
+                out_features,
+                bytes_per_expert,
+                stream);
+        }
     } else {
         launch_grouped_projection_kernel<type, MMQ_J>(
             packed,
