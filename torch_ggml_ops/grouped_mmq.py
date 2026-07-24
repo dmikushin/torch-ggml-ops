@@ -1,6 +1,14 @@
 import torch
 
 
+@torch.library.register_fake("torch_ggml_ops::fixed_grouped_mmq")
+def _fixed_grouped_mmq_fake(
+    input: torch.Tensor,
+    packed_weight: torch.Tensor,
+) -> torch.Tensor:
+    return input.new_empty((*input.shape[:-1], packed_weight.shape[1]))
+
+
 @torch.library.register_fake("torch_ggml_ops::grouped_mmq")
 def _grouped_mmq_fake(
     input: torch.Tensor,
@@ -108,6 +116,18 @@ torch.library.register_autograd(
 )
 
 
+def _fixed_grouped_mmq_backward(ctx, grad_output: torch.Tensor):
+    raise RuntimeError(
+        "torch_ggml_ops::fixed_grouped_mmq does not support backward"
+    )
+
+
+torch.library.register_autograd(
+    "torch_ggml_ops::fixed_grouped_mmq",
+    _fixed_grouped_mmq_backward,
+)
+
+
 def _grouped_mmq_grad_input_backward(ctx, grad_grad_input: torch.Tensor):
     raise RuntimeError(
         "torch_ggml_ops::grouped_mmq_grad_input does not support higher-order gradients"
@@ -205,6 +225,18 @@ torch.library.register_autograd(
 )
 
 
+def fixed_grouped_mmq(
+    input: torch.Tensor,
+    packed_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Run fixed-group Q8_0 MMQ with weight shape [8, out_features, 4352]."""
+
+    return torch.ops.torch_ggml_ops.fixed_grouped_mmq.default(
+        input,
+        packed_weight,
+    )
+
+
 def grouped_mmq(
     input: torch.Tensor,
     packed_weight: torch.Tensor,
@@ -247,4 +279,4 @@ def grouped_mmq_pair(
     )
 
 
-__all__ = ["grouped_mmq", "grouped_mmq_pair"]
+__all__ = ["fixed_grouped_mmq", "grouped_mmq", "grouped_mmq_pair"]

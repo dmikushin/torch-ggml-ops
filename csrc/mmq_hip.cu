@@ -37,11 +37,55 @@ using torch::stable::Tensor;
 
 int64_t packed_block_bytes(int64_t quant_type) {
     switch (quant_type) {
+        case GGML_TYPE_Q8_0: return sizeof(block_q8_0);
+        case GGML_TYPE_Q2_K: return sizeof(block_q2_K);
         case GGML_TYPE_Q3_K: return sizeof(block_q3_K);
         case GGML_TYPE_Q4_K: return sizeof(block_q4_K);
         case GGML_TYPE_Q5_K: return sizeof(block_q5_K);
         case GGML_TYPE_Q6_K: return sizeof(block_q6_K);
+        case GGML_TYPE_IQ2_XXS: return sizeof(block_iq2_xxs);
         case GGML_TYPE_IQ2_S: return sizeof(block_iq2_s);
+        default:
+            STD_TORCH_CHECK(false, "unsupported quant_type: ", quant_type);
+    }
+}
+
+int64_t packed_block_values(int64_t quant_type) {
+    return quant_type == GGML_TYPE_Q8_0 ? QK8_0 : QK_K;
+}
+
+int64_t packed_row_bytes(int64_t quant_type, int64_t in_features) {
+    return (in_features / packed_block_values(quant_type)) *
+        packed_block_bytes(quant_type);
+}
+
+template <typename Function>
+void dispatch_forward_quant_type(int64_t quant_type, Function && function) {
+    switch (quant_type) {
+        case GGML_TYPE_Q8_0:
+            function(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
+            break;
+        case GGML_TYPE_Q2_K:
+            function(std::integral_constant<ggml_type, GGML_TYPE_Q2_K>{});
+            break;
+        case GGML_TYPE_Q3_K:
+            function(std::integral_constant<ggml_type, GGML_TYPE_Q3_K>{});
+            break;
+        case GGML_TYPE_Q4_K:
+            function(std::integral_constant<ggml_type, GGML_TYPE_Q4_K>{});
+            break;
+        case GGML_TYPE_Q5_K:
+            function(std::integral_constant<ggml_type, GGML_TYPE_Q5_K>{});
+            break;
+        case GGML_TYPE_Q6_K:
+            function(std::integral_constant<ggml_type, GGML_TYPE_Q6_K>{});
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            function(std::integral_constant<ggml_type, GGML_TYPE_IQ2_XXS>{});
+            break;
+        case GGML_TYPE_IQ2_S:
+            function(std::integral_constant<ggml_type, GGML_TYPE_IQ2_S>{});
+            break;
         default:
             STD_TORCH_CHECK(false, "unsupported quant_type: ", quant_type);
     }
@@ -76,6 +120,11 @@ void check_hip(hipError_t status, const char * operation) {
 
 int sram_stride_host(int64_t quant_type) {
     switch (quant_type) {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ2_XXS:
+            return mmq_sram_stride(GGML_TYPE_Q8_0);
+        case GGML_TYPE_Q2_K:
+            return mmq_sram_stride(GGML_TYPE_Q2_K);
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_IQ2_S:
             return mmq_sram_stride(GGML_TYPE_Q3_K);
@@ -373,7 +422,7 @@ GroupedMMQShape validate_grouped_mmq(
     STD_TORCH_CHECK(num_experts <= std::numeric_limits<int>::max(), "expert count exceeds the kernel limit");
     STD_TORCH_CHECK(num_groups <= std::numeric_limits<int>::max(), "active expert count exceeds the kernel limit");
 
-    const int64_t row_bytes = (in_features / QK_K) * packed_block_bytes(quant_type);
+    const int64_t row_bytes = packed_row_bytes(quant_type, in_features);
     STD_TORCH_CHECK(packed_weight.size(1) == out_features, "packed_weight physical output dimension does not match out_features");
     STD_TORCH_CHECK(
         packed_weight.size(2) == row_bytes,
@@ -483,8 +532,7 @@ GroupedMMQShape validate_grouped_mmq_grad_input(
     STD_TORCH_CHECK(num_experts <= std::numeric_limits<int>::max(), "expert count exceeds the kernel limit");
     STD_TORCH_CHECK(num_groups <= std::numeric_limits<int>::max(), "active expert count exceeds the kernel limit");
 
-    const int64_t row_bytes =
-        (in_features / QK_K) * packed_block_bytes(quant_type);
+    const int64_t row_bytes = packed_row_bytes(quant_type, in_features);
     STD_TORCH_CHECK(
         packed_weight.size(1) == out_features,
         "packed_weight physical output dimension does not match grad_output");
@@ -584,6 +632,152 @@ Tensor new_grouped_backward_row_task_workspace(
         ScalarType::Byte);
 }
 
+Tensor fixed_grouped_mmq_cuda(
+        const Tensor & input,
+        const Tensor & packed_weight) {
+    constexpr int groups = 8;
+    constexpr int in_features = 4096;
+    constexpr int blocks_per_weight_row = in_features / QK_K;
+    constexpr int row_bytes = (in_features / QK8_0) * sizeof(block_q8_0);
+
+    STD_TORCH_CHECK(input.is_cuda(), "input must be a CUDA/HIP tensor");
+    STD_TORCH_CHECK(packed_weight.is_cuda(), "packed_weight must be a CUDA/HIP tensor");
+    STD_TORCH_CHECK(
+        input.get_device_index() == packed_weight.get_device_index(),
+        "input and packed_weight must be on the same device");
+    STD_TORCH_CHECK(
+        input.scalar_type() == ScalarType::BFloat16,
+        "input must have dtype torch.bfloat16");
+    STD_TORCH_CHECK(
+        packed_weight.scalar_type() == ScalarType::Byte,
+        "packed_weight must have dtype torch.uint8");
+    STD_TORCH_CHECK(
+        input.is_contiguous(),
+        "input must be contiguous; torch_ggml_ops will not insert a hidden copy");
+    STD_TORCH_CHECK(
+        packed_weight.is_contiguous(),
+        "packed_weight must be contiguous; torch_ggml_ops will not insert a hidden copy");
+    STD_TORCH_CHECK(input.storage_offset() == 0, "input must have zero storage offset");
+    STD_TORCH_CHECK(
+        packed_weight.storage_offset() == 0,
+        "packed_weight must have zero storage offset");
+    STD_TORCH_CHECK(
+        input.dim() >= 2 && input.size(input.dim() - 2) == groups &&
+            input.size(input.dim() - 1) == in_features,
+        "fixed_grouped_mmq input must have shape [..., 8, 4096]");
+    STD_TORCH_CHECK(
+        packed_weight.dim() == 3 &&
+            packed_weight.size(0) == groups &&
+            packed_weight.size(2) == row_bytes,
+        "fixed_grouped_mmq packed_weight must have shape [8, out_features, 4352]");
+
+    const int64_t out_features = packed_weight.size(1);
+    STD_TORCH_CHECK(out_features > 0, "out_features must be positive");
+    STD_TORCH_CHECK(
+        out_features <= std::numeric_limits<int>::max(),
+        "out_features exceeds the kernel limit");
+    const int64_t bytes_per_group = out_features * row_bytes;
+    const int64_t total_rows = input.numel() / in_features;
+    const int64_t tokens = total_rows / groups;
+    STD_TORCH_CHECK(tokens > 0, "zero-token inputs are not supported");
+    STD_TORCH_CHECK(
+        total_rows <= std::numeric_limits<int>::max(),
+        "fixed-group activation row count exceeds the kernel limit");
+    STD_TORCH_CHECK(
+        tokens <= std::numeric_limits<int>::max(),
+        "fixed-group token count exceeds the kernel limit");
+    STD_TORCH_CHECK(
+        packed_weight.numel() == groups * bytes_per_group,
+        "fixed-group packed_weight byte count is inconsistent with its logical shape");
+
+    const auto input_address = reinterpret_cast<uintptr_t>(input.const_data_ptr());
+    const auto packed_address =
+        reinterpret_cast<uintptr_t>(packed_weight.const_data_ptr());
+    STD_TORCH_CHECK(input_address % 16 == 0, "input data pointer must be 16-byte aligned");
+    STD_TORCH_CHECK(
+        packed_address % 16 == 0,
+        "packed_weight data pointer must be 16-byte aligned");
+
+    const int32_t device_index = input.get_device_index();
+    torch::stable::accelerator::DeviceGuard guard(device_index);
+    std::vector<int64_t> output_sizes(input.sizes().begin(), input.sizes().end());
+    output_sizes.back() = out_features;
+    Tensor output = torch::stable::new_empty(
+        input,
+        torch::headeronly::IntHeaderOnlyArrayRef(
+            output_sizes.data(), output_sizes.size()),
+        ScalarType::BFloat16);
+
+    const int64_t workspace_bytes =
+        total_rows * (in_features / (4 * QK8_1)) * sizeof(block_q8_1_mmq);
+    std::array<int64_t, 1> workspace_size{workspace_bytes};
+    Tensor workspace = torch::stable::new_empty(
+        input,
+        torch::headeronly::IntHeaderOnlyArrayRef(
+            workspace_size.data(), workspace_size.size()),
+        ScalarType::Byte);
+
+    void * stream_pointer = nullptr;
+    TORCH_ERROR_CODE_CHECK(
+        aoti_torch_get_current_cuda_stream(device_index, &stream_pointer));
+    hipStream_t stream = static_cast<hipStream_t>(stream_pointer);
+
+    const auto * input_pointer =
+        static_cast<const __hip_bfloat16 *>(input.const_data_ptr());
+    const auto * packed_pointer =
+        static_cast<const char *>(packed_weight.const_data_ptr());
+    auto * output_pointer =
+        static_cast<__hip_bfloat16 *>(output.mutable_data_ptr());
+    auto * workspace_pointer =
+        static_cast<block_q8_1_mmq *>(workspace.mutable_data_ptr());
+
+    quantize_bf16_mmq_q8_1<GGML_TYPE_Q8_0>
+        <<<dim3(total_rows, 1, 1), dim3(512, 1, 1), 0, stream>>>(
+            input_pointer,
+            workspace_pointer,
+            total_rows,
+            total_rows,
+            in_features);
+    check_hip(
+        hipGetLastError(),
+        "fixed-group quantize_bf16_mmq_q8_1 launch");
+
+    constexpr int J = MMQ_J_SMALL;
+    const dim3 grid(
+        (out_features + MMQ_I - 1) / MMQ_I,
+        (tokens + J - 1) / J,
+        groups);
+    const dim3 block(WARP_SIZE, MMQ_NWARPS, 1);
+    const int shared_ints = J + GGML_PAD(J * MMQ_TILE_Y_K, MMQ_NTHREADS) +
+        MMQ_I * sram_stride_host(GGML_TYPE_Q8_0);
+    if (out_features % MMQ_I == 0) {
+        fixed_grouped_q8_0_mmq_bf16_kernel<
+            J, groups, blocks_per_weight_row, false>
+            <<<grid, block, shared_ints * sizeof(int), stream>>>(
+                packed_pointer,
+                reinterpret_cast<const int *>(workspace_pointer),
+                output_pointer,
+                static_cast<int>(tokens),
+                static_cast<int>(out_features),
+                bytes_per_group);
+    } else {
+        fixed_grouped_q8_0_mmq_bf16_kernel<
+            J, groups, blocks_per_weight_row, true>
+            <<<grid, block, shared_ints * sizeof(int), stream>>>(
+                packed_pointer,
+                reinterpret_cast<const int *>(workspace_pointer),
+                output_pointer,
+                static_cast<int>(tokens),
+                static_cast<int>(out_features),
+                bytes_per_group);
+    }
+    check_hip(
+        hipGetLastError(),
+        "fixed_grouped_q8_0_mmq_bf16_kernel launch");
+
+    return output;
+}
+
 Tensor mmq_cuda(
         const Tensor & input,
         const Tensor & packed_weight,
@@ -610,8 +804,8 @@ Tensor mmq_cuda(
     STD_TORCH_CHECK(in_features <= std::numeric_limits<int>::max(), "in_features exceeds the kernel limit");
     STD_TORCH_CHECK(out_features <= std::numeric_limits<int>::max(), "out_features exceeds the kernel limit");
 
-    const int64_t block_bytes = packed_block_bytes(quant_type);
-    const int64_t expected_packed_bytes = out_features * (in_features / QK_K) * block_bytes;
+    const int64_t expected_packed_bytes =
+        out_features * packed_row_bytes(quant_type, in_features);
     STD_TORCH_CHECK(
         packed_weight.numel() == expected_packed_bytes,
         "packed_weight has ",
@@ -660,7 +854,7 @@ Tensor mmq_cuda(
     auto * output_pointer = static_cast<__hip_bfloat16 *>(output.mutable_data_ptr());
     auto * workspace_pointer = static_cast<block_q8_1_mmq *>(workspace_tensor.mutable_data_ptr());
 
-    dispatch_quant_type(quant_type, [&](auto type_tag) {
+    dispatch_forward_quant_type(quant_type, [&](auto type_tag) {
         constexpr ggml_type type = decltype(type_tag)::value;
         launch_dense_mmq<type>(
             input_pointer,
@@ -718,9 +912,8 @@ Tensor mmq_grad_input_cuda(
     STD_TORCH_CHECK(in_features <= std::numeric_limits<int>::max(), "in_features exceeds the kernel limit");
     STD_TORCH_CHECK(out_features <= std::numeric_limits<int>::max(), "out_features exceeds the kernel limit");
 
-    const int64_t block_bytes = packed_block_bytes(quant_type);
     const int64_t expected_packed_bytes =
-        out_features * (in_features / QK_K) * block_bytes;
+        out_features * packed_row_bytes(quant_type, in_features);
     STD_TORCH_CHECK(
         packed_weight.numel() == expected_packed_bytes,
         "packed_weight has ",
@@ -1025,7 +1218,7 @@ Tensor grouped_mmq_cuda(
         return output;
     }
 
-    dispatch_quant_type(quant_type, [&](auto type_tag) {
+    dispatch_forward_quant_type(quant_type, [&](auto type_tag) {
         constexpr ggml_type type = decltype(type_tag)::value;
         launch_grouped_quantize<type>(
             input_pointer,
@@ -1153,7 +1346,7 @@ std::tuple<Tensor, Tensor> grouped_mmq_pair_cuda(
         return std::make_tuple(std::move(first_output), std::move(second_output));
     }
 
-    dispatch_quant_type(quant_type, [&](auto type_tag) {
+    dispatch_forward_quant_type(quant_type, [&](auto type_tag) {
         constexpr ggml_type type = decltype(type_tag)::value;
         launch_grouped_quantize<type>(
             input_pointer,
@@ -1195,6 +1388,7 @@ std::tuple<Tensor, Tensor> grouped_mmq_pair_cuda(
 } // namespace
 
 STABLE_TORCH_LIBRARY(torch_ggml_ops, m) {
+    m.def("fixed_grouped_mmq(Tensor input, Tensor packed_weight) -> Tensor");
     m.def("mmq(Tensor input, Tensor packed_weight, int quant_type, int out_features) -> Tensor");
     m.def(
         "mmq_grad_input(Tensor grad_output, Tensor packed_weight, int quant_type, "
@@ -1215,6 +1409,7 @@ STABLE_TORCH_LIBRARY(torch_ggml_ops, m) {
 }
 
 STABLE_TORCH_LIBRARY_IMPL(torch_ggml_ops, CUDA, m) {
+    m.impl("fixed_grouped_mmq", TORCH_BOX(&fixed_grouped_mmq_cuda));
     m.impl("mmq", TORCH_BOX(&mmq_cuda));
     m.impl("mmq_grad_input", TORCH_BOX(&mmq_grad_input_cuda));
     m.impl("grouped_mmq_grad_input", TORCH_BOX(&grouped_mmq_grad_input_cuda));

@@ -41,10 +41,13 @@ using nv_bfloat162 = __hip_bfloat162;
 
 // GGML quantization identifiers used by the checkpoint.
 enum ggml_type : int32_t {
+    GGML_TYPE_Q8_0 = 8,
+    GGML_TYPE_Q2_K = 10,
     GGML_TYPE_Q3_K = 11,
     GGML_TYPE_Q4_K = 12,
     GGML_TYPE_Q5_K = 13,
     GGML_TYPE_Q6_K = 14,
+    GGML_TYPE_IQ2_XXS = 16,
     GGML_TYPE_IQ2_S = 22,
     GGML_TYPE_COUNT = 40,
 };
@@ -58,6 +61,8 @@ enum ggml_type : int32_t {
 #define QI8_0 (QK8_0 / (4 * QR8_0))
 #define QR8_1 1
 #define QI8_1 (QK8_1 / (4 * QR8_1))
+#define QR2_K 4
+#define QI2_K (QK_K / (4 * QR2_K))
 #define QR3_K 4
 #define QI3_K (QK_K / (4 * QR3_K))
 #define QR4_K 2
@@ -66,14 +71,35 @@ enum ggml_type : int32_t {
 #define QI5_K (QK_K / (4 * QR5_K))
 #define QR6_K 2
 #define QI6_K (QK_K / (4 * QR6_K))
+#define QR2_XXS 4
+#define QI2_XXS (QK_K / (4 * QR2_XXS))
 #define QR2_S 4
 #define QI2_S (QK_K / (4 * QR2_S))
+
+struct block_q8_0 {
+    half d;
+    int8_t qs[QK8_0];
+};
+static_assert(sizeof(block_q8_0) == 34, "wrong q8_0 block size");
 
 struct block_q8_1 {
     half2 ds;
     int8_t qs[QK8_1];
 };
 static_assert(sizeof(block_q8_1) == 36, "wrong q8_1 block size");
+
+struct block_q2_K {
+    uint8_t scales[QK_K / 16];
+    uint8_t qs[QK_K / 4];
+    union {
+        struct {
+            half d;
+            half dmin;
+        };
+        half2 dm;
+    };
+};
+static_assert(sizeof(block_q2_K) == 84, "wrong q2_K block size");
 
 struct block_q3_K {
     uint8_t hmask[QK_K / 8];
@@ -117,6 +143,12 @@ struct block_q6_K {
     half d;
 };
 static_assert(sizeof(block_q6_K) == 210, "wrong q6_K block size");
+
+struct block_iq2_xxs {
+    half d;
+    uint16_t qs[QK_K / 8];
+};
+static_assert(sizeof(block_iq2_xxs) == 66, "wrong iq2_xxs block size");
 
 struct block_iq2_s {
     half d;
@@ -194,9 +226,16 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int i32) 
     return tmp;
 }
 
+static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t value) {
+    const uint32_t parity = __popc(value) & 1;
+    const uint32_t signs = value ^ (parity << 7);
+    return signs * 0x01010101U;
+}
+
 template <ggml_type type>
 struct ggml_cuda_type_traits {
     static constexpr int qk = QK_K;
 };
 
 #include "iq2_s_grid.cuh"
+#include "iq2_xxs_grid.cuh"

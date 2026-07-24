@@ -28,23 +28,33 @@ struct block_q8_1_mmq {
 static_assert(sizeof(block_q8_1_mmq) == 144, "unexpected MMQ Q8_1 block size");
 
 enum ggml_cuda_mmq_sram_layout {
+    GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1,
+    GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K,
 };
 
 static constexpr __host__ __device__ ggml_cuda_mmq_sram_layout mmq_sram_layout(ggml_type type) {
-    return type == GGML_TYPE_Q3_K || type == GGML_TYPE_IQ2_S
-        ? GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K
-        : type == GGML_TYPE_Q6_K
-            ? GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K
-            : GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1;
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ2_XXS
+        ? GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0
+        : type == GGML_TYPE_Q2_K
+            ? GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K
+            : type == GGML_TYPE_Q3_K || type == GGML_TYPE_IQ2_S
+                ? GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K
+                : type == GGML_TYPE_Q6_K
+                    ? GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K
+                    : GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1;
 }
 
 static constexpr __host__ __device__ int mmq_sram_stride(ggml_type type) {
     switch (mmq_sram_layout(type)) {
+        case GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0:
+            return 2 * MMQ_TILE_NE_K + 2 * MMQ_TILE_NE_K / QI8_0 + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1:
             return 2 * MMQ_TILE_NE_K + 2 * MMQ_TILE_NE_K / QI8_1 + 4;
+        case GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K:
+            return 2 * MMQ_TILE_NE_K + MMQ_TILE_NE_K + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K:
             return 2 * MMQ_TILE_NE_K + MMQ_TILE_NE_K / 2 + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K:
@@ -83,13 +93,29 @@ static constexpr __device__ int ggml_cuda_mmq_get_I(ggml_type, int, bool) { retu
 static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, int, bool) { return mmq_sram_stride(type); }
 static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type, int, bool) { return 16; }
 
+enum mmq_q8_1_ds_layout {
+    MMQ_Q8_1_DS_LAYOUT_D4,
+    MMQ_Q8_1_DS_LAYOUT_DS4,
+    MMQ_Q8_1_DS_LAYOUT_D2S6,
+};
+
 #include "vendor/llama_cpp/mmq-load-targets.cuh"
 #include "vendor/llama_cpp/mmq-vec-dot-targets.cuh"
 
 template <ggml_type type, int J, bool fallback = true>
 static __device__ __forceinline__ void mmq_load_target(
         const char * x, int * tile, int block_offset, int i_max, int row_stride) {
-    if constexpr (type == GGML_TYPE_Q3_K) {
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        constexpr int blocks_per_iteration = MMQ_ITER_K / QK8_0;
+        ggml_cuda_mmq_load_tiles_q8_0<type, J, fallback>(
+            x,
+            tile,
+            block_offset * blocks_per_iteration,
+            i_max,
+            row_stride * blocks_per_iteration);
+    } else if constexpr (type == GGML_TYPE_Q2_K) {
+        ggml_cuda_mmq_load_tiles_q2_K<type, J, fallback>(x, tile, block_offset, i_max, row_stride);
+    } else if constexpr (type == GGML_TYPE_Q3_K) {
         ggml_cuda_mmq_load_tiles_q3_K<type, J, fallback>(x, tile, block_offset, i_max, row_stride);
     } else if constexpr (type == GGML_TYPE_Q4_K) {
         ggml_cuda_mmq_load_tiles_q4_K<type, J, fallback>(x, tile, block_offset, i_max, row_stride);
@@ -97,6 +123,8 @@ static __device__ __forceinline__ void mmq_load_target(
         ggml_cuda_mmq_load_tiles_q5_K<type, J, fallback>(x, tile, block_offset, i_max, row_stride);
     } else if constexpr (type == GGML_TYPE_Q6_K) {
         ggml_cuda_mmq_load_tiles_q6_K<type, J, fallback>(x, tile, block_offset, i_max, row_stride);
+    } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
+        ggml_cuda_mmq_load_tiles_iq2_xxs<type, J, fallback>(x, tile, block_offset, i_max, row_stride);
     } else if constexpr (type == GGML_TYPE_IQ2_S) {
         ggml_cuda_mmq_load_tiles_iq2_s<type, J, fallback>(x, tile, block_offset, i_max, row_stride);
     }
@@ -105,7 +133,12 @@ static __device__ __forceinline__ void mmq_load_target(
 template <ggml_type type, int J, bool fallback = true>
 static __device__ __forceinline__ void mmq_vec_dot_target(
         const int * x, const int * y, float * sum, int k00) {
-    if constexpr (type == GGML_TYPE_Q3_K || type == GGML_TYPE_IQ2_S) {
+    if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ2_XXS) {
+        ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<
+            type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>(x, y, sum, k00);
+    } else if constexpr (type == GGML_TYPE_Q2_K) {
+        ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma<type, J, fallback>(x, y, sum, k00);
+    } else if constexpr (type == GGML_TYPE_Q3_K || type == GGML_TYPE_IQ2_S) {
         ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>(x, y, sum, k00);
     } else if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
         ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma<type, J, fallback>(x, y, sum, k00);
@@ -138,14 +171,13 @@ static __device__ __forceinline__ void mmq_write_back_bf16(
     }
 }
 
-enum mmq_q8_layout {
-    MMQ_Q8_D4,
-    MMQ_Q8_DS4,
-};
-
 template <ggml_type type>
-static constexpr __host__ __device__ mmq_q8_layout mmq_activation_layout() {
-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? MMQ_Q8_DS4 : MMQ_Q8_D4;
+static constexpr __host__ __device__ mmq_q8_1_ds_layout mmq_activation_layout() {
+    return type == GGML_TYPE_Q2_K
+        ? MMQ_Q8_1_DS_LAYOUT_D2S6
+        : type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K
+            ? MMQ_Q8_1_DS_LAYOUT_DS4
+            : MMQ_Q8_1_DS_LAYOUT_D4;
 }
 
 template <ggml_type type>
@@ -156,7 +188,11 @@ static __global__ void quantize_bf16_mmq_q8_1(
         int64_t rows,
         int64_t rows_padded,
         int64_t k) {
-    constexpr mmq_q8_layout layout = mmq_activation_layout<type>();
+    constexpr mmq_q8_1_ds_layout layout = mmq_activation_layout<type>();
+    constexpr int values_per_scale =
+        layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int values_per_sum =
+        layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
     const int64_t row = blockIdx.x;
 
     for (int64_t i0 = static_cast<int64_t>(threadIdx.x) * 4;
@@ -173,14 +209,14 @@ static __global__ void quantize_bf16_mmq_q8_1(
             fmaxf(fabsf(xi.x), fabsf(xi.y)),
             fmaxf(fabsf(xi.z), fabsf(xi.w)));
 #pragma unroll
-        for (int offset = 4; offset > 0; offset >>= 1) {
+        for (int offset = values_per_scale / 8; offset > 0; offset >>= 1) {
             amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset, WARP_SIZE));
         }
 
         float sum = xi.x + xi.y + xi.z + xi.w;
-        if constexpr (layout == MMQ_Q8_DS4) {
+        if constexpr (layout != MMQ_Q8_1_DS_LAYOUT_D4) {
 #pragma unroll
-            for (int offset = 4; offset > 0; offset >>= 1) {
+            for (int offset = values_per_sum / 8; offset > 0; offset >>= 1) {
                 sum += __shfl_xor_sync(0xffffffff, sum, offset, WARP_SIZE);
             }
         }
@@ -198,8 +234,15 @@ static __global__ void quantize_bf16_mmq_q8_1(
         block_q8_1_mmq & out = y[block_k * rows_padded + row];
         reinterpret_cast<char4 *>(out.qs)[iqs / 4] = q;
 
-        if (iqs % 32 == 0) {
-            if constexpr (layout == MMQ_Q8_DS4) {
+        if constexpr (layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+            if (iqs % 16 == 0 && iqs < 96) {
+                out.d2s6[2 + iqs / 16] = sum;
+                if (iqs % 64 == 0) {
+                    out.d2s6[iqs / 64] = d;
+                }
+            }
+        } else if (iqs % 32 == 0) {
+            if constexpr (layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
                 out.ds4[iqs / 32] = make_half2(d, sum);
             } else {
                 out.d4[iqs / 32] = d;
@@ -262,6 +305,96 @@ static __global__ void dense_mmq_bf16_kernel(
         sum,
         dst + tile_j * J * nrows_weight + tile_i * MMQ_I,
         nrows_weight,
+        i_max,
+        j_max);
+}
+
+template <int J, int groups, int blocks_per_weight_row, bool fallback>
+__launch_bounds__(MMQ_NTHREADS, 2)
+static __global__ void fixed_grouped_q8_0_mmq_bf16_kernel(
+        const char * __restrict__ weights,
+        const int * __restrict__ activations,
+        __hip_bfloat16 * __restrict__ dst,
+        int tokens,
+        int nrows_weight,
+        int64_t bytes_per_group) {
+    constexpr ggml_type type = GGML_TYPE_Q8_0;
+    constexpr int q8_block_ints = sizeof(block_q8_1_mmq) / sizeof(int);
+    static_assert(MMQ_TILE_Y_K == q8_block_ints, "unexpected fixed-group Q8 tile layout");
+
+    const int tile_i = blockIdx.x;
+    const int token_start = blockIdx.y * J;
+    const int group = blockIdx.z;
+    const int i_max = min(MMQ_I, nrows_weight - tile_i * MMQ_I) - 1;
+    const int j_max = min(J, tokens - token_start) - 1;
+    if (j_max < 0) {
+        return;
+    }
+
+    const int total_activation_rows = tokens * groups;
+    const char * group_weights = weights + static_cast<int64_t>(group) * bytes_per_group;
+    extern __shared__ int shared[];
+    int * tile_y = shared + J;
+    int * tile_x = tile_y + GGML_PAD(J * MMQ_TILE_Y_K, MMQ_NTHREADS);
+    float sum[J * MMQ_I / MMQ_NTHREADS] = {0.0f};
+
+#pragma unroll 1
+    for (int kb = 0; kb < blocks_per_weight_row; ++kb) {
+        const int weight_block_offset =
+            tile_i * MMQ_I * blocks_per_weight_row + kb;
+        mmq_load_target<type, J, fallback>(
+            group_weights,
+            tile_x,
+            weight_block_offset,
+            i_max,
+            blocks_per_weight_row);
+
+#pragma unroll
+        for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += MMQ_NTHREADS) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            const int local_token = l / q8_block_ints;
+            const int q8_int = l % q8_block_ints;
+            if (local_token <= j_max) {
+                const int activation_row =
+                    (token_start + local_token) * groups + group;
+                tile_y[l] = activations[
+                    ((2 * kb) * total_activation_rows + activation_row) *
+                        q8_block_ints +
+                    q8_int];
+            } else {
+                tile_y[l] = 0;
+            }
+        }
+        __syncthreads();
+        mmq_vec_dot_target<type, J, fallback>(tile_x, tile_y, sum, 0);
+        __syncthreads();
+
+#pragma unroll
+        for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += MMQ_NTHREADS) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            const int local_token = l / q8_block_ints;
+            const int q8_int = l % q8_block_ints;
+            if (local_token <= j_max) {
+                const int activation_row =
+                    (token_start + local_token) * groups + group;
+                tile_y[l] = activations[
+                    ((2 * kb + 1) * total_activation_rows + activation_row) *
+                        q8_block_ints +
+                    q8_int];
+            } else {
+                tile_y[l] = 0;
+            }
+        }
+        __syncthreads();
+        mmq_vec_dot_target<type, J, fallback>(
+            tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        __syncthreads();
+    }
+
+    mmq_write_back_bf16<type, J, !fallback, false>(
+        sum,
+        dst + (token_start * groups + group) * nrows_weight + tile_i * MMQ_I,
+        groups * nrows_weight,
         i_max,
         j_max);
 }

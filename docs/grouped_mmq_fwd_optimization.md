@@ -2,17 +2,18 @@
 
 ## Scope
 
-This document covers routed grouped MMQ forward on gfx1151.
+This document covers routed and fixed-group grouped MMQ forward on gfx1151.
 
 The production operators are:
-- `grouped_mmq_pair` for gate and up.
-- `grouped_mmq` for down.
+- `grouped_mmq_pair` for routed gate and up.
+- `grouped_mmq` for routed down.
+- `fixed_grouped_mmq` for DeepSeek output A.
 
 Dense MMQ forward and backward are documented separately in `docs/mmq_fwd_optimization.md` and `docs/mmq_bwd_optimization.md`.
 
-The grouped optimization pass is complete for the current packed representation. The original spill-heavy baseline and all experiment logs remain below for provenance, but the source of record is the spill-free G11 dispatch and `/tmp/grouped_mmq_fwd_final_full_v2.json`.
+The grouped optimization pass is complete for the current Qwen packed representation. The original spill-heavy baseline and all experiment logs remain below for provenance, but the source of record is the spill-free G11 dispatch and `/tmp/grouped_mmq_fwd_final_full_v2.json`. DeepSeek-V4-Flash forward correctness and benchmark coverage are implemented; its three new production families are not yet performance-tuned.
 
-## Current status
+## Qwen current status
 
 Done:
 - specialized production gate/up and down shapes at compile time with `I=64`, `J=64`, and 128 threads.
@@ -30,9 +31,9 @@ Final outcome:
 - checkpoint-weighted packed grouped projections are 1.53-2.82x faster than AITER across the measured batch/distribution matrix.
 - the only remaining individual losses are nonuniform IQ2_S down at batch 1 and batch 4.
 
-Remaining work is representation-level: compact lossless IQ2_S decode caching, cross-call decoded-weight reuse, or a transient project-owned decoded dense stage. The local tile, scheduler, K-loop, bounds, cache, and synchronization neighborhoods are closed.
+Remaining work for the current Qwen workload is representation-level: compact lossless IQ2_S decode caching, cross-call decoded-weight reuse, or a transient project-owned decoded dense stage. Its local tile, scheduler, K-loop, bounds, cache, and synchronization neighborhoods are closed.
 
-## Production contract
+## Qwen production contract
 
 The public activation and output dtype is BF16.
 
@@ -58,7 +59,7 @@ Batch 1 commonly has about 150-256 active experts per layer. The observed mean w
 
 One representative batch-1 layer had 192 active experts and group sizes around 60-106 rows. Batch 4 and batch 16 usually activate all 256 experts, although the sizes remain skewed.
 
-## Production checkpoint matrix
+## Qwen production checkpoint matrix
 
 The benchmark uses real tensors from `Qwen3.6-35B-A3B-APEX-I-Mini.gguf`.
 
@@ -72,6 +73,191 @@ The benchmark uses real tensors from `Qwen3.6-35B-A3B-APEX-I-Mini.gguf`.
 
 Gate and up use one shared Q8_1 activation workspace. The two packed projections still execute as two grouped multiplication launches.
 
+## DeepSeek-V4-Flash expansion and optimization plan
+
+### Implementation status
+
+Correctness support is implemented for two routed expert formats and one semantically distinct fixed-group projection. Performance tuning has not started. The production checkpoint matrix is:
+
+| Benchmark case | Groups/experts | Logical weight per group/expert `(N, K)` | Physical packed shape | GGUF type | Tensors | Operator |
+| --- | ---: | ---: | ---: | --- | ---: | --- |
+| `ds4_output_a_q8_0` | 8 fixed groups | `(1024, 4096)` | raw `(8192, 4352)`, operator view `(8, 1024, 4352)` | Q8_0 | 43 | `fixed_grouped_mmq` |
+| `ds4_gate_up_iq2_xxs` | 256 experts | `(2048, 4096)` | `(256, 2048, 1056)` each | IQ2_XXS | 43 pairs | `grouped_mmq_pair` |
+| `ds4_down_q2_k` | 256 experts | `(4096, 2048)` | `(256, 4096, 672)` | Q2_K | 43 | `grouped_mmq` |
+
+DeepSeek uses top-six routing. The exact batch targets are:
+
+| Physical batch | Token rows M | Routed rows R | Mean rows/expert if all 256 are active |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,048 | 12,288 | 48 |
+| 4 | 8,192 | 49,152 | 192 |
+| 16 | 32,768 | 196,608 | 768 |
+
+The fixed output-A operator consumes logical input `[..., 8, 4096]` and produces `[..., 8, N]`, where `N` is carried by the packed logical view. Production uses `N=1024`. This mirrors llama.cpp reshaping the raw logical `(8192, 4096)` weight to eight `(1024, 4096)` matrices before MMQ. It uses token rows `M`, not routed rows `R`; flattening it into an ordinary `4096 -> 8192` projection is invalid.
+
+The implemented forward contract is:
+- paired `IQ2_XXS` gate/up execution with one shared Q8_1 activation workspace and independent packed weights and outputs.
+- direct packed `Q2_K` down execution without selected logical expert matrices.
+- one Q8_1 activation workspace shared by all eight fixed output-A groups.
+- device-resident route metadata with no `.item()`, CPU descriptor, or hidden synchronization.
+- forward-only dispatch for the three new formats until their independent backward decoders exist.
+- Transformers GGUF dequantization as the independent numerical reference.
+
+Focused real-checkpoint validation is bitwise exact against separate dense packed MMQ calls. Observed normalized RMSE against independent BF16 references is approximately `0.0061` for `Q8_0` and `IQ2_XXS`, and `0.0121` for `Q2_K`. These are correctness checks, not accepted production performance baselines.
+
+### Benchmark matrix
+
+`bench/benchmark_grouped_mmq_fwd.py` is model-family-aware. Auto detection keeps the Qwen checkpoint on its original five cases and selects the three cases above when `blk.0.attn_output_a.weight` is present. An explicit `--model-family` override is available. Routed top-k defaults to eight for Qwen and six for DeepSeek; `--top-k` is an explicit override.
+
+The complete DeepSeek matrix has 27 points:
+- fixed output A: three physical batches, one fixed distribution.
+- routed gate/up: three physical batches by four route distributions, 12 points.
+- routed down: three physical batches by four route distributions, 12 points.
+- the routed pair contributes one complete public-operator timing per point while accounting for two logical projections.
+
+Routed cases retain BF16 AITER GMM with the project-owned heuristic as their timed reference. Fixed output A uses BF16 `torch.bmm` over eight strided groups and includes conversion back to the public token-major contiguous output layout. Setup-only dequantization is excluded from both references.
+
+Every point records:
+- complete packed public-operator latency, including Q8_1 quantization and workspace allocation.
+- logical throughput, allocation growth, physical packed shape, quant type, and group summary.
+- bitwise comparison with separate dense packed MMQ calls.
+- error against independently dequantized BF16 AITER or BF16 batched GEMM.
+- checkpoint-weighted forward and recomputation estimates using 43 layers.
+
+Baseline commands are:
+
+```bash
+python bench/benchmark_grouped_mmq_fwd.py \
+  --model ~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf \
+  --model-family deepseek \
+  --warmup 3 \
+  --repeats 9 \
+  --correctness-rows 256 \
+  --output /tmp/grouped_mmq_fwd_ds4_baseline_full.json
+
+python bench/benchmark_grouped_mmq_fwd.py \
+  --model ~/models/qwen3.6/Qwen3.6-35B-A3B-APEX-I-Mini.gguf \
+  --model-family qwen \
+  --warmup 3 \
+  --repeats 9 \
+  --correctness-rows 256 \
+  --output /tmp/grouped_mmq_fwd_qwen_pre_ds4_control.json
+```
+
+The four deterministic route distributions remain useful for stable comparisons. Before final dispatch selection, add captured hash-router and learned-router distributions from real DeepSeek runs as an additional route set. Captures must preserve inactive experts and exact offsets while remaining device-resident in the timed path.
+
+### Non-regression contract
+
+The existing Qwen dispatch is a production control, not a starting point to rewrite. `/tmp/grouped_mmq_fwd_final_full_v2.json` remains its historical source of record. Before changing kernel source, produce the fresh Qwen control above on the same build and machine used for the DeepSeek baseline.
+
+A retained DeepSeek optimization must satisfy all of the following:
+- all 60 Qwen case/batch/distribution points remain bitwise equal to dense packed MMQ.
+- all 27 DeepSeek points remain bitwise equal to dense packed MMQ and inside the established independent-reference error envelope.
+- no Qwen point has a repeatable latency regression. Treat a median movement above 1% as requiring a 25-repeat sequential A/B control; reject a repeatable regression above measurement noise even if the checkpoint-weighted total improves.
+- the Qwen checkpoint-weighted estimate does not regress.
+- existing Qwen arithmetic kernels retain zero private segment, zero spills, and no dynamic stack.
+- new production arithmetic kernels also require zero private segment, zero spills, and no dynamic stack.
+- changes to the shared quantizer or MMQ core run dense forward controls in addition to both grouped matrices.
+- no concurrent benchmark or profiler run is accepted.
+
+Improvements to existing Qwen cases are welcome, but they must pass the same complete matrix. Do not replace an exact Qwen branch with a broader heuristic based only on a DeepSeek win.
+
+### Dispatch policy
+
+Keep dispatch static, small, and explainable. It may depend on:
+- quant type.
+- operator kind: fixed, routed pair, or routed single.
+- exact `(N, K)` production geometry.
+- a coarse host-visible row bucket such as mean rows per active group.
+
+It must not depend on a route distribution name, environment variable, online autotuning, host reads of device offsets, or a large per-shape table. The intended order is:
+
+```text
+1. Existing exact Qwen production branches, unchanged unless independently improved.
+2. Exact DeepSeek Q8_0 fixed-group branch.
+3. Exact DeepSeek IQ2_XXS (2048, 4096) pair branch.
+4. Exact DeepSeek Q2_K (4096, 2048) single branch.
+5. General bounds-safe grouped MMQ fallback for every other supported shape.
+```
+
+Start with at most two row buckets per routed DeepSeek family: small groups and large groups. Add a third bucket only when a broad route matrix demonstrates a repeatable win. An average-row threshold is only a launch hint; every selected kernel must still handle skew, inactive experts, and tails correctly.
+
+### Phase D0: lock baselines and diagnose
+
+1. Run the fresh Qwen 60-point control and DeepSeek 27-point baseline sequentially.
+2. Trace one representative point for each new family at batches 1 and 16. Separate quantization, task setup, and multiplication time.
+3. Extract code-object metadata and disassembly for `Q8_0`, `IQ2_XXS`, and `Q2_K`. Record VGPRs, SGPRs, LDS, private bytes, spills, and dynamic stack.
+4. Record one-expert controls at representative group sizes 48, 192, and 768 for routed cases. Compare grouped packed execution with the corresponding sequence of dense packed calls.
+5. Profile counters only after decomposition. Prior logs show that spill removal and address/control cleanup can dominate apparent cache or LDS hypotheses.
+
+The current routed DeepSeek paths use the general `J=128` kernel because their shapes do not match the Qwen exact branches. The first question is therefore whether generic shape state and `J=128` create spills or excessive full/tail control, not whether a new persistent scheduler is needed.
+
+### Phase D1: fixed-group Q8_0 output A
+
+Production geometry is eight always-active groups, `N=1024`, `K=4096`, and 16 MMQ K iterations. Start from the current llama.cpp-style Q8_1/Q8_0 implementation and compare it with the relevant DwarfStar grouped-Q8 implementation on this machine; do not assume either source is faster.
+
+Measure a bounded candidate set:
+- compile-time `N=1024`, `K=4096`, group count eight, and fixed K trip count.
+- `I=64, J=64` as the first specialized control.
+- `I=64, J=128` only if code-object resources remain spill-free.
+- `I=128` only after profiling shows insufficient output reuse or launch parallelism; G9 already showed that wider output tiles can lose despite fewer VGPRs.
+- current Q8_1 prequantization versus a direct BF16/Q8_0 DwarfStar-style path, judged by complete public-operator latency and workspace allocation.
+
+Keep group as an explicit grid dimension and preserve token-major contiguous output. Avoid a host loop over eight public MMQ calls. Output-A has no routing imbalance, so route descriptors and persistent expert traversal are non-priorities. Its likely first-order choices are activation quantization cost at `8*M` rows, fixed K traversal, and Q8_0 weight/scale staging.
+
+### Phase D2: routed IQ2_XXS gate/up
+
+Production geometry is a pair of `N=2048`, `K=4096` experts with 16 packed blocks per row. Mean rows per expert are 48, 192, and 768.
+
+Start with:
+- compile-time `N=2048`, `K=4096`, and fixed 16-block pointer traversal.
+- `I=64, J=64` with exact full-row and one bounded tail body.
+- a `J=32` small-group control only for batch-1 nonuniform routes, where mean group size is 48.
+- `J=128` only as a spill-free measured control; prior Qwen G3 materially regressed this geometry.
+- serial expert ownership as the initial scheduler because 32 output tiles per active expert already expose much more N parallelism than Qwen gate/up.
+- row-task descriptors only for large groups if traces show serial row imbalance. Reuse one descriptor build across gate and up.
+
+`IQ2_XXS` optimization should focus on the natural decode-sharing unit: grid lookup, sign unpacking, scale formation, and aligned packed loads. Keep project-specific cooperative decode helpers outside vendored source. Do not fuse the two forward arithmetic outputs unless a resource analysis shows two accumulator sets remain spill-free; unlike backward, forward must produce two separate tensors and cannot share one accumulator.
+
+### Phase D3: routed Q2_K down
+
+Production geometry is `N=4096`, `K=2048` with eight packed blocks per row and 64 output tiles per active expert. Its activation metadata uses the distinct Q8_1 `D2S6` layout.
+
+Start with:
+- compile-time `N=4096`, `K=2048`, and fixed eight-block pointer traversal.
+- `I=64, J=64`, exact full rows, and one contiguous bounded tail.
+- serial expert row ownership as the initial scheduler. The 64 N tiles per expert make the Qwen G8 down result directly relevant: extra row descriptors are unlikely to repay setup or locality loss.
+- `J=32` only for batch-1 tail utilization and `J=128` only as a resource-clean control.
+- separate measurement of D2S6 activation quantization and packed multiplication before changing the shared quantizer.
+
+Tune Q2_K scale/min reconstruction and LDS placement independently of IQ2_XXS. A common schedule may be selected only if both complete matrices support it; a common decoder abstraction is not a performance goal.
+
+### Phase D4: simple heuristics and integration
+
+After the three families have independent winners:
+1. Encode only the measured exact-shape branches and coarse row thresholds.
+2. Keep the general bounds-safe fallback for all other supported shapes and output ranks.
+3. Run the full Qwen and DeepSeek matrices after every shared-core change.
+4. Inspect code-object resources after each retained structural change, not only at the end.
+5. Run `torch.compile`, FakeTensor, allocation, current-stream, sparse-route, and partial-tile tests.
+6. Produce `/tmp/grouped_mmq_fwd_ds4_final_full.json` and a same-build `/tmp/grouped_mmq_fwd_qwen_post_ds4_control.json`.
+7. Compare fresh pre/post Qwen controls as well as the historical G11 artifact.
+
+### Closed neighborhoods carried forward from prior logs
+
+Do not begin with the following mechanisms. They were neutral, invalid, or materially slower in the dense/grouped forward and backward passes:
+- a global `J=64`, `J=128`, or `I=128` rule across quant types.
+- eight-wave ownership of an `I=64` output tile without a valid reduction design.
+- complete decoded-weight LDS caching at the current 64-row output tile.
+- N-major row tasks, fixed-size persistent traversal, split full/tail launches, or host-built grouped descriptors.
+- wholesale direct-to-VGPR, both-operands direct-to-VGPR, two-LDS pipelines, GSU, split-K, or grouped Stream-K.
+- compiler-managed local arrays as packed prefetch state.
+- keeping next-iteration packed fragments live across the current WMMA phase.
+- broad swizzle or padding sweeps without a measured LDS-bank or fragment-load problem.
+- assuming int8 WMMA has a raw arithmetic advantage over BF16 WMMA on gfx1151.
+
+These mechanisms may be reopened only with new profile evidence specific to `Q8_0`, `IQ2_XXS`, or `Q2_K`. The plan deliberately starts with exact specialization, bounded lifetimes, full/tail separation, and simple scheduling because those were the durable wins across all previous logs.
+
 ## Benchmark infrastructure
 
 `bench/benchmark_grouped_mmq_fwd.py` follows the dense benchmark conventions.
@@ -80,19 +266,18 @@ It records:
 - complete public packed-operator latency.
 - logical throughput.
 - incremental peak allocation and reservation growth.
-- AITER configuration.
+- model family, quant type, and physical packed shapes.
+- AITER configuration for routed cases.
 - routing metadata and distribution statistics.
 - checkpoint-weighted forward and optimizer-step estimates.
 - grouped-versus-dense-MMQ exactness.
-- grouped-versus-dequantized-BF16 error.
+- grouped-versus-independently-dequantized-BF16 error.
 
 The packed timing includes Q8_1 quantization and grouped multiplication.
 
-The BF16 performance reference is AITER Triton `gmm`, using the project-owned `torch_ggml_ops.aiter_gmm_heuristics.gmm_config`. It is not `torch.matmul`.
+The routed BF16 performance reference is AITER Triton `gmm`, using the project-owned `torch_ggml_ops.aiter_gmm_heuristics.gmm_config`. AITER receives independently dequantized BF16 versions of the same logical GGUF experts. Dequantization and active-weight selection are setup costs and are not inside the timed GMM call. The reference uses production transposed weight metadata and keeps `work_stealing` disabled.
 
-AITER receives independently dequantized BF16 versions of the same logical GGUF experts. Dequantization and active-weight selection are setup costs and are not inside the timed GMM call.
-
-The AITER reference uses the production transposed weight metadata expected by the grouped kernel. `work_stealing` remains disabled, matching the production call.
+The fixed-group BF16 performance reference is `torch.bmm` over eight independently dequantized matrices. Its timed function includes conversion from the group-major batched-GEMM output to the public token-major contiguous layout.
 
 The full baseline command was:
 
@@ -130,7 +315,7 @@ The benchmark covers four deterministic distributions.
 
 `boundary` includes sizes 1, 15, 16, 17, 63, 64, 65, 127, 128, and 129 before filling the remaining groups. It exercises edge handling without making it the only performance distribution.
 
-Representative summaries are:
+The following representative summaries are for the historical Qwen top-eight rows:
 
 | Batch | Distribution | Active experts | Minimum | Maximum | Mean |
 |---:|---|---:|---:|---:|---:|
@@ -144,6 +329,25 @@ Representative summaries are:
 | 16 | uniform | 256 | 1,024 | 1,024 | 1,024.0 |
 | 16 | skewed | 256 | 768 | 1,280 | 1,024.0 |
 | 16 | sparse | 240 | 821 | 1,367 | 1,092.3 |
+
+DeepSeek top-six deterministic summaries are:
+
+| Batch | Distribution | Active experts | Minimum | Maximum | Mean |
+|---:|---|---:|---:|---:|---:|
+| 1 | uniform | 256 | 48 | 48 | 48.0 |
+| 1 | skewed | 256 | 26 | 70 | 48.0 |
+| 1 | sparse | 192 | 48 | 80 | 64.0 |
+| 1 | boundary | 256 | 1 | 129 | 48.0 |
+| 4 | uniform | 256 | 192 | 192 | 192.0 |
+| 4 | skewed | 256 | 128 | 256 | 192.0 |
+| 4 | sparse | 224 | 165 | 275 | 219.4 |
+| 4 | boundary | 256 | 1 | 217 | 192.0 |
+| 16 | uniform | 256 | 768 | 768 | 768.0 |
+| 16 | skewed | 256 | 512 | 1,024 | 768.0 |
+| 16 | sparse | 240 | 616 | 1,026 | 819.2 |
+| 16 | boundary | 256 | 1 | 877 | 768.0 |
+
+The fixed output-A case does not use a routing distribution. All eight groups receive exactly `M` rows.
 
 ## Historical pre-G1 baseline results
 

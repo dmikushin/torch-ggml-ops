@@ -2,7 +2,7 @@
 
 ## Status at a glance
 
-The production optimization pass for grouped MMQ backward on gfx1151 is complete for the current packed GGUF representations.
+The production optimization pass for grouped MMQ backward on gfx1151 is complete for the current Qwen packed GGUF representations. This completion claim does not include the planned DeepSeek-V4-Flash grouped workloads described below.
 
 Sources of record:
 
@@ -36,9 +36,9 @@ Final outcome:
 
 ### Remaining work
 
-There is no pending local tile, scheduler, decoder-width, swizzle, prefetch, or integration task for the current execution model.
+There is no pending local tile, scheduler, decoder-width, swizzle, prefetch, or integration task for the current Qwen execution model. DeepSeek-V4-Flash is a new shape/type expansion with separate work listed below.
 
-Further performance work is representation-level and should begin only with a design that changes reuse across calls or changes the format consumed by the arithmetic kernel. Candidate directions are:
+Further performance work on those Qwen kernels is representation-level and should begin only with a design that changes reuse across calls or changes the format consumed by the arithmetic kernel. Candidate directions are:
 - a compact lossless decoded cache substantially smaller than BF16.
 - cross-call decoded-weight reuse.
 - reusable device task/decode metadata.
@@ -117,6 +117,35 @@ The production sequence length is 2,048 and top-k is 8.
 | 1 | 16,384 | 64 |
 | 4 | 65,536 | 256 |
 | 16 | 262,144 | 1,024 |
+
+### Planned DeepSeek-V4-Flash expansion
+
+Status: not implemented or tuned. DeepSeek introduces two routed expert formats and one semantically distinct fixed-group projection. All three require production configurations for physical batch sizes 1, 4, and 16 at sequence length 2,048.
+
+| Workload | Forward weight per group/expert `(N, K)` | Backward GEMM | GGUF type | Tensors | Planned operator |
+| --- | ---: | --- | --- | ---: | --- |
+| Grouped output A, 8 fixed groups | `(1024, 4096)` | `(M, 1024) x (1024, 4096)` per group | Q8_0 | 43 | dedicated fixed-group input gradient |
+| Routed gate/up, 256 experts | `(2048, 4096)` | two `(R, 2048) x (2048, 4096)` contributions | IQ2_XXS | 43 pairs | `grouped_mmq_pair_grad_input` |
+| Routed down, 256 experts | `(4096, 2048)` | `(R, 4096) x (4096, 2048)` | Q2_K | 43 | `grouped_mmq_grad_input` |
+
+DeepSeek uses top-six routing. The exact batch targets are:
+
+| Physical batch | Token rows M | Routed rows R | Mean rows/expert if all 256 are active |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,048 | 12,288 | 48 |
+| 4 | 8,192 | 49,152 | 192 |
+| 16 | 32,768 | 196,608 | 768 |
+
+The fixed-group output-A input gradient uses token rows `M` and preserves eight independent `1024 x 4096` weights. It must accumulate each group's cotangent into that group's 4,096-wide input without materializing a packed transpose or treating the flattened `(8192, 4096)` checkpoint tensor as one ordinary matrix.
+
+The DeepSeek backward contract is:
+- BF16 cotangent inputs and BF16 input-gradient outputs with FP32 accumulation.
+- direct decode of `Q8_0`, `IQ2_XXS`, and `Q2_K` into WMMA operands.
+- no cotangent quantization, packed transpose, selected logical expert matrix, CPU route metadata, or hidden synchronization.
+- fused paired gate/up input-gradient accumulation where it preserves the existing single-output allocation and one-rounding contract.
+- benchmarks using actual hash-router and learned-router distributions, including inactive experts, skew, tails, and group sizes crossing 16/32/64/128-row boundaries.
+- distinct lookup entries keyed by quant type, expert/fixed-group geometry, backward direction, physical batch, and route bucket; current Qwen S1/S2/row-task dispatch thresholds are not presumed optimal.
+- output/input-gradient correctness, allocation, and complete public-operator timing at physical batch sizes 1, 4, and 16.
 
 ### Routing distributions
 

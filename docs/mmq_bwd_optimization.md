@@ -6,7 +6,8 @@ This document covers dense `torch_ggml_ops::mmq_grad_input` backward on gfx1151.
 
 Included:
 - BF16 cotangents.
-- packed GGUF Q3_K, Q4_K, Q5_K, Q6_K, and IQ2_S weights.
+- current packed GGUF Q3_K, Q4_K, Q5_K, Q6_K, and IQ2_S weights.
+- planned packed GGUF Q8_0 DeepSeek-V4-Flash weights.
 - BF16 input gradients.
 - the 160 ordinary model projections.
 - the packed Q6_K language-model head.
@@ -22,7 +23,7 @@ Excluded:
 
 ## Current status
 
-Dense backward optimization is complete for the current fused packed representation. The final source-of-record benchmark is `/tmp/mmq_bwd_final_autonomous.json`.
+Dense backward optimization is complete for the current Qwen fused packed representation. The final source-of-record benchmark is `/tmp/mmq_bwd_final_autonomous.json`. This completion claim does not include the planned DeepSeek-V4-Flash `Q8_0` workload described below.
 
 Done:
 - ordinary batch-16 packed backward is 1.193 seconds versus 1.267 seconds for the BF16 reference, approximately 5.8% faster overall.
@@ -31,7 +32,7 @@ Done:
 - every retained production specialization has zero private segment and zero VGPR or SGPR spills.
 - exact full-tile guards and bounds-safe fallbacks pass the current correctness suite.
 
-Remaining work is limited to higher-level representation or cross-call reuse for shared-down Q4_K/Q5_K. Local geometry, K-depth, prefetch, padding, swizzle, and extraction neighborhoods are closed.
+Remaining work for the current Qwen workload is limited to higher-level representation or cross-call reuse for shared-down Q4_K/Q5_K. Its local geometry, K-depth, prefetch, padding, swizzle, and extraction neighborhoods are closed.
 
 ## Hardware and measurement rules
 
@@ -118,9 +119,44 @@ production backward chunk M = 256
 
 Benchmarks retain `M = 64, 128, 256`. M=64 and M=128 are lower-memory fallbacks.
 
+## Planned DeepSeek-V4-Flash expansion
+
+Status: not implemented or tuned. The target remains gfx1151 with sequence length 2,048 and physical batch sizes 1, 4, and 16. Batch coverage is part of the production contract, not a gradient-accumulation substitute.
+
+For full-sequence dense input gradients:
+
+| Physical batch | M |
+| ---: | ---: |
+| 1 | 2,048 |
+| 4 | 8,192 |
+| 16 | 32,768 |
+
+Add packed `Q8_0` input-gradient support for every persistent ordinary matrix in DeepSeek-V4-Flash. Backward computes `dY @ W` directly from the authoritative forward-layout packed weight:
+
+| Family | Forward weight `(N, K)` | Backward GEMM | Tensors |
+| --- | ---: | --- | ---: |
+| Attention Q-A | `(1024, 4096)` | `(M, 1024) x (1024, 4096)` | 43 |
+| Attention Q-B | `(32768, 1024)` | `(M, 32768) x (32768, 1024)` | 43 |
+| Attention KV | `(512, 4096)` | `(M, 512) x (512, 4096)` | 43 |
+| Attention output B | `(4096, 8192)` | `(M, 4096) x (4096, 8192)` | 43 |
+| Shared gate/up | `(2048, 4096)` | `(M, 2048) x (2048, 4096)` | 86 |
+| Shared down | `(4096, 2048)` | `(M, 4096) x (4096, 2048)` | 43 |
+| LM head | `(129280, 4096)` | `(M, 129280) x (129280, 4096)` | 1 |
+
+For the LM head, `M` is a loss chunk rather than the complete token count. Tune `M = 32, 64, 128, 256, 512` by complete packed-loss-loop time and peak allocation separately at physical batch sizes 1, 4, and 16.
+
+The backward contract is:
+- BF16 cotangent input and BF16 input-gradient output.
+- direct packed `Q8_0` decode into BF16 WMMA fragments with FP32 accumulation.
+- no cotangent quantization, packed transpose, or logical weight materialization.
+- explicit production lookup entries keyed by quant type, `(M, N, K)` geometry, direction, and batch/chunk bucket.
+- output/input-gradient correctness and complete latency/allocation benchmarks for all three physical batch sizes.
+
+The complete new quant inventory also contains routed `IQ2_XXS` gate/up weights and routed `Q2_K` down weights. Those types are not dense-MMQ targets; their exact transposed operations and route buckets are specified in `docs/grouped_mmq_bwd_optimization.md`. The frozen eight-group `Q8_0` output-A input gradient also belongs to that grouped plan and must not be implemented as an ordinary flattened transpose.
+
 ## Current source status
 
-Dense backward optimization is complete for the current fused packed representation. The selected implementation is committed in `csrc/ck/mmq_backward.cuh` and the final source-of-record benchmark is:
+Dense backward optimization is complete for the current Qwen fused packed representation. The selected implementation is committed in `csrc/ck/mmq_backward.cuh` and the final source-of-record benchmark is:
 
 ```text
 /tmp/mmq_bwd_final_autonomous.json

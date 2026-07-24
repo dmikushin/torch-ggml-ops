@@ -10,6 +10,17 @@ import torch
 from mmq_benchmark_common import cuda_event_times_ms, incremental_peak_bytes
 
 
+QUANT_BLOCK_GEOMETRY = {
+    "Q8_0": (32, 34),
+    "Q2_K": (256, 84),
+    "Q3_K": (256, 110),
+    "Q4_K": (256, 144),
+    "Q5_K": (256, 176),
+    "IQ2_XXS": (256, 66),
+    "IQ2_S": (256, 82),
+}
+
+
 @dataclass(frozen=True)
 class GroupedMMQCase:
     name: str
@@ -20,10 +31,28 @@ class GroupedMMQCase:
     model_layer_count: int
     priority: str
     description: str
+    expected_quant_type: str
+    model_family: str = "qwen"
+    top_k: int = 8
+    fixed_groups: int = 0
 
     @property
     def projections(self) -> int:
-        return len(self.tensor_names)
+        return self.fixed_groups or len(self.tensor_names)
+
+    @property
+    def routed(self) -> bool:
+        return self.kind in {"single", "pair"}
+
+    @property
+    def packed_row_bytes(self) -> int:
+        block_values, block_bytes = QUANT_BLOCK_GEOMETRY[self.expected_quant_type]
+        if self.expected_in_features % block_values != 0:
+            raise ValueError(
+                f"{self.name} K={self.expected_in_features} is not divisible by "
+                f"the {self.expected_quant_type} block size {block_values}"
+            )
+        return self.expected_in_features // block_values * block_bytes
 
 
 CASES = (
@@ -36,6 +65,7 @@ CASES = (
         20,
         "primary",
         "paired routed gate/up for layers 0-9 and 30-39",
+        "Q3_K",
     ),
     GroupedMMQCase(
         "gate_up_iq2_s",
@@ -46,6 +76,7 @@ CASES = (
         20,
         "primary",
         "paired routed gate/up for layers 10-29",
+        "IQ2_S",
     ),
     GroupedMMQCase(
         "down_iq2_s",
@@ -56,6 +87,7 @@ CASES = (
         20,
         "primary",
         "routed down projection for layers 10-29",
+        "IQ2_S",
     ),
     GroupedMMQCase(
         "down_q4_k",
@@ -66,6 +98,7 @@ CASES = (
         18,
         "primary",
         "routed down projection for layers 2-9 and 30-39",
+        "Q4_K",
     ),
     GroupedMMQCase(
         "down_q5_k",
@@ -76,6 +109,47 @@ CASES = (
         2,
         "secondary",
         "routed down projection for layers 0-1",
+        "Q5_K",
+    ),
+    GroupedMMQCase(
+        "ds4_output_a_q8_0",
+        "fixed",
+        ("blk.0.attn_output_a.weight",),
+        1024,
+        4096,
+        43,
+        "primary",
+        "eight fixed attention output-A groups",
+        "Q8_0",
+        model_family="deepseek",
+        top_k=1,
+        fixed_groups=8,
+    ),
+    GroupedMMQCase(
+        "ds4_gate_up_iq2_xxs",
+        "pair",
+        ("blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight"),
+        2048,
+        4096,
+        43,
+        "primary",
+        "paired top-six routed gate/up for all expert layers",
+        "IQ2_XXS",
+        model_family="deepseek",
+        top_k=6,
+    ),
+    GroupedMMQCase(
+        "ds4_down_q2_k",
+        "single",
+        ("blk.0.ffn_down_exps.weight",),
+        4096,
+        2048,
+        43,
+        "primary",
+        "top-six routed down projection for all expert layers",
+        "Q2_K",
+        model_family="deepseek",
+        top_k=6,
     ),
 )
 
@@ -98,7 +172,11 @@ def parse_name_list(value: str) -> tuple[str, ...]:
     return result
 
 
-def select_cases(case_names: str, primary_only: bool) -> tuple[GroupedMMQCase, ...]:
+def select_cases(
+    case_names: str,
+    primary_only: bool,
+    model_family: str = "qwen",
+) -> tuple[GroupedMMQCase, ...]:
     by_name = {case.name: case for case in CASES}
     if case_names:
         names = tuple(name.strip() for name in case_names.split(",") if name.strip())
@@ -108,8 +186,15 @@ def select_cases(case_names: str, primary_only: bool) -> tuple[GroupedMMQCase, .
                 f"unknown cases {unknown}; available cases are {sorted(by_name)}"
             )
         selected = tuple(by_name[name] for name in names)
+        mismatched = [
+            case.name for case in selected if case.model_family != model_family
+        ]
+        if mismatched:
+            raise ValueError(
+                f"cases {mismatched} do not belong to model family {model_family}"
+            )
     else:
-        selected = CASES
+        selected = tuple(case for case in CASES if case.model_family == model_family)
     if primary_only:
         selected = tuple(case for case in selected if case.priority == "primary")
     if not selected:

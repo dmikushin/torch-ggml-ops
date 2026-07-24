@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Benchmark production grouped MMQ forward against BF16 AITER GMM.
+"""Benchmark production routed and fixed-group MMQ forward.
 
 The packed path measures the complete public operator, including Q8_1 activation
-quantization and grouped multiplication. Gate/up uses grouped_mmq_pair so both
-projections share one Q8_1 workspace. The BF16 reference dequantizes the same
-GGUF experts once, then runs AITER GMM with the project-owned gfx1151 heuristic.
+quantization and grouped multiplication. Routed gate/up uses grouped_mmq_pair so
+both projections share one Q8_1 workspace and compares with BF16 AITER GMM.
+Fixed output-A uses fixed_grouped_mmq and a BF16 strided-batched GEMM reference.
 """
 
 import argparse
@@ -49,7 +49,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--sequence-length", type=int, default=2048)
-    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="override the selected model family's routed top-k",
+    )
+    parser.add_argument(
+        "--model-family",
+        choices=("auto", "qwen", "deepseek"),
+        default="auto",
+        help="case family; auto detects DeepSeek from attn_output_a",
+    )
     parser.add_argument("--batches", type=parse_int_list, default=(1, 4, 16))
     parser.add_argument(
         "--distributions",
@@ -71,7 +82,7 @@ def parse_args() -> argparse.Namespace:
 
     if not args.model.is_file():
         parser.error(f"GGUF model not found: {args.model}")
-    if args.sequence_length <= 0 or args.top_k <= 0:
+    if args.sequence_length <= 0 or (args.top_k is not None and args.top_k <= 0):
         parser.error("--sequence-length and --top-k must be positive")
     if args.warmup < 0 or args.repeats <= 0 or args.correctness_rows <= 0:
         parser.error(
@@ -108,6 +119,34 @@ def dense_grouped_mmq_reference(
     return torch.cat(outputs, dim=0)
 
 
+def dense_fixed_mmq_reference(
+    input: torch.Tensor,
+    packed_weight: torch.Tensor,
+    quant_type: int,
+    out_features: int,
+) -> torch.Tensor:
+    return torch.stack(
+        tuple(
+            torch_ggml_ops.mmq(
+                input[:, group].clone(),
+                packed_weight[group].clone(),
+                quant_type,
+                out_features,
+            )
+            for group in range(input.shape[1])
+        ),
+        dim=1,
+    )
+
+
+def bf16_fixed_reference(
+    input: torch.Tensor,
+    logical_weight: torch.Tensor,
+) -> torch.Tensor:
+    group_major = torch.bmm(input.permute(1, 0, 2), logical_weight.transpose(1, 2))
+    return group_major.permute(1, 0, 2).contiguous()
+
+
 def correctness_metrics(
     case: GroupedForwardCase,
     input: torch.Tensor,
@@ -117,6 +156,22 @@ def correctness_metrics(
     quant_type: int,
     gmm_config: dict[str, int],
 ) -> dict:
+    if case.kind == "fixed":
+        with torch.inference_mode():
+            actual = torch_ggml_ops.fixed_grouped_mmq(input, packed_weights[0])
+            dense_reference = dense_fixed_mmq_reference(
+                input,
+                packed_weights[0],
+                quant_type,
+                case.expected_out_features,
+            )
+            bf16_reference = bf16_fixed_reference(input, logical_weights[0])
+        return {
+            "rows": input.shape[0],
+            "same_q8_dense": error_metrics(actual, dense_reference),
+            "bf16_bmm": error_metrics(actual, bf16_reference),
+        }
+
     checked_distribution = truncate_distribution(distribution, input.shape[0])
     expert_indices, expert_offsets, group_sizes = device_metadata(checked_distribution)
     selected_logical = tuple(
@@ -198,24 +253,205 @@ def correctness_metrics(
 
 def print_result(result: dict) -> None:
     mmq = result["grouped_mmq"]
-    aiter = result["aiter_bf16"]
-    if result["kind"] == "pair":
-        nrmse = max(
-            metric["normalized_rmse"] for metric in result["correctness"]["bf16_aiter"]
-        )
+    if result["kind"] == "fixed":
+        reference = result["bf16_bmm"]
+        reference_label = "BMM"
+        nrmse = result["correctness"]["bf16_bmm"]["normalized_rmse"]
+        row_label = "M"
     else:
-        nrmse = result["correctness"]["bf16_aiter"]["normalized_rmse"]
+        reference = result["aiter_bf16"]
+        reference_label = "AITER"
+        if result["kind"] == "pair":
+            nrmse = max(
+                metric["normalized_rmse"]
+                for metric in result["correctness"]["bf16_aiter"]
+            )
+        else:
+            nrmse = result["correctness"]["bf16_aiter"]["normalized_rmse"]
+        row_label = "R"
     print(
-        f"{result['case']:<18} B={result['batch']:>2} "
-        f"{result['distribution']:<8} R={result['rows']:>6} "
+        f"{result['case']:<24} B={result['batch']:>2} "
+        f"{result['distribution']:<8} {row_label}={result['rows']:>6} "
         f"G={result['group_summary']['active_experts']:>3} "
-        f"{result['quant_type']:<5} "
+        f"{result['quant_type']:<8} "
         f"MMQ={mmq['median_ms']:>8.3f} ms {mmq['logical_tflops']:>6.2f} TF "
-        f"AITER={aiter['median_ms']:>8.3f} ms {aiter['logical_tflops']:>6.2f} TF "
-        f"ratio={result['mmq_to_aiter_tflops_ratio']:>5.2f}x "
+        f"{reference_label}={reference['median_ms']:>8.3f} ms "
+        f"{reference['logical_tflops']:>6.2f} TF "
+        f"ratio={result['mmq_to_reference_tflops_ratio']:>5.2f}x "
         f"NRMSE={nrmse:.3e}",
         flush=True,
     )
+
+
+def benchmark_fixed_case(
+    args: argparse.Namespace,
+    case: GroupedForwardCase,
+    case_index: int,
+    tensor: gguf.ReaderTensor,
+    quant_type: int,
+    quant_name: str,
+    report: dict,
+) -> None:
+    flat_packed = load_packed_tensor(tensor)
+    expected_flat_shape = (
+        case.fixed_groups * case.expected_out_features,
+        case.packed_row_bytes,
+    )
+    if tuple(flat_packed.shape) != expected_flat_shape:
+        raise RuntimeError(
+            f"{tensor.name} has packed shape {tuple(flat_packed.shape)}, "
+            f"expected {expected_flat_shape}"
+        )
+    logical_shape = tuple(int(value) for value in reversed(tensor.shape))
+    expected_logical_shape = (
+        case.fixed_groups * case.expected_out_features,
+        case.expected_in_features,
+    )
+    if logical_shape != expected_logical_shape:
+        raise RuntimeError(
+            f"{tensor.name} has logical shape {logical_shape}, "
+            f"expected {expected_logical_shape}"
+        )
+
+    packed_weight = flat_packed.view(
+        case.fixed_groups, case.expected_out_features, flat_packed.shape[-1]
+    )
+    logical_weight = dequantize_gguf_tensor(
+        packed_weight,
+        tensor.tensor_type,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).reshape(
+        case.fixed_groups,
+        case.expected_out_features,
+        case.expected_in_features,
+    )
+
+    for batch_index, batch in enumerate(args.batches):
+        rows = batch * args.sequence_length
+        input = make_bf16_input(
+            rows * case.fixed_groups,
+            case.expected_in_features,
+            args.seed + case_index * 10000 + batch_index * 100,
+        ).view(rows, case.fixed_groups, case.expected_in_features)
+
+        def mmq_function(
+            input=input,
+            packed_weight=packed_weight,
+        ):
+            return torch_ggml_ops.fixed_grouped_mmq(input, packed_weight)
+
+        def bf16_function(
+            input=input,
+            logical_weight=logical_weight,
+        ):
+            return bf16_fixed_reference(input, logical_weight)
+
+        mmq_result = benchmark_function(
+            mmq_function,
+            rows,
+            case.expected_out_features,
+            case.expected_in_features,
+            case.projections,
+            args.warmup,
+            args.repeats,
+        )
+        bf16_result = benchmark_function(
+            bf16_function,
+            rows,
+            case.expected_out_features,
+            case.expected_in_features,
+            case.projections,
+            args.warmup,
+            args.repeats,
+        )
+
+        correctness_rows = min(rows, args.correctness_rows)
+        correctness_input = input[:correctness_rows].clone()
+        fixed_distribution = RouteDistribution(
+            "fixed",
+            tuple(range(case.fixed_groups)),
+            (rows,) * case.fixed_groups,
+        )
+        correctness = correctness_metrics(
+            case,
+            correctness_input,
+            (packed_weight,),
+            (logical_weight,),
+            fixed_distribution,
+            quant_type,
+            {},
+        )
+
+        workspace_bytes = (
+            rows * case.fixed_groups * (case.expected_in_features // (4 * 32)) * 144
+        )
+        output_bytes = (
+            rows
+            * case.fixed_groups
+            * case.expected_out_features
+            * torch.bfloat16.itemsize
+        )
+        group_summary = distribution_summary(fixed_distribution)
+        model_calls = case.model_layer_count
+        ratio = mmq_result["logical_tflops"] / bf16_result["logical_tflops"]
+        result = {
+            "case": case.name,
+            "model_family": case.model_family,
+            "kind": case.kind,
+            "description": case.description,
+            "priority": case.priority,
+            "batch": batch,
+            "rows": rows,
+            "logical_group_rows": rows * case.fixed_groups,
+            "n": case.expected_out_features,
+            "k": case.expected_in_features,
+            "projections": case.projections,
+            "quant_type": quant_name,
+            "quant_type_id": quant_type,
+            "distribution": "fixed",
+            "group_summary": group_summary,
+            "expert_indices": list(range(case.fixed_groups)),
+            "group_sizes": [rows] * case.fixed_groups,
+            "packed_weight_shapes": [list(packed_weight.shape)],
+            "reference_kind": "BF16 torch.bmm with public-layout conversion",
+            "q8_workspace_bytes": workspace_bytes,
+            "expected_output_bytes": output_bytes,
+            "pair_shares_one_q8_workspace": False,
+            "fixed_groups_share_one_q8_workspace": True,
+            "model_calls_per_forward": model_calls,
+            "checkpointed_calls_per_optimizer_step": 2 * model_calls,
+            "grouped_mmq": mmq_result,
+            "bf16_bmm": bf16_result,
+            "mmq_to_reference_tflops_ratio": ratio,
+            "mmq_to_bf16_bmm_tflops_ratio": ratio,
+            "estimated_mmq_optimizer_step_ms": (
+                2 * model_calls * mmq_result["median_ms"]
+            ),
+            "estimated_reference_optimizer_step_ms": (
+                2 * model_calls * bf16_result["median_ms"]
+            ),
+            "estimated_bf16_bmm_optimizer_step_ms": (
+                2 * model_calls * bf16_result["median_ms"]
+            ),
+            "correctness": correctness,
+            "metadata_device_resident": True,
+            "host_group_descriptor_build_in_timed_path": False,
+            "current_stream_operator_contract_tested": True,
+        }
+        report["results"].append(result)
+        print_result(result)
+
+        del mmq_function, bf16_function
+        del input, correctness_input
+        gc.collect()
+        torch.cuda.empty_cache()
+        synchronize()
+
+    del logical_weight, packed_weight, flat_packed
+    gc.collect()
+    torch.cuda.empty_cache()
+    synchronize()
 
 
 def main() -> None:
@@ -223,9 +459,15 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("a HIP/CUDA device is required")
 
-    cases = select_cases(args.cases, args.primary_only)
     reader = gguf.GGUFReader(args.model)
     tensors = {tensor.name: tensor for tensor in reader.tensors}
+    detected_model_family = (
+        "deepseek" if "blk.0.attn_output_a.weight" in tensors else "qwen"
+    )
+    model_family = (
+        detected_model_family if args.model_family == "auto" else args.model_family
+    )
+    cases = select_cases(args.cases, args.primary_only, model_family)
     quant_names = {int(value): value.name for value in gguf.GGMLQuantizationType}
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
 
@@ -235,8 +477,17 @@ def main() -> None:
     if missing:
         raise RuntimeError(f"checkpoint is missing benchmark tensors: {missing}")
 
+    routed_top_ks = {
+        args.top_k if args.top_k is not None else case.top_k
+        for case in cases
+        if case.routed
+    }
+    report_top_k = next(iter(routed_top_ks)) if len(routed_top_ks) == 1 else None
+
     report = {
         "model": str(args.model),
+        "model_family": model_family,
+        "detected_model_family": detected_model_family,
         "device": {
             "name": properties.name,
             "gcn_arch_name": getattr(properties, "gcnArchName", None),
@@ -245,14 +496,22 @@ def main() -> None:
         },
         "configuration": {
             "sequence_length": args.sequence_length,
-            "top_k": args.top_k,
+            "top_k": report_top_k,
+            "top_k_override": args.top_k,
             "batches": list(args.batches),
+            "cases": [case.name for case in cases],
             "distributions": list(args.distributions),
             "warmup": args.warmup,
             "repeats": args.repeats,
             "correctness_rows": args.correctness_rows,
             "aiter_heuristic": "torch_ggml_ops.aiter_gmm_heuristics.gmm_config",
-            "reference": "BF16 AITER gmm with project-owned gmm_config",
+            "reference": (
+                "BF16 AITER gmm with project-owned gmm_config"
+                if all(case.routed for case in cases)
+                else "case-specific BF16 reference; see routed_reference and fixed_reference"
+            ),
+            "routed_reference": "BF16 AITER gmm with project-owned gmm_config",
+            "fixed_reference": "BF16 torch.bmm including public-layout conversion",
             "aiter_work_stealing": False,
         },
         "results": [],
@@ -263,7 +522,10 @@ def main() -> None:
         f"torch={torch.__version__} hip={torch.version.hip}",
         flush=True,
     )
-    print(f"model={args.model}", flush=True)
+    print(
+        f"model={args.model} family={model_family} cases={','.join(case.name for case in cases)}",
+        flush=True,
+    )
 
     with torch.inference_mode():
         for case_index, case in enumerate(cases):
@@ -273,6 +535,23 @@ def main() -> None:
                 raise RuntimeError(f"{case.name} paired tensors have different qtypes")
             quant_type = quant_types.pop()
             quant_name = quant_names.get(quant_type, str(quant_type))
+            if quant_name != case.expected_quant_type:
+                raise RuntimeError(
+                    f"{case.name} has quant type {quant_name}, "
+                    f"expected {case.expected_quant_type}"
+                )
+
+            if case.kind == "fixed":
+                benchmark_fixed_case(
+                    args,
+                    case,
+                    case_index,
+                    case_tensors[0],
+                    quant_type,
+                    quant_name,
+                    report,
+                )
+                continue
 
             packed_weights = tuple(
                 load_packed_tensor(tensor) for tensor in case_tensors
@@ -293,6 +572,11 @@ def main() -> None:
                     raise RuntimeError(
                         f"{tensor.name} has {packed.shape[0]} experts, expected 256"
                     )
+                if packed.shape[2] != case.packed_row_bytes:
+                    raise RuntimeError(
+                        f"{tensor.name} has {packed.shape[2]} packed bytes per row, "
+                        f"expected {case.packed_row_bytes} for {case.expected_quant_type}"
+                    )
 
             logical_weights = tuple(
                 dequantize_gguf_tensor(
@@ -309,8 +593,9 @@ def main() -> None:
                 case.expected_in_features, case.expected_out_features
             )
 
+            top_k = args.top_k if args.top_k is not None else case.top_k
             for batch_index, batch in enumerate(args.batches):
-                rows = batch * args.sequence_length * args.top_k
+                rows = batch * args.sequence_length * top_k
                 available_distributions = route_distributions(rows, batch)
                 for distribution_index, distribution_name in enumerate(
                     args.distributions
@@ -443,12 +728,17 @@ def main() -> None:
                         * torch.bfloat16.itemsize
                     )
                     model_calls = case.model_layer_count
+                    ratio = (
+                        mmq_result["logical_tflops"] / aiter_result["logical_tflops"]
+                    )
                     result = {
                         "case": case.name,
+                        "model_family": case.model_family,
                         "kind": case.kind,
                         "description": case.description,
                         "priority": case.priority,
                         "batch": batch,
+                        "top_k": top_k,
                         "rows": rows,
                         "n": case.expected_out_features,
                         "k": case.expected_in_features,
@@ -459,6 +749,10 @@ def main() -> None:
                         "group_summary": distribution_summary(distribution),
                         "expert_indices": list(distribution.expert_indices_cpu),
                         "group_sizes": list(distribution.group_sizes_cpu),
+                        "packed_weight_shapes": [
+                            list(weight.shape) for weight in packed_weights
+                        ],
+                        "reference_kind": "BF16 AITER gmm",
                         "aiter_config": dict(gmm_config),
                         "q8_workspace_bytes": workspace_bytes,
                         "expected_output_bytes": output_bytes,
@@ -467,12 +761,13 @@ def main() -> None:
                         "checkpointed_calls_per_optimizer_step": 2 * model_calls,
                         "grouped_mmq": mmq_result,
                         "aiter_bf16": aiter_result,
-                        "mmq_to_aiter_tflops_ratio": (
-                            mmq_result["logical_tflops"]
-                            / aiter_result["logical_tflops"]
-                        ),
+                        "mmq_to_reference_tflops_ratio": ratio,
+                        "mmq_to_aiter_tflops_ratio": ratio,
                         "estimated_mmq_optimizer_step_ms": (
                             2 * model_calls * mmq_result["median_ms"]
+                        ),
+                        "estimated_reference_optimizer_step_ms": (
+                            2 * model_calls * aiter_result["median_ms"]
                         ),
                         "estimated_aiter_optimizer_step_ms": (
                             2 * model_calls * aiter_result["median_ms"]

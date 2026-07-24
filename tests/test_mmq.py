@@ -184,7 +184,7 @@ def test_invalid_inputs_fail_without_hidden_copies(reader: gguf.GGUFReader) -> N
     with pytest.raises(RuntimeError, match="expected"):
         torch_ggml_ops.mmq(input, packed[:-1].clone(), int(qtype), 37)
     with pytest.raises(RuntimeError, match="unsupported quant_type"):
-        torch_ggml_ops.mmq(input, packed, 10, 37)
+        torch_ggml_ops.mmq(input, packed, 999, 37)
     with pytest.raises(RuntimeError, match="zero-row"):
         torch_ggml_ops.mmq(input[:0], packed, int(qtype), 37)
 
@@ -218,6 +218,6 @@ def test_invalid_grad_input_operands_fail_without_hidden_copies(
     with pytest.raises(RuntimeError, match="expected"):
         op(grad_output, packed[:-1].clone(), int(qtype), 2048)
     with pytest.raises(RuntimeError, match="unsupported quant_type"):
-        op(grad_output, packed, 10, 2048)
+        op(grad_output, packed, 999, 2048)
     with pytest.raises(RuntimeError, match="zero-row"):
         op(grad_output[:0], packed, int(qtype), 2048)
