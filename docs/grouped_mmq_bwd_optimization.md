@@ -422,6 +422,20 @@ The remaining single-down losses are representation-level for the retained execu
 
 The arithmetic geometry, full/tail strategy, row ordering, direct tasks, persistence, decoder width, LDS layout, and bounded prefetch neighborhoods have all been measured. Do not restart those sweeps without new profiler evidence.
 
+## Retuning priorities after standalone-bundle exploration
+
+Grouped-backward aggregate bundle movement is neutral, so retuning is based on persistent arithmetic deficits and checkpoint weight rather than on packaging deltas. Warm module loading before timing and separate the approximately 0.004 ms row-task builder from the arithmetic body.
+
+| Mark | Case | Why it is worth revisiting | Required semantic direction |
+| --- | --- | --- | --- |
+| **RETUNE-HIGH (REPRESENTATION)** | Single-down Q4_K | The family appears in 18 layers, wins only 1 of 12 individual points, and has a median packed/AITER throughput ratio near `0.86x`. Large arithmetic bodies are around 10-11 ms while setup is negligible. | Reuse a compact lossless decode across row tasks or calls, or change the representation consumed by both dense and grouped shared-down kernels. Keep the selected S1/S2/row-task geometry and M-major ordering as controls. |
+| **RETUNE-HIGH (REPRESENTATION)** | Single-down IQ2_S | The family appears in 20 layers, wins only 3 of 12 points, has a median ratio near `0.93x`, and remains notably slow on small nonuniform routes. | Target reusable grid/sign/scale decode or another lossless representation shared across output tiles. Do not restart decoder-width, row-task, persistence, or swizzle sweeps. |
+| **DO NOT RETUNE NOW** | Single-down Q5_K | Bundle controls show several `1.8-2.7%` regressions, but the format appears in only two edge layers and the retained row-task kernel is already at the resource ceiling. | Preserve it unless a representation project shared with Q4_K/IQ2_S provides the implementation nearly for free. |
+| **DO NOT RETUNE NOW** | Fused Q3_K and IQ2_S pairs | Both pair families win all 24 points and dominate the checkpoint-weighted advantage. | Retain as non-regression controls. |
+| **DO NOT RETUNE FROM BUNDLE DATA** | Q4_K batch-1 small-row paths | The packaged kernels improve about `4.8-10.3%`. | Keep the current semantic behavior and use it as a control for future representation work. |
+
+These marks do not reopen local tiling. A future representation experiment must pass the acceptance gates below and improve the shared dense-down controls as evidence that it addresses the common decode cost.
+
 ## Historical baseline and diagnosis
 
 This section is historical. It records why the tile architecture was replaced and should not be read as a description of the current kernel.
@@ -850,6 +864,18 @@ git diff --check
 Then run the full 60-point matrix, inspect the final gfx1151 code object, and collect representative profiler traces sequentially.
 
 Do not edit `~/transformers-qwen3-moe-fused`. It is legacy/reference-only.
+
+## Architecture-specific bundle conversion
+
+Grouped backward now ships 22 independent gfx1151 entries: five generic single kernels, five generic pair kernels, and twelve geometry-specific single, pair, and row-task kernels. `csrc/ck/grouped_mmq_backward.cuh` and `csrc/ck/grouped_mmq_backward_tiled.cuh` expose reusable device bodies; `csrc/mmq_bundle.cpp` owns the retained static selection and all HIP module launches.
+
+The conversion removed the legacy in-header launchers, unreachable large serial down kernels superseded by row tasks, and the superseded N=128 Q3 pair family. Forward and backward now share one packaged row-task descriptor builder with a host-selected row tile.
+
+All twelve geometry-specific arithmetic entries are resource-gated and have zero private bytes, zero VGPR/SGPR spills, and no dynamic stack. The ten generic compatibility entries remain packaged without a new resource assertion.
+
+The initial nine-repeat before/after matrix measured `+0.18%` geometric latency. Sequential embedded/bundle/embedded 25-repeat controls are neutral in aggregate: `+0.03%` geometric, `+0.19%` median, and `+0.00%` estimated model latency against the bracket midpoint, while the embedded controls drifted by `+1.43%`.
+
+Notable midpoint changes are a `10.3%` improvement for batch-1 uniform `Q4_K` down, a `4.8%` improvement for batch-1 skewed `Q4_K` down, and several `1.8-2.7%` `Q5_K` regressions on small sparse/boundary and batch-16 nonuniform routes. Artifacts are `/tmp/grouped_mmq_bwd_pre_bundle.json`, `/tmp/grouped_mmq_bwd_post_bundle.json`, and the three `/tmp/grouped_mmq_bwd_*_control_25.json` files. The complete packaging contract is in `docs/kernel_bundle.md`.
 
 ## Artifact index
 

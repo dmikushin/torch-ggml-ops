@@ -9,7 +9,6 @@ import numpy as np
 import torch
 from mmq_benchmark_common import cuda_event_times_ms, incremental_peak_bytes
 
-
 QUANT_BLOCK_GEOMETRY = {
     "Q8_0": (32, 34),
     "Q2_K": (256, 84),

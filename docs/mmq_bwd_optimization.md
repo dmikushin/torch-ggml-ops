@@ -32,7 +32,7 @@ Done:
 - every retained production specialization has zero private segment and zero VGPR or SGPR spills.
 - exact full-tile guards and bounds-safe fallbacks pass the current correctness suite.
 
-Remaining work for the current Qwen workload is limited to higher-level representation or cross-call reuse for shared-down Q4_K/Q5_K. Its local geometry, K-depth, prefetch, padding, swizzle, and extraction neighborhoods are closed.
+The broad local pass is complete. Shared-down Q4_K/Q5_K still require higher-level representation or cross-call reuse, while standalone-bundle exploration reopens only the bounded retuning candidates recorded under `Retuning priorities after standalone-bundle exploration`. Closed neighborhoods must not be restarted as broad sweeps.
 
 ## Hardware and measurement rules
 
@@ -774,6 +774,18 @@ Done:
 
 No further ordinary geometry, K-depth, swizzle-only, or prefetch-toggle sweep has a high-confidence meaningful margin.
 
+### Retuning priorities after standalone-bundle exploration
+
+These marks prioritize large repeatable margins, long arithmetic kernels, and projection families with meaningful checkpoint call counts. They do not treat changed instruction ordering as an optimization hypothesis. Measure warmed packaged HSACOs, isolate arithmetic duration, and change one HIP-semantic behavior at a time.
+
+| Mark | Case | Model/performance reason | Bounded semantic experiment |
+| --- | --- | --- | --- |
+| **RETUNE-HIGH** | `DenseBwdQ3KFullWide`, attention-query Q3_K | Repeatable regressions span all production batches: about `+7.0%`, `+4.0%`, and `+2.9%`. The historical batch-16 kernel is approximately 47 ms and the projection occurs in ten query/query-gate tensors. | Revalidate current packed quant extraction, packed-byte prefetch, and selected eight-BF16 XOR layout with at most three single-knob controls. Do not reopen M/N geometry, K64, or cross-iteration prefetch. |
+| **RETUNE-HIGH (REPRESENTATION)** | Shared-down Q4_K/Q5_K | These are the only material dense-backward deficits, approximately `0.78x/0.74x` BF16 across 40 tensors. Q5_K also has a repeatable `+4.1%` batch-4 bundle control regression. | Change decode reuse or the representation consumed by the kernel. Before a larger project, one current-HSACO four- versus eight-BF16 Q5_K swizzle control is allowed because the earlier margin was modest; all other local geometry/K-depth neighborhoods remain closed. |
+| **RETUNE-MEDIUM** | Narrow Q5_K full-tile path | Batch 1 regresses about `5.7%`, and packed Q5 extraction historically produced a gain of similar size. Narrow projections are called repeatedly even though each individual kernel is short. | Direct packed-versus-scalar Q5 extraction A/B with identical geometry, LDS layout, and prefetch. Stop if packed extraction remains faster. |
+| **RETUNE-MEDIUM** | Q6_K M=256 backward | The same production loss-chunk kernel regresses about `2.33%` in all three physical-batch controls and takes about 11.7 ms per chunk. | Packed-versus-scalar Q6 extraction only. The selected N4/K32/two-M-workgroup geometry and eight-BF16 swizzle remain closed because alternatives lost by much larger margins. |
+| **DO NOT RETUNE NOW** | Isolated Q4_K narrow/attention-output bundle points | Their `2-3%` movements are isolated, while shared-down Q4_K improved about `4.8%` and the local neighborhoods were already measured. | Retain as controls unless repeated model-weighted arithmetic timing identifies a consistent deficit. |
+
 ### Monitor the production M=256 LM-head schedule
 
 The packed Liger loss uses M=256. Its complete MMQ-forward, in-place cross-entropy, and MMQ-backward loop is 26.5% faster than the previous M=64 schedule. Peak allocation above resident inputs increases from 69.03 to 253.57 MiB. That approximately 184.5 MiB increase is accepted. M=128 remains the first lower-memory fallback.
@@ -890,6 +902,16 @@ Backward uses the authoritative packed payload and does not quantize cotangents.
 The extension was rebuilt for `/tmp/mmq_bwd_final_autonomous.json`. `python -m compileall -q bench` and `git diff --check` also pass.
 
 One validation run had a single grouped-pair element exceed its absolute tolerance by one BF16 step. The targeted test and an immediate complete rerun passed without source changes, so it was treated as reduction-order test variance rather than a dense MMQ failure.
+
+## Architecture-specific bundle conversion
+
+All 36 retained dense-backward specializations now compile as independent gfx1151 HSACOs through `tools/build_mmq_bundle.py`. `csrc/ck/mmq_backward.cuh` owns one reusable device body, while `csrc/mmq_bundle.cpp` preserves the established full/bounded, row-range, N-tile, K-iteration, grouped-M, decoder, prefetch, LDS-layout, and packed-byte dispatch. The old in-header launcher and all embedded backward entry points were removed.
+
+Every dense-backward artifact is resource-gated and has zero private bytes, zero VGPR/SGPR spills, and no dynamic stack.
+
+The initial nine-repeat before/after comparison measured `+0.56%` geometric latency. Sequential embedded/bundle/embedded 25-repeat controls place the package at `+1.12%` geometrically, `+0.69%` by median point, and `+0.93%` by estimated model latency against the bracket midpoint; the embedded controls drifted by `+1.04%`.
+
+The largest repeatable regressions are the `Q3_K` attention-query points at about `+2.9-7.0%`, including batch 1 at `3.199/3.448/3.248 ms` for embedded pre, bundle, and embedded post. Shared-down `Q4_K` batch 4 improves about `4.8%`, while shared-down `Q5_K` batch 4 regresses about `4.1%`. These are accepted code-object layout changes; no dispatch threshold or device-body algorithm changed. Artifacts are `/tmp/mmq_bwd_pre_bundle.json`, `/tmp/mmq_bwd_post_bundle.json`, and the three `/tmp/mmq_bwd_*_control_25.json` files. The complete design and package contract is in `docs/kernel_bundle.md`.
 
 ## Profiler and tool issues
 

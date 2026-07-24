@@ -7,9 +7,8 @@
 #undef __HIP_NO_HALF_CONVERSIONS__
 #endif
 
-#include "mmq_core.cuh"
-#include "ck/grouped_mmq_backward.cuh"
-#include "ck/mmq_backward.cuh"
+#include "mmq_bundle.h"
+#include "vendor/llama_cpp/common.cuh"
 
 #include <hip/hip_runtime.h>
 #include <Python.h>
@@ -29,33 +28,6 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-
-void launch_deepseek_grouped_projection(
-    ggml_type type,
-    const char * packed,
-    const int * activations,
-    __hip_bfloat16 * output,
-    const int64_t * expert_indices,
-    const int32_t * expert_offsets,
-    int num_experts,
-    int num_groups,
-    int rows,
-    int in_features,
-    int out_features,
-    int64_t bytes_per_expert,
-    hipStream_t stream);
-
-void launch_qwen_iq2_s_down_projection(
-    const char * packed,
-    const int * activations,
-    __hip_bfloat16 * output,
-    const int64_t * expert_indices,
-    const int32_t * expert_offsets,
-    int num_experts,
-    int num_groups,
-    int rows,
-    int64_t bytes_per_expert,
-    hipStream_t stream);
 
 namespace {
 
@@ -86,362 +58,11 @@ int64_t packed_row_bytes(int64_t quant_type, int64_t in_features) {
         packed_block_bytes(quant_type);
 }
 
-template <typename Function>
-void dispatch_forward_quant_type(int64_t quant_type, Function && function) {
-    switch (quant_type) {
-        case GGML_TYPE_Q8_0:
-            function(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
-            break;
-        case GGML_TYPE_Q2_K:
-            function(std::integral_constant<ggml_type, GGML_TYPE_Q2_K>{});
-            break;
-        case GGML_TYPE_Q3_K:
-            function(std::integral_constant<ggml_type, GGML_TYPE_Q3_K>{});
-            break;
-        case GGML_TYPE_Q4_K:
-            function(std::integral_constant<ggml_type, GGML_TYPE_Q4_K>{});
-            break;
-        case GGML_TYPE_Q5_K:
-            function(std::integral_constant<ggml_type, GGML_TYPE_Q5_K>{});
-            break;
-        case GGML_TYPE_Q6_K:
-            function(std::integral_constant<ggml_type, GGML_TYPE_Q6_K>{});
-            break;
-        case GGML_TYPE_IQ2_XXS:
-            function(std::integral_constant<ggml_type, GGML_TYPE_IQ2_XXS>{});
-            break;
-        case GGML_TYPE_IQ2_S:
-            function(std::integral_constant<ggml_type, GGML_TYPE_IQ2_S>{});
-            break;
-        default:
-            STD_TORCH_CHECK(false, "unsupported quant_type: ", quant_type);
-    }
-}
-
-template <typename Function>
-void dispatch_quant_type(int64_t quant_type, Function && function) {
-    switch (quant_type) {
-        case GGML_TYPE_Q3_K:
-            function(std::integral_constant<ggml_type, GGML_TYPE_Q3_K>{});
-            break;
-        case GGML_TYPE_Q4_K:
-            function(std::integral_constant<ggml_type, GGML_TYPE_Q4_K>{});
-            break;
-        case GGML_TYPE_Q5_K:
-            function(std::integral_constant<ggml_type, GGML_TYPE_Q5_K>{});
-            break;
-        case GGML_TYPE_Q6_K:
-            function(std::integral_constant<ggml_type, GGML_TYPE_Q6_K>{});
-            break;
-        case GGML_TYPE_IQ2_S:
-            function(std::integral_constant<ggml_type, GGML_TYPE_IQ2_S>{});
-            break;
-        default:
-            STD_TORCH_CHECK(false, "unsupported quant_type: ", quant_type);
-    }
-}
-
-void check_hip(hipError_t status, const char * operation) {
-    STD_TORCH_CHECK(status == hipSuccess, operation, " failed: ", hipGetErrorString(status));
-}
-
-int sram_stride_host(int64_t quant_type) {
-    switch (quant_type) {
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_IQ2_XXS:
-            return mmq_sram_stride(GGML_TYPE_Q8_0);
-        case GGML_TYPE_Q2_K:
-            return mmq_sram_stride(GGML_TYPE_Q2_K);
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_IQ2_S:
-            return mmq_sram_stride(GGML_TYPE_Q3_K);
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-            return mmq_sram_stride(GGML_TYPE_Q4_K);
-        case GGML_TYPE_Q6_K:
-            return mmq_sram_stride(GGML_TYPE_Q6_K);
-        default:
-            return -1;
-    }
-}
-
-template <ggml_type type, int J>
-void launch_dense_mmq_multiply(
-        const char * packed,
-        __hip_bfloat16 * output,
-        const block_q8_1_mmq * workspace,
-        int rows,
-        int rows_padded,
-        int in_features,
-        int out_features,
-        hipStream_t stream) {
-    const dim3 mmq_grid((out_features + MMQ_I - 1) / MMQ_I, rows_padded / J, 1);
-    const dim3 mmq_block(WARP_SIZE, MMQ_NWARPS, 1);
-    const int shared_ints = J + GGML_PAD(J * MMQ_TILE_Y_K, MMQ_NTHREADS)
-        + MMQ_I * sram_stride_host(type);
-    dense_mmq_bf16_kernel<type, J>
-        <<<mmq_grid, mmq_block, shared_ints * sizeof(int), stream>>>(
-            packed,
-            reinterpret_cast<const int *>(workspace),
-            output,
-            out_features,
-            rows,
-            rows_padded,
-            in_features / QK_K);
-}
-
-template <ggml_type type>
-void launch_dense_mmq(
-        const __hip_bfloat16 * input,
-        const char * packed,
-        __hip_bfloat16 * output,
-        block_q8_1_mmq * workspace,
-        int rows,
-        int rows_padded,
-        int in_features,
-        int out_features,
-        hipStream_t stream) {
-    const dim3 quant_grid(rows, 1, 1);
-    const dim3 quant_block(512, 1, 1);
-    quantize_bf16_mmq_q8_1<type><<<quant_grid, quant_block, 0, stream>>>(
-        input, workspace, rows, rows_padded, in_features);
-    check_hip(hipGetLastError(), "quantize_bf16_mmq_q8_1 launch");
-
-    if constexpr (type == GGML_TYPE_Q6_K) {
-        if (rows_padded == MMQ_J_SMALL) {
-            launch_dense_mmq_multiply<type, MMQ_J_SMALL>(
-                packed, output, workspace, rows, rows_padded, in_features, out_features, stream);
-        } else {
-            launch_dense_mmq_multiply<type, MMQ_J>(
-                packed, output, workspace, rows, rows_padded, in_features, out_features, stream);
-        }
-    } else {
-        launch_dense_mmq_multiply<type, MMQ_J>(
-            packed, output, workspace, rows, rows_padded, in_features, out_features, stream);
-    }
-    check_hip(hipGetLastError(), "dense_mmq_bf16_kernel launch");
-}
-
-template <ggml_type type>
-void launch_grouped_quantize(
-        const __hip_bfloat16 * input,
-        block_q8_1_mmq * workspace,
-        int rows,
-        int in_features,
-        hipStream_t stream) {
-    const dim3 quant_grid(rows, 1, 1);
-    const dim3 quant_block(512, 1, 1);
-    quantize_bf16_mmq_q8_1<type><<<quant_grid, quant_block, 0, stream>>>(
-        input, workspace, rows, rows, in_features);
-    check_hip(hipGetLastError(), "grouped quantize_bf16_mmq_q8_1 launch");
-}
-
-template <ggml_type type, int J, int fixed_nrows_weight = 0, int fixed_blocks_per_weight_row = 0>
-void launch_grouped_projection_kernel(
-        const char * packed,
-        const int * activations,
-        __hip_bfloat16 * output,
-        const int64_t * expert_indices,
-        const int32_t * expert_offsets,
-        int num_experts,
-        int num_groups,
-        int rows,
-        int in_features,
-        int out_features,
-        int64_t bytes_per_expert,
-        hipStream_t stream) {
-    constexpr bool fixed_shape = fixed_nrows_weight > 0 && fixed_blocks_per_weight_row > 0;
-    const int kernel_out_features = fixed_shape ? fixed_nrows_weight : out_features;
-    const int kernel_blocks_per_weight_row =
-        fixed_shape ? fixed_blocks_per_weight_row : in_features / QK_K;
-    const dim3 mmq_grid((kernel_out_features + MMQ_I - 1) / MMQ_I, num_groups, 1);
-    const dim3 mmq_block(WARP_SIZE, MMQ_NWARPS, 1);
-    const int shared_ints = J + GGML_PAD(J * MMQ_TILE_Y_K, MMQ_NTHREADS)
-        + MMQ_I * sram_stride_host(type);
-    grouped_mmq_bf16_kernel<type, J, fixed_nrows_weight, fixed_blocks_per_weight_row>
-        <<<mmq_grid, mmq_block, shared_ints * sizeof(int), stream>>>(
-            packed,
-            activations,
-            output,
-            expert_indices,
-            expert_offsets,
-            num_experts,
-            kernel_out_features,
-            rows,
-            kernel_blocks_per_weight_row,
-            bytes_per_expert);
-}
-
-void launch_grouped_row_task_setup(
-        const int64_t * expert_indices,
-        const int32_t * expert_offsets,
-        int32_t * task_count,
-        int32_t * task_experts,
-        int32_t * task_row_starts,
-        int32_t * task_row_ends,
-        int num_experts,
-        int num_groups,
-        int rows,
-        hipStream_t stream) {
-    grouped_mmq_build_row_tasks<<<1, 256, 0, stream>>>(
-        expert_indices,
-        expert_offsets,
-        task_count,
-        task_experts,
-        task_row_starts,
-        task_row_ends,
-        num_experts,
-        num_groups,
-        rows,
-        MMQ_J_SMALL);
-    check_hip(hipGetLastError(), "grouped_mmq_build_row_tasks launch");
-}
-
-template <ggml_type type>
-void launch_grouped_row_task_projection(
-        const char * packed,
-        const int * activations,
-        __hip_bfloat16 * output,
-        const int32_t * task_count,
-        const int32_t * task_experts,
-        const int32_t * task_row_starts,
-        const int32_t * task_row_ends,
-        int max_tasks,
-        int rows,
-        int64_t bytes_per_expert,
-        hipStream_t stream) {
-    const dim3 mmq_grid(512 / MMQ_I, max_tasks, 1);
-    const dim3 mmq_block(WARP_SIZE, MMQ_NWARPS, 1);
-    const int shared_ints = MMQ_J_SMALL
-        + GGML_PAD(MMQ_J_SMALL * MMQ_TILE_Y_K, MMQ_NTHREADS)
-        + MMQ_I * sram_stride_host(type);
-    grouped_mmq_row_task_kernel<type, MMQ_J_SMALL, 512, 8>
-        <<<mmq_grid, mmq_block, shared_ints * sizeof(int), stream>>>(
-            packed,
-            activations,
-            output,
-            task_count,
-            task_experts,
-            task_row_starts,
-            task_row_ends,
-            rows,
-            bytes_per_expert);
-    check_hip(hipGetLastError(), "grouped_mmq_row_task_kernel launch");
-}
-
-template <ggml_type type>
-void launch_grouped_projection(
-        const char * packed,
-        const int * activations,
-        __hip_bfloat16 * output,
-        const int64_t * expert_indices,
-        const int32_t * expert_offsets,
-        int num_experts,
-        int num_groups,
-        int rows,
-        int in_features,
-        int out_features,
-        int64_t bytes_per_expert,
-        hipStream_t stream) {
-    if constexpr (type == GGML_TYPE_IQ2_S) {
-        if (
-            out_features == 2048 && in_features == 512 &&
-            rows < num_groups * (2 * MMQ_J_SMALL)
-        ) {
-            launch_qwen_iq2_s_down_projection(
-                packed,
-                activations,
-                output,
-                expert_indices,
-                expert_offsets,
-                num_experts,
-                num_groups,
-                rows,
-                bytes_per_expert,
-                stream);
-            return;
-        }
-    }
-
-    if (out_features == 512 && in_features == 2048) {
-        launch_grouped_projection_kernel<type, MMQ_J_SMALL, 512, 8>(
-            packed,
-            activations,
-            output,
-            expert_indices,
-            expert_offsets,
-            num_experts,
-            num_groups,
-            rows,
-            in_features,
-            out_features,
-            bytes_per_expert,
-            stream);
-    } else if (out_features == 2048 && in_features == 512) {
-        launch_grouped_projection_kernel<type, MMQ_J_SMALL, 2048, 2>(
-            packed,
-            activations,
-            output,
-            expert_indices,
-            expert_offsets,
-            num_experts,
-            num_groups,
-            rows,
-            in_features,
-            out_features,
-            bytes_per_expert,
-            stream);
-    } else if constexpr (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q2_K) {
-        const bool production_shape =
-            (type == GGML_TYPE_IQ2_XXS && out_features == 2048 && in_features == 4096) ||
-            (type == GGML_TYPE_Q2_K && out_features == 4096 && in_features == 2048);
-        if (production_shape) {
-            launch_deepseek_grouped_projection(
-                type,
-                packed,
-                activations,
-                output,
-                expert_indices,
-                expert_offsets,
-                num_experts,
-                num_groups,
-                rows,
-                in_features,
-                out_features,
-                bytes_per_expert,
-                stream);
-        } else {
-            launch_grouped_projection_kernel<type, MMQ_J>(
-                packed,
-                activations,
-                output,
-                expert_indices,
-                expert_offsets,
-                num_experts,
-                num_groups,
-                rows,
-                in_features,
-                out_features,
-                bytes_per_expert,
-                stream);
-        }
-    } else {
-        launch_grouped_projection_kernel<type, MMQ_J>(
-            packed,
-            activations,
-            output,
-            expert_indices,
-            expert_offsets,
-            num_experts,
-            num_groups,
-            rows,
-            in_features,
-            out_features,
-            bytes_per_expert,
-            stream);
-    }
-    check_hip(hipGetLastError(), "grouped_mmq_bf16_kernel launch");
-}
+constexpr int64_t kQuantWorkspaceBlockBytes = 144;
+constexpr int64_t kQuantWorkspaceBlockValues = 4 * QK8_1;
+constexpr int64_t kForwardRows = 128;
+constexpr int64_t kForwardSmallRows = 64;
+constexpr int64_t kBackwardTaskRows = 128;
 
 struct GroupedMMQShape {
     int rows;
@@ -656,8 +277,9 @@ Tensor new_grouped_output(const Tensor & input, const GroupedMMQShape & shape) {
 }
 
 Tensor new_grouped_workspace(const Tensor & input, const GroupedMMQShape & shape) {
-    const int64_t workspace_bytes =
-        static_cast<int64_t>(shape.rows) * (shape.in_features / (4 * QK8_1)) * sizeof(block_q8_1_mmq);
+    const int64_t workspace_bytes = static_cast<int64_t>(shape.rows) *
+        (shape.in_features / kQuantWorkspaceBlockValues) *
+        kQuantWorkspaceBlockBytes;
     std::array<int64_t, 1> workspace_size{workspace_bytes};
     return torch::stable::new_empty(
         input,
@@ -667,11 +289,12 @@ Tensor new_grouped_workspace(const Tensor & input, const GroupedMMQShape & shape
 
 bool use_grouped_row_tasks(const GroupedMMQShape & shape) {
     return shape.out_features == 512 && shape.in_features == 2048 &&
-        shape.rows >= shape.num_groups * (2 * MMQ_J_SMALL);
+        shape.rows >= shape.num_groups * (2 * kForwardSmallRows);
 }
 
 int grouped_row_task_capacity(const GroupedMMQShape & shape) {
-    return (shape.rows + MMQ_J_SMALL - 1) / MMQ_J_SMALL + shape.num_groups;
+    return (shape.rows + kForwardSmallRows - 1) / kForwardSmallRows +
+        shape.num_groups;
 }
 
 Tensor new_grouped_row_task_workspace(
@@ -689,14 +312,13 @@ Tensor new_grouped_row_task_workspace(
 bool use_grouped_backward_row_tasks(
         const GroupedMMQShape & shape, int64_t quant_type) {
     return shape.out_features == 2048 && shape.in_features == 512 &&
-        shape.rows >= shape.num_groups * torch_ggml_ops::ck::GROUPED_BACKWARD_TILED_M &&
+        shape.rows >= shape.num_groups * kBackwardTaskRows &&
         (quant_type == GGML_TYPE_Q4_K || quant_type == GGML_TYPE_Q5_K ||
          quant_type == GGML_TYPE_IQ2_S);
 }
 
 int grouped_backward_row_task_capacity(const GroupedMMQShape & shape) {
-    constexpr int row_tile =
-        torch_ggml_ops::ck::GROUPED_BACKWARD_TILED_M;
+    constexpr int row_tile = kBackwardTaskRows;
     return (shape.rows + row_tile - 1) / row_tile + shape.num_groups;
 }
 
@@ -789,8 +411,9 @@ Tensor fixed_grouped_mmq_cuda(
             output_sizes.data(), output_sizes.size()),
         ScalarType::BFloat16);
 
-    const int64_t workspace_bytes =
-        total_rows * (in_features / (4 * QK8_1)) * sizeof(block_q8_1_mmq);
+    const int64_t workspace_bytes = total_rows *
+        (in_features / kQuantWorkspaceBlockValues) *
+        kQuantWorkspaceBlockBytes;
     std::array<int64_t, 1> workspace_size{workspace_bytes};
     Tensor workspace = torch::stable::new_empty(
         input,
@@ -809,52 +432,24 @@ Tensor fixed_grouped_mmq_cuda(
         static_cast<const char *>(packed_weight.const_data_ptr());
     auto * output_pointer =
         static_cast<__hip_bfloat16 *>(output.mutable_data_ptr());
-    auto * workspace_pointer =
-        static_cast<block_q8_1_mmq *>(workspace.mutable_data_ptr());
+    void * workspace_pointer = workspace.mutable_data_ptr();
 
-    quantize_bf16_mmq_q8_1<GGML_TYPE_Q8_0>
-        <<<dim3(total_rows, 1, 1), dim3(512, 1, 1), 0, stream>>>(
-            input_pointer,
-            workspace_pointer,
-            total_rows,
-            total_rows,
-            in_features);
-    check_hip(
-        hipGetLastError(),
-        "fixed-group quantize_bf16_mmq_q8_1 launch");
-
-    constexpr int J = MMQ_J_SMALL;
-    const dim3 grid(
-        (out_features + MMQ_I - 1) / MMQ_I,
-        (tokens + J - 1) / J,
-        groups);
-    const dim3 block(WARP_SIZE, MMQ_NWARPS, 1);
-    const int shared_ints = J + GGML_PAD(J * MMQ_TILE_Y_K, MMQ_NTHREADS) +
-        MMQ_I * sram_stride_host(GGML_TYPE_Q8_0);
-    if (out_features % MMQ_I == 0) {
-        fixed_grouped_q8_0_mmq_bf16_kernel<
-            J, groups, blocks_per_weight_row, false>
-            <<<grid, block, shared_ints * sizeof(int), stream>>>(
-                packed_pointer,
-                reinterpret_cast<const int *>(workspace_pointer),
-                output_pointer,
-                static_cast<int>(tokens),
-                static_cast<int>(out_features),
-                bytes_per_group);
-    } else {
-        fixed_grouped_q8_0_mmq_bf16_kernel<
-            J, groups, blocks_per_weight_row, true>
-            <<<grid, block, shared_ints * sizeof(int), stream>>>(
-                packed_pointer,
-                reinterpret_cast<const int *>(workspace_pointer),
-                output_pointer,
-                static_cast<int>(tokens),
-                static_cast<int>(out_features),
-                bytes_per_group);
-    }
-    check_hip(
-        hipGetLastError(),
-        "fixed_grouped_q8_0_mmq_bf16_kernel launch");
+    torch_ggml_ops::mmq_bundle::launch_quantize(
+        GGML_TYPE_Q8_0,
+        input_pointer,
+        workspace_pointer,
+        total_rows,
+        total_rows,
+        in_features,
+        stream);
+    torch_ggml_ops::mmq_bundle::launch_fixed_grouped_forward(
+        packed_pointer,
+        static_cast<const int *>(workspace_pointer),
+        output_pointer,
+        static_cast<int>(tokens),
+        static_cast<int>(out_features),
+        bytes_per_group,
+        stream);
 
     return output;
 }
@@ -915,11 +510,12 @@ Tensor mmq_cuda(
         torch::headeronly::IntHeaderOnlyArrayRef(output_sizes.data(), output_sizes.size()),
         ScalarType::BFloat16);
 
-    const int64_t row_tile =
-        quant_type == GGML_TYPE_Q6_K && rows <= MMQ_J_SMALL ? MMQ_J_SMALL : MMQ_J;
+    const int64_t row_tile = quant_type == GGML_TYPE_Q6_K &&
+        rows <= kForwardSmallRows ? kForwardSmallRows : kForwardRows;
     const int64_t rows_padded = ((rows + row_tile - 1) / row_tile) * row_tile;
-    const int64_t workspace_bytes =
-        rows_padded * (in_features / (4 * QK8_1)) * sizeof(block_q8_1_mmq);
+    const int64_t workspace_bytes = rows_padded *
+        (in_features / kQuantWorkspaceBlockValues) *
+        kQuantWorkspaceBlockBytes;
     std::array<int64_t, 1> workspace_size{workspace_bytes};
     Tensor workspace_tensor = torch::stable::new_empty(
         input,
@@ -933,21 +529,26 @@ Tensor mmq_cuda(
     const auto * input_pointer = static_cast<const __hip_bfloat16 *>(input.const_data_ptr());
     const auto * packed_pointer = static_cast<const char *>(packed_weight.const_data_ptr());
     auto * output_pointer = static_cast<__hip_bfloat16 *>(output.mutable_data_ptr());
-    auto * workspace_pointer = static_cast<block_q8_1_mmq *>(workspace_tensor.mutable_data_ptr());
+    void * workspace_pointer = workspace_tensor.mutable_data_ptr();
 
-    dispatch_forward_quant_type(quant_type, [&](auto type_tag) {
-        constexpr ggml_type type = decltype(type_tag)::value;
-        launch_dense_mmq<type>(
-            input_pointer,
-            packed_pointer,
-            output_pointer,
-            workspace_pointer,
-            static_cast<int>(rows),
-            static_cast<int>(rows_padded),
-            static_cast<int>(in_features),
-            static_cast<int>(out_features),
-            stream);
-    });
+    torch_ggml_ops::mmq_bundle::launch_quantize(
+        static_cast<int32_t>(quant_type),
+        input_pointer,
+        workspace_pointer,
+        rows,
+        rows_padded,
+        in_features,
+        stream);
+    torch_ggml_ops::mmq_bundle::launch_dense_forward(
+        static_cast<int32_t>(quant_type),
+        packed_pointer,
+        static_cast<const int *>(workspace_pointer),
+        output_pointer,
+        static_cast<int>(rows),
+        static_cast<int>(rows_padded),
+        static_cast<int>(in_features),
+        static_cast<int>(out_features),
+        stream);
 
     return output;
 }
@@ -1031,18 +632,15 @@ Tensor mmq_grad_input_cuda(
     const auto * packed_pointer = static_cast<const char *>(packed_weight.const_data_ptr());
     auto * input_pointer = static_cast<__hip_bfloat16 *>(grad_input.mutable_data_ptr());
 
-    dispatch_quant_type(quant_type, [&](auto type_tag) {
-        constexpr ggml_type type = decltype(type_tag)::value;
-        torch_ggml_ops::ck::launch_dense_mmq_grad_input<type>(
-            grad_pointer,
-            packed_pointer,
-            input_pointer,
-            static_cast<int>(rows),
-            static_cast<int>(out_features),
-            static_cast<int>(in_features),
-            stream);
-    });
-    check_hip(hipGetLastError(), "dense_mmq_grad_input_kernel launch");
+    torch_ggml_ops::mmq_bundle::launch_dense_backward(
+        static_cast<int32_t>(quant_type),
+        grad_pointer,
+        packed_pointer,
+        input_pointer,
+        static_cast<int>(rows),
+        static_cast<int>(out_features),
+        static_cast<int>(in_features),
+        stream);
 
     return grad_input;
 }
@@ -1095,7 +693,7 @@ Tensor grouped_mmq_grad_input_cuda(
         int32_t * task_experts = task_count + 1;
         int32_t * task_row_starts = task_experts + max_tasks;
         int32_t * task_row_ends = task_row_starts + max_tasks;
-        grouped_mmq_build_row_tasks<<<1, 256, 0, stream>>>(
+        torch_ggml_ops::mmq_bundle::launch_grouped_row_task_setup(
             expert_pointer,
             offsets_pointer,
             task_count,
@@ -1105,40 +703,36 @@ Tensor grouped_mmq_grad_input_cuda(
             shape.num_experts,
             shape.num_groups,
             shape.rows,
-            torch_ggml_ops::ck::GROUPED_BACKWARD_TILED_M);
-        dispatch_quant_type(quant_type, [&](auto type_tag) {
-            constexpr ggml_type type = decltype(type_tag)::value;
-            torch_ggml_ops::ck::launch_grouped_mmq_grad_input_row_tasks<type>(
-                grad_pointer,
-                packed_pointer,
-                input_pointer,
-                task_count,
-                task_experts,
-                task_row_starts,
-                task_row_ends,
-                max_tasks,
-                shape.bytes_per_expert,
-                stream);
-        });
+            128,
+            stream);
+        torch_ggml_ops::mmq_bundle::launch_grouped_backward_row_tasks(
+            static_cast<int32_t>(quant_type),
+            grad_pointer,
+            packed_pointer,
+            input_pointer,
+            task_count,
+            task_experts,
+            task_row_starts,
+            task_row_ends,
+            max_tasks,
+            shape.bytes_per_expert,
+            stream);
     } else {
-        dispatch_quant_type(quant_type, [&](auto type_tag) {
-            constexpr ggml_type type = decltype(type_tag)::value;
-            torch_ggml_ops::ck::launch_grouped_mmq_grad_input<type>(
-                grad_pointer,
-                packed_pointer,
-                input_pointer,
-                expert_pointer,
-                offsets_pointer,
-                shape.num_experts,
-                shape.num_groups,
-                shape.rows,
-                shape.out_features,
-                shape.in_features,
-                shape.bytes_per_expert,
-                stream);
-        });
+        torch_ggml_ops::mmq_bundle::launch_grouped_backward(
+            static_cast<int32_t>(quant_type),
+            grad_pointer,
+            packed_pointer,
+            input_pointer,
+            expert_pointer,
+            offsets_pointer,
+            shape.num_experts,
+            shape.num_groups,
+            shape.rows,
+            shape.out_features,
+            shape.in_features,
+            shape.bytes_per_expert,
+            stream);
     }
-    check_hip(hipGetLastError(), "grouped_mmq_grad_input_kernel launch");
 
     return grad_input;
 }
@@ -1202,25 +796,22 @@ Tensor grouped_mmq_pair_grad_input_cuda(
     auto * input_pointer =
         static_cast<__hip_bfloat16 *>(grad_input.mutable_data_ptr());
 
-    dispatch_quant_type(quant_type, [&](auto type_tag) {
-        constexpr ggml_type type = decltype(type_tag)::value;
-        torch_ggml_ops::ck::launch_grouped_mmq_pair_grad_input<type>(
-            first_grad_pointer,
-            second_grad_pointer,
-            first_packed_pointer,
-            second_packed_pointer,
-            input_pointer,
-            expert_pointer,
-            offsets_pointer,
-            shape.num_experts,
-            shape.num_groups,
-            shape.rows,
-            shape.out_features,
-            shape.in_features,
-            shape.bytes_per_expert,
-            stream);
-    });
-    check_hip(hipGetLastError(), "grouped_mmq_pair_grad_input_kernel launch");
+    torch_ggml_ops::mmq_bundle::launch_grouped_pair_backward(
+        static_cast<int32_t>(quant_type),
+        first_grad_pointer,
+        second_grad_pointer,
+        first_packed_pointer,
+        second_packed_pointer,
+        input_pointer,
+        expert_pointer,
+        offsets_pointer,
+        shape.num_experts,
+        shape.num_groups,
+        shape.rows,
+        shape.out_features,
+        shape.in_features,
+        shape.bytes_per_expert,
+        stream);
 
     return grad_input;
 }
@@ -1253,8 +844,16 @@ Tensor grouped_mmq_cuda(
     const auto * expert_pointer = static_cast<const int64_t *>(expert_indices.const_data_ptr());
     const auto * offsets_pointer = static_cast<const int32_t *>(expert_offsets.const_data_ptr());
     auto * output_pointer = static_cast<__hip_bfloat16 *>(output.mutable_data_ptr());
-    auto * workspace_pointer = static_cast<block_q8_1_mmq *>(workspace.mutable_data_ptr());
+    void * workspace_pointer = workspace.mutable_data_ptr();
 
+    torch_ggml_ops::mmq_bundle::launch_quantize(
+        static_cast<int32_t>(quant_type),
+        input_pointer,
+        workspace_pointer,
+        shape.rows,
+        shape.rows,
+        shape.in_features,
+        stream);
     if (use_grouped_row_tasks(shape)) {
         Tensor task_workspace = new_grouped_row_task_workspace(input, shape);
         auto * task_pointer = static_cast<int32_t *>(task_workspace.mutable_data_ptr());
@@ -1264,63 +863,48 @@ Tensor grouped_mmq_cuda(
         int32_t * task_row_starts = task_experts + max_tasks;
         int32_t * task_row_ends = task_row_starts + max_tasks;
 
-        dispatch_quant_type(quant_type, [&](auto type_tag) {
-            constexpr ggml_type type = decltype(type_tag)::value;
-            launch_grouped_quantize<type>(
-                input_pointer,
-                workspace_pointer,
-                shape.rows,
-                shape.in_features,
-                stream);
-            launch_grouped_row_task_setup(
-                expert_pointer,
-                offsets_pointer,
-                task_count,
-                task_experts,
-                task_row_starts,
-                task_row_ends,
-                shape.num_experts,
-                shape.num_groups,
-                shape.rows,
-                stream);
-            launch_grouped_row_task_projection<type>(
-                packed_pointer,
-                reinterpret_cast<const int *>(workspace_pointer),
-                output_pointer,
-                task_count,
-                task_experts,
-                task_row_starts,
-                task_row_ends,
-                max_tasks,
-                shape.rows,
-                shape.bytes_per_expert,
-                stream);
-        });
-        return output;
-    }
-
-    dispatch_forward_quant_type(quant_type, [&](auto type_tag) {
-        constexpr ggml_type type = decltype(type_tag)::value;
-        launch_grouped_quantize<type>(
-            input_pointer,
-            workspace_pointer,
-            shape.rows,
-            shape.in_features,
-            stream);
-        launch_grouped_projection<type>(
-            packed_pointer,
-            reinterpret_cast<const int *>(workspace_pointer),
-            output_pointer,
+        torch_ggml_ops::mmq_bundle::launch_grouped_row_task_setup(
             expert_pointer,
             offsets_pointer,
+            task_count,
+            task_experts,
+            task_row_starts,
+            task_row_ends,
             shape.num_experts,
             shape.num_groups,
             shape.rows,
-            shape.in_features,
-            shape.out_features,
+            64,
+            stream);
+        torch_ggml_ops::mmq_bundle::launch_grouped_forward_row_tasks(
+            static_cast<int32_t>(quant_type),
+            packed_pointer,
+            static_cast<const int *>(workspace_pointer),
+            output_pointer,
+            task_count,
+            task_experts,
+            task_row_starts,
+            task_row_ends,
+            max_tasks,
+            shape.rows,
             shape.bytes_per_expert,
             stream);
-    });
+        return output;
+    }
+
+    torch_ggml_ops::mmq_bundle::launch_grouped_forward(
+        static_cast<int32_t>(quant_type),
+        packed_pointer,
+        static_cast<const int *>(workspace_pointer),
+        output_pointer,
+        expert_pointer,
+        offsets_pointer,
+        shape.num_experts,
+        shape.num_groups,
+        shape.rows,
+        shape.in_features,
+        shape.out_features,
+        shape.bytes_per_expert,
+        stream);
 
     return output;
 }
@@ -1369,8 +953,16 @@ std::tuple<Tensor, Tensor> grouped_mmq_pair_cuda(
     const auto * offsets_pointer = static_cast<const int32_t *>(expert_offsets.const_data_ptr());
     auto * first_output_pointer = static_cast<__hip_bfloat16 *>(first_output.mutable_data_ptr());
     auto * second_output_pointer = static_cast<__hip_bfloat16 *>(second_output.mutable_data_ptr());
-    auto * workspace_pointer = static_cast<block_q8_1_mmq *>(workspace.mutable_data_ptr());
+    void * workspace_pointer = workspace.mutable_data_ptr();
 
+    torch_ggml_ops::mmq_bundle::launch_quantize(
+        static_cast<int32_t>(quant_type),
+        input_pointer,
+        workspace_pointer,
+        shape.rows,
+        shape.rows,
+        shape.in_features,
+        stream);
     if (use_grouped_row_tasks(shape)) {
         Tensor task_workspace = new_grouped_row_task_workspace(input, shape);
         auto * task_pointer = static_cast<int32_t *>(task_workspace.mutable_data_ptr());
@@ -1380,41 +972,26 @@ std::tuple<Tensor, Tensor> grouped_mmq_pair_cuda(
         int32_t * task_row_starts = task_experts + max_tasks;
         int32_t * task_row_ends = task_row_starts + max_tasks;
 
-        dispatch_quant_type(quant_type, [&](auto type_tag) {
-            constexpr ggml_type type = decltype(type_tag)::value;
-            launch_grouped_quantize<type>(
-                input_pointer,
-                workspace_pointer,
-                shape.rows,
-                shape.in_features,
-                stream);
-            launch_grouped_row_task_setup(
-                expert_pointer,
-                offsets_pointer,
-                task_count,
-                task_experts,
-                task_row_starts,
-                task_row_ends,
-                shape.num_experts,
-                shape.num_groups,
-                shape.rows,
-                stream);
-            launch_grouped_row_task_projection<type>(
-                first_packed_pointer,
-                reinterpret_cast<const int *>(workspace_pointer),
-                first_output_pointer,
-                task_count,
-                task_experts,
-                task_row_starts,
-                task_row_ends,
-                max_tasks,
-                shape.rows,
-                shape.bytes_per_expert,
-                stream);
-            launch_grouped_row_task_projection<type>(
-                second_packed_pointer,
-                reinterpret_cast<const int *>(workspace_pointer),
-                second_output_pointer,
+        torch_ggml_ops::mmq_bundle::launch_grouped_row_task_setup(
+            expert_pointer,
+            offsets_pointer,
+            task_count,
+            task_experts,
+            task_row_starts,
+            task_row_ends,
+            shape.num_experts,
+            shape.num_groups,
+            shape.rows,
+            64,
+            stream);
+        for (const auto & projection : {
+                 std::make_pair(first_packed_pointer, first_output_pointer),
+                 std::make_pair(second_packed_pointer, second_output_pointer)}) {
+            torch_ggml_ops::mmq_bundle::launch_grouped_forward_row_tasks(
+                static_cast<int32_t>(quant_type),
+                projection.first,
+                static_cast<const int *>(workspace_pointer),
+                projection.second,
                 task_count,
                 task_experts,
                 task_row_starts,
@@ -1423,22 +1000,18 @@ std::tuple<Tensor, Tensor> grouped_mmq_pair_cuda(
                 shape.rows,
                 shape.bytes_per_expert,
                 stream);
-        });
+        }
         return std::make_tuple(std::move(first_output), std::move(second_output));
     }
 
-    dispatch_forward_quant_type(quant_type, [&](auto type_tag) {
-        constexpr ggml_type type = decltype(type_tag)::value;
-        launch_grouped_quantize<type>(
-            input_pointer,
-            workspace_pointer,
-            shape.rows,
-            shape.in_features,
-            stream);
-        launch_grouped_projection<type>(
-            first_packed_pointer,
-            reinterpret_cast<const int *>(workspace_pointer),
-            first_output_pointer,
+    for (const auto & projection : {
+             std::make_pair(first_packed_pointer, first_output_pointer),
+             std::make_pair(second_packed_pointer, second_output_pointer)}) {
+        torch_ggml_ops::mmq_bundle::launch_grouped_forward(
+            static_cast<int32_t>(quant_type),
+            projection.first,
+            static_cast<const int *>(workspace_pointer),
+            projection.second,
             expert_pointer,
             offsets_pointer,
             shape.num_experts,
@@ -1448,20 +1021,7 @@ std::tuple<Tensor, Tensor> grouped_mmq_pair_cuda(
             shape.out_features,
             shape.bytes_per_expert,
             stream);
-        launch_grouped_projection<type>(
-            second_packed_pointer,
-            reinterpret_cast<const int *>(workspace_pointer),
-            second_output_pointer,
-            expert_pointer,
-            offsets_pointer,
-            shape.num_experts,
-            shape.num_groups,
-            shape.rows,
-            shape.in_features,
-            shape.out_features,
-            shape.bytes_per_expert,
-            stream);
-    });
+    }
 
     return std::make_tuple(std::move(first_output), std::move(second_output));
 }

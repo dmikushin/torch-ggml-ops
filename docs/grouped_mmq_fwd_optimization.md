@@ -31,7 +31,7 @@ Final outcome:
 - checkpoint-weighted packed grouped projections are 1.53-2.82x faster than AITER across the measured batch/distribution matrix.
 - the only remaining individual losses are nonuniform IQ2_S down at batch 1 and batch 4.
 
-Remaining work for the current Qwen workload is representation-level: compact lossless IQ2_S decode caching, cross-call decoded-weight reuse, or a transient project-owned decoded dense stage. Its local tile, scheduler, K-loop, bounds, cache, and synchronization neighborhoods are closed.
+The broad Qwen local pass is complete. Representation-level IQ2_S work remains open, and standalone-bundle exploration adds one bounded Q5_K mixed-tile candidate recorded under `Retuning priorities after standalone-bundle exploration`. Other local tile, scheduler, K-loop, bounds, cache, and synchronization neighborhoods remain closed.
 
 ## Qwen production contract
 
@@ -1250,6 +1250,68 @@ The adjacent full Qwen 25-repeat A/B artifacts are:
 
 Relative to detached `efca259`, the checkpoint has `+0.54%` median and `+0.23%` geometric-mean latency movement. The retained small-row IQ2_S path improves batch-1 uniform/sparse by `10.8%/9.6%` in this packaged comparison. Conversely, unchanged Q3_K gate/up batch-4 points regress `1.2-4.3%`, and unchanged IQ2_S gate/up batch-4 points regress `0.9-2.5%`. Twenty-five of 60 individual points move by more than 1% despite unchanged arithmetic for most of them. This confirms that translation-unit separation, filename order, and the unreachable layout anchor are not valid performance contracts. The post-control artifact is the authoritative last-version Qwen baseline for the standalone module conversion; the packaged implementation must be compared against it in both production sequence and cold-instruction-cache conditions.
 
+### G15: standalone gfx1151 kernel bundle
+
+Status: retained and packaged; bounded Q5_K small-row retune retained.
+
+Grouped-forward arithmetic now ships as one independently compiled HSACO per entry under `torch_ggml_ops/kernels/gfx1151`. The extension fatbinary retains activation quantization, row-task setup, dense MMQ, and backward kernels, but no grouped-forward arithmetic kernels. The host table locates stable-name artifacts relative to `_C.abi3.so` with `dladdr`, then lazily caches `hipModuleLoadData`/`hipModuleGetFunction` results per device and kernel ID. The loader trusts the packaged code objects and leaves compatibility validation to HIP.
+
+The retained bundle has 37 entries totaling 1,652,576 bytes. Fourteen are production checkpoint entries and all 14 report zero private bytes, zero VGPR/SGPR spills, and no dynamic stack. The remaining generic and unsupported checkpoint-format entries preserve compatibility and their historical resource profiles. The package contains only the 37 HSACOs; launch metadata is compiled into the generated C++ table.
+
+The first repeated build rejected every artifact as non-reproducible because Clang 23 derived its default compilation-unit ID from staging paths. The generator now supplies a deterministic per-symbol `-cuid`. An isolated two-directory probe and a complete two-pass 36-entry build were byte-identical; the final 37-entry bundle receives the same reproducibility check after all retained edits.
+
+Packaging validation built `dist/torch_ggml_ops-0.1.0-cp310-abi3-linux_x86_64.whl`, confirmed the extension and all HSACOs in the archive, installed it under `/tmp/torch-ggml-ops-wheel-install`, changed the working directory to `/tmp`, and successfully launched fixed Q8 through the installed module.
+
+The first bundled source-of-record matrices, before the Q5 retune, were:
+
+```text
+/tmp/grouped_mmq_fwd_ds4_kernel_bundle.json
+/tmp/grouped_mmq_fwd_qwen_kernel_bundle.json
+```
+
+They remained bitwise exact and moved `+0.41%` and `+0.02%` geometrically against the G14 nine-repeat artifacts. Thirteen Qwen points crossed the 1% trigger. A fresh rebuild of commit `fdf8798` produced extension SHA-256 `ed2d1018d6266ec77a8d22573f3b85b63f33fc3efbc4bff5472e48d05c45c1cf`, distinct from G14's benchmarked extension despite identical source. The bracketed 25-repeat artifacts were:
+
+```text
+/tmp/grouped_mmq_fwd_qwen_last_version_rebuilt_pre_control_25.json
+/tmp/grouped_mmq_fwd_qwen_kernel_bundle_post_control_25.json
+/tmp/grouped_mmq_fwd_qwen_last_version_rebuilt_post_control_25.json
+```
+
+The rebuilt G14 pre/post controls drift by `-1.30%` geometrically and 33/60 points move more than 1%, while the bundle is `+1.12%` versus the pre-control and `-0.19%` versus the post-control. Against the canonical G14 post-control it is `+0.29%`. This brackets aggregate bundle movement inside the old packaging instability rather than identifying a stable aggregate regression.
+
+Q5_K down batch-1 nonuniform points were the repeatable exception. Standalone J64 uses 248 VGPRs and 46 SGPRs with a 28,544-byte arithmetic symbol, versus G14's 239 VGPRs and 41,960-byte symbol. A J32 standalone entry reduces this to 189 VGPRs and 32 SGPRs and is selected only when `rows < 128 * num_groups`. Adjacent J32/J64/J32 25-repeat artifacts are:
+
+```text
+/tmp/grouped_mmq_fwd_qwen_q5_j32_pre_25.json
+/tmp/grouped_mmq_fwd_qwen_q5_j64_mid_25.json
+/tmp/grouped_mmq_fwd_qwen_q5_j32_post_25.json
+```
+
+J32 improves skewed by `16.3-16.5%`, sparse by `13.9-14.1%`, and boundary by `14.5-14.7%`. Uniform regresses `2.6-3.1%`; the substantial three-route gain is retained. Batch 4/16 remain on J64. A Q3_K J32 candidate reached 144 VGPRs and 40 SGPRs but regressed batch-1 uniform from approximately 3.8 to 4.655 ms for only marginal nonuniform gains and is rejected.
+
+The final matrices are:
+
+```text
+/tmp/grouped_mmq_fwd_ds4_kernel_bundle_final.json
+/tmp/grouped_mmq_fwd_qwen_kernel_bundle_final.json
+```
+
+DeepSeek has 39/39 exact packed-reference checks and Qwen has 84/84. The packed path wins all 24 routed DeepSeek comparisons and 54/60 Qwen comparisons. Against G14, DeepSeek geometric/median latency movement is `+0.49%/+0.59%`; Qwen is `-0.99%/-0.14%`. Final Q5_K batch-1 skewed/sparse/boundary improve by `14.2-16.4%`; uniform regresses `1.86%` in the full matrix and is covered by the adjacent 25-repeat control.
+
+## Retuning priorities after standalone-bundle exploration
+
+The priorities below use arithmetic cost, checkpoint call count, reference deficit, and demonstrated semantic alternatives. Module loading and host launcher overhead are out of scope. Avoid extra public launches; prefer one kernel whose work decomposition adapts from device-visible group size.
+
+| Mark | Case | Why it is worth revisiting | Required semantic direction |
+| --- | --- | --- | --- |
+| **RETUNE-HIGH** | Qwen down Q5_K, batch-1 low-row routes | J32 demonstrates a large `14-16%` win on skewed/sparse/boundary routes but loses `2.6-3.1%` on uniform in adjacent controls. This is direct evidence that full-tile and tail work want different J. | Test one internal mixed J64/J32 body: consume full 64-row group tiles with J64 and use J32 for residual rows. Keep J32 and J64 standalone entries as controls. Reject spills and avoid a split-launch solution. |
+| **RETUNE-HIGH (REPRESENTATION)** | DeepSeek fixed-group Q8_0 output A | It is called for 43 tensors, takes approximately `11/44/176 ms` at batches 1/4/16, spends about 91% of kernel time in arithmetic, and remains only `0.74-0.76x` the BF16 BMM reference. | The J32/J128, loop-rolling, and direct DwarfStar local schedules are closed. Reopen only with changed Q8_0 scale staging, lossless decoded-weight reuse, or a transient dense representation that preserves the fixed eight-group contract. |
+| **RETUNE-MEDIUM (REPRESENTATION)** | DeepSeek routed Q2_K down | It is called for 43 expert tensors and takes approximately `18-22/72-77/290-298 ms`. Batch 4 beats AITER by only about `1.06-1.14x`; arithmetic is about 98.7% of the measured batch-1 kernel time. | Target repeated scale/min reconstruction across 64 output tiles or reuse a compact lossless decode. Do not repeat J64, split-tail launch, tail replication, or broad tile sweeps. |
+| **RETUNE-MEDIUM (REPRESENTATION)** | Qwen routed IQ2_S down, nonuniform batches 1/4 | These are the six remaining Qwen losses; the family occurs in 20 middle-layer down projections and reaches approximately `0.76x` AITER at batch-1 sparse. | Reduce repeated IQ2_S grid/sign/scale decode or zero-padded partial-J work through a lossless reusable representation. Existing J64/J32, row-task, cache, and local synchronization neighborhoods remain closed. |
+| **DO NOT RETUNE NOW** | DeepSeek IQ2_XXS pair and unchanged Qwen gate/up families | The long IQ2_XXS pair is already `1.38-2.16x` AITER and the Qwen pair families win every point. Bundle-only point movement does not identify a semantic deficit. | Retain as controls. |
+
+The later generalized MMQ bundle preserves the G15 grouped-forward dispatch and tuning decisions while moving the remaining MMQ families into the same artifact system. Generic build and loading behavior is documented in `docs/kernel_bundle.md`; this log remains the source of truth for grouped-forward kernel behavior.
+
 ## Final retained evaluation
 
 The complete retained 60-point artifact after G11 is:
@@ -1403,6 +1465,27 @@ AITER remains the reference, not the ceiling. The final target is the best end-t
 - Do not use shipped TensileLite grouped YAML choices or their displayed grouped GFLOP/s as a performance bound. Use them only as generator and interface evidence.
 - Do not copy TensileLite's host-built grouped user-argument setup or per-workgroup GEMM search into the production routing path. Build compact metadata on the device and index it directly.
 - Do not retry a wholesale direct-to-VGPR conversion, both-operands direct-to-VGPR, a two-LDS pipeline, GSU, split-K, or grouped Stream-K for the current packed representation.
+
+## Generalized bundle consolidation
+
+The original 37-entry grouped-forward package is now part of the generalized gfx1151 MMQ bundle documented in `docs/kernel_bundle.md`. Kernel device bodies and all retained thresholds are unchanged. Symbols now use the shared `torch_ggml_ops_mmq_gfx1151_v1_` ABI prefix, and grouped forward shares one loader, process-lifetime `(device, kernel ID)` cache, generated symbol/filename table, and row-task builder with dense and backward MMQ.
+
+Fresh complete matrices against the consolidated loader are:
+
+```text
+/tmp/grouped_mmq_fwd_qwen_general_bundle_final.json
+/tmp/grouped_mmq_fwd_ds4_general_bundle_final.json
+```
+
+The historical Qwen comparison moved enough points beyond 1% to require a sequential 25-repeat old/general/old control. Against the old-bundle bracket midpoint, the generalized bundle is `+0.07%` geometrically and `+0.19%` by median point; the old controls drift by `+0.46%`. The control artifacts are:
+
+```text
+/tmp/grouped_mmq_fwd_old_bundle_pre_control_25.json
+/tmp/grouped_mmq_fwd_general_bundle_control_25.json
+/tmp/grouped_mmq_fwd_old_bundle_post_control_25.json
+```
+
+The consolidation is performance-neutral and preserves exact packed-reference behavior. No grouped-forward tuning or dispatch change is attributed to this packaging work.
 
 ## Final status
 

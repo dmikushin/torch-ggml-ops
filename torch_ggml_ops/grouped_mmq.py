@@ -117,9 +117,7 @@ torch.library.register_autograd(
 
 
 def _fixed_grouped_mmq_backward(ctx, grad_output: torch.Tensor):
-    raise RuntimeError(
-        "torch_ggml_ops::fixed_grouped_mmq does not support backward"
-    )
+    raise RuntimeError("torch_ggml_ops::fixed_grouped_mmq does not support backward")
 
 
 torch.library.register_autograd(

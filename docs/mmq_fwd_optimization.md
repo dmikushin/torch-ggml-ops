@@ -151,7 +151,7 @@ The complete new quant inventory also contains routed `IQ2_XXS` gate/up weights 
 
 ## Current implementation
 
-The dense forward path is implemented in project-owned `csrc/mmq_core.cuh` and dispatched from `csrc/mmq_hip.cu`.
+The dense forward device bodies are implemented in project-owned `csrc/mmq_core.cuh`. Production entry points are independently compiled by `tools/build_mmq_bundle.py` and selected and launched through `csrc/mmq_bundle.cpp`; `csrc/mmq_hip.cu` retains only operator validation and tensor/workspace ownership.
 
 The ordinary multiplication geometry remains:
 
@@ -331,6 +331,18 @@ These deficits do not change the production LM-head selection. M=256 is the prod
 
 No further global `J=64`, `I=128`, or broad tile sweep should be repeated. Those neighborhoods already regressed the production mix.
 
+## Retuning priorities after standalone-bundle exploration
+
+Retuning decisions are based on HIP-level kernel behavior and model impact, not on opcode rearrangement or module-launch overhead. Candidates must be measured with warmed modules and arithmetic-focused timings, then checked with the complete operator and loss loop.
+
+| Mark | Case | Why it is worth revisiting | Allowed next scope |
+| --- | --- | --- | --- |
+| **RETUNE-HIGH** | LM-head `Q6_K`, M=256 | The arithmetic call is long at `16.127 ms`, is repeated across the chunked loss, and reaches only about `0.81x` BF16 throughput. This is the largest retained dense-forward single-call margin. | Require a new packed representation, accumulator organization, or decode-reuse argument. Do not repeat the rejected global J/I/tile sweep. Preserve M=64/M=128 and complete-loss controls. |
+| **RETUNE-MEDIUM** | Narrow `Q3_K` and `Q5_K`, M=32,768 | They remain approximately 8% and 5% behind BF16 and belong to the repeatedly called narrow-projection inventory. | Revisit only with a quant-specific decode/LDS-producer hypothesis or shared decoded representation. Do not apply a global forward geometry change. |
+| **DO NOT RETUNE FROM BUNDLE DATA** | Attention-query `Q3_K` and attention-output `Q4_K` batch 4 | The approximately 3.2% bundle movements occurred without a change to the HIP arithmetic, tile coverage, bounds handling, memory behavior, or dispatch. There is no kernel-behavior hypothesis to test. | Keep as performance controls. Reopen only if an independent HIP-semantic experiment identifies a production margin. |
+
+Q8_1 workspace reuse remains a higher-level cross-call project rather than a kernel-retuning task under the current launcher-overhead exclusion.
+
 ## Remaining work
 
 ### Reuse Q8_1 activations across same-input projections
@@ -375,7 +387,15 @@ Forward normalized RMSE remains within the existing Q8_1 envelope:
 - approximately 0.6% for Q3_K and Q6_K.
 - approximately 1.1-2.0% for Q4_K and Q5_K.
 
-Dense forward and quantizer specializations have zero-byte private segments. No file under `csrc/vendor/llama_cpp/*` was modified.
+The resource-gated quantizer specializations have zero-byte private segments and no spills. Dense-forward compatibility entries retain their historical compiler resource profiles; in particular, `Q2_K` J128 uses 112 private bytes and 27 VGPR spills and is deliberately not resource-gated. No file under `csrc/vendor/llama_cpp/*` was modified by the bundle conversion.
+
+## Architecture-specific bundle conversion
+
+Dense forward and its activation quantizers moved from the extension fatbinary into the generalized gfx1151 package documented in `docs/kernel_bundle.md`. The conversion retains D4/DS4/D2S6 workspace selection, J128 ordinary geometry, and the J64 `Q6_K` small-row threshold. It removes direct launches and device entry points from `csrc/mmq_hip.cu`.
+
+The initial nine-repeat before/after comparison measured `-0.23%` geometric dense-forward latency. Sequential embedded/bundle/embedded 25-repeat controls measured the bundle at `+0.87%` geometrically, `+0.76%` by median point, and `+1.05%` by estimated model latency against the bracket midpoint. The embedded controls themselves drifted by `+2.18%`.
+
+Notable midpoint comparisons are about `+3.2%` for attention-query `Q3_K` batch 4 and attention-output `Q4_K` batch 4, and `-1.5%` for narrow `Q5_K` batch 1. These are code-object layout effects, not retained tile or dispatch changes. Source artifacts are `/tmp/mmq_fwd_pre_bundle.json`, `/tmp/mmq_fwd_post_bundle.json`, and the three `/tmp/mmq_fwd_*_control_25.json` files.
 
 ## Tool notes
 

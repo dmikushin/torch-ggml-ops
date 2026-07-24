@@ -83,8 +83,7 @@ def _assert_q8_activation_error(
 ) -> None:
     error = actual.float() - expected.float()
     normalized_rmse = (
-        error.square().mean().sqrt()
-        / expected.float().square().mean().sqrt()
+        error.square().mean().sqrt() / expected.float().square().mean().sqrt()
     )
     assert torch.isfinite(actual).all()
     assert normalized_rmse.item() < 0.04
@@ -109,9 +108,7 @@ def test_deepseek_routed_forward_matches_transformers_dequantization(
         dtype=torch.bfloat16,
     )
 
-    expected = _reference_grouped(
-        input, packed, experts, offsets, quant_type, 37
-    )
+    expected = _reference_grouped(input, packed, experts, offsets, quant_type, 37)
     actual = torch_ggml_ops.grouped_mmq(
         input, packed, experts, offsets, int(quant_type), 37
     )
@@ -144,12 +141,8 @@ def test_deepseek_iq2_xxs_pair_matches_transformers_dequantization(
         dtype=torch.bfloat16,
     )
 
-    expected_gate = _reference_grouped(
-        input, gate, experts, offsets, quant_type, 37
-    )
-    expected_up = _reference_grouped(
-        input, up, experts, offsets, quant_type, 37
-    )
+    expected_gate = _reference_grouped(input, gate, experts, offsets, quant_type, 37)
+    expected_up = _reference_grouped(input, up, experts, offsets, quant_type, 37)
     actual_gate, actual_up = torch_ggml_ops.grouped_mmq_pair(
         input, gate, up, experts, offsets, int(quant_type), 37
     )
@@ -167,9 +160,7 @@ def test_deepseek_formats_remain_forward_only(
         reader, _ROUTED_PROJECTIONS[qname]
     )
     experts, offsets = _routing()
-    grad_output = torch.randn(
-        10, 37, device="cuda", dtype=torch.bfloat16
-    )
+    grad_output = torch.randn(10, 37, device="cuda", dtype=torch.bfloat16)
 
     with pytest.raises(RuntimeError, match="unsupported quant_type"):
         torch.ops.torch_ggml_ops.grouped_mmq_grad_input.default(
@@ -209,9 +200,7 @@ def test_deepseek_fixed_q8_0_forward_matches_transformers_dequantization(
         dtype=torch.bfloat16,
     )
 
-    expected = torch.empty(
-        2, 8, out_features, device="cuda", dtype=torch.bfloat16
-    )
+    expected = torch.empty(2, 8, out_features, device="cuda", dtype=torch.bfloat16)
     for group in range(8):
         logical = dequantize_gguf_tensor(
             packed[group],

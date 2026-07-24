@@ -115,9 +115,6 @@ enum mmq_q8_1_ds_layout {
 #ifdef MMQ_USE_ROLLED_Q2_K
 #include "vendor/llama_cpp/mmq-vec-dot-q2-k-rolled.cuh"
 #endif
-#ifdef MMQ_USE_ROLLED_Q2_K_LEGACY
-#include "vendor/llama_cpp/mmq-vec-dot-q2-k-rolled-legacy.cuh"
-#endif
 
 template <ggml_type type, int J, bool fallback = true>
 static __device__ __forceinline__ void mmq_load_target(
@@ -154,10 +151,7 @@ static __device__ __forceinline__ void mmq_vec_dot_target(
         ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<
             type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>(x, y, sum, k00);
     } else if constexpr (type == GGML_TYPE_Q2_K) {
-#ifdef MMQ_USE_ROLLED_Q2_K_LEGACY
-        ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma_rolled_legacy<type, J, fallback>(
-            x, y, sum, k00);
-#elif defined(MMQ_USE_ROLLED_Q2_K)
+#ifdef MMQ_USE_ROLLED_Q2_K
         ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma_rolled<type, J, fallback>(x, y, sum, k00);
 #else
         ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma<type, J, fallback>(x, y, sum, k00);
@@ -205,8 +199,7 @@ static constexpr __host__ __device__ mmq_q8_1_ds_layout mmq_activation_layout() 
 }
 
 template <ggml_type type>
-__launch_bounds__(512, 1)
-static __global__ void quantize_bf16_mmq_q8_1(
+static __device__ __forceinline__ void quantize_bf16_mmq_q8_1_body(
         const __hip_bfloat16 * __restrict__ x,
         block_q8_1_mmq * __restrict__ y,
         int64_t rows,
@@ -276,8 +269,7 @@ static __global__ void quantize_bf16_mmq_q8_1(
 }
 
 template <ggml_type type, int J>
-__launch_bounds__(MMQ_NTHREADS, 2)
-static __global__ void dense_mmq_bf16_kernel(
+static __device__ __forceinline__ void dense_mmq_bf16_body(
         const char * __restrict__ weights,
         const int * __restrict__ activations,
         __hip_bfloat16 * __restrict__ dst,
@@ -334,8 +326,7 @@ static __global__ void dense_mmq_bf16_kernel(
 }
 
 template <int J, int groups, int blocks_per_weight_row, bool fallback>
-__launch_bounds__(MMQ_NTHREADS, 2)
-static __global__ void fixed_grouped_q8_0_mmq_bf16_kernel(
+static __device__ __forceinline__ void fixed_grouped_q8_0_mmq_bf16_body(
         const char * __restrict__ weights,
         const int * __restrict__ activations,
         __hip_bfloat16 * __restrict__ dst,
@@ -662,9 +653,8 @@ static __device__ __forceinline__ void grouped_mmq_tail_tile(
     }
 }
 
-template <ggml_type type, int J, int fixed_nrows_weight = 0, int fixed_blocks_per_weight_row = 0>
-__launch_bounds__(MMQ_NTHREADS, 2)
-static __global__ void grouped_mmq_bf16_kernel(
+template <ggml_type type, int J, int fixed_nrows_weight, int fixed_blocks_per_weight_row>
+static __device__ __forceinline__ void grouped_mmq_bf16_body(
         const char * __restrict__ weights,
         const int * __restrict__ activations,
         __hip_bfloat16 * __restrict__ dst,
@@ -728,8 +718,7 @@ static __global__ void grouped_mmq_bf16_kernel(
     }
 }
 
-__launch_bounds__(256, 1)
-static __global__ void grouped_mmq_build_row_tasks(
+static __device__ __forceinline__ void grouped_mmq_build_row_tasks_body(
         const int64_t * __restrict__ expert_indices,
         const int32_t * __restrict__ expert_offsets,
         int32_t * __restrict__ task_count,
@@ -786,8 +775,7 @@ static __global__ void grouped_mmq_build_row_tasks(
 }
 
 template <ggml_type type, int J, int fixed_nrows_weight, int fixed_blocks_per_weight_row>
-__launch_bounds__(MMQ_NTHREADS, 2)
-static __global__ void grouped_mmq_row_task_kernel(
+static __device__ __forceinline__ void grouped_mmq_row_task_body(
         const char * __restrict__ weights,
         const int * __restrict__ activations,
         __hip_bfloat16 * __restrict__ dst,
@@ -801,7 +789,7 @@ static __global__ void grouped_mmq_row_task_kernel(
     static_assert(MMQ_TILE_Y_K == q8_block_ints, "unexpected grouped Q8 tile layout");
     static_assert(
         fixed_nrows_weight > 0 && fixed_blocks_per_weight_row > 0,
-        "row-task grouped MMQ requires a fixed production shape");
+        "row-task grouped MMQ requires a fixed shape");
 
     const int task = blockIdx.y;
     if (task >= task_count[0]) {
