@@ -1,169 +1,109 @@
-# Dense MMQ forward optimization status and plan
-
-## Scope
-
-This document covers dense `torch_ggml_ops::mmq` forward on gfx1151.
-
-Included:
-- BF16 activations.
-- internal Q8_1 activation quantization.
-- packed GGUF Q3_K, Q4_K, Q5_K, Q6_K, IQ2_S, and Q8_0 weights.
-- the DeepSeek-V4-Flash persistent ordinary Q8_0 projections.
-- BF16 outputs.
-- the 160 ordinary Qwen projections and packed Q6_K language-model head.
-- the 301 ordinary DeepSeek Q8_0 projections and packed Q8_0 language-model head.
-- production batch sizes 1, 4, and 16 at sequence length 2048.
-
-Excluded:
-- `grouped_mmq` multiplication and routed-expert scheduling.
-- GatedDeltaNet physical-layout permutations.
-- LoRA GEMMs and residual accumulation.
-- public operator-schema changes.
-- changes to `csrc/vendor/llama_cpp/*`.
-
-The grouped path shares the rewritten activation quantizer but now has its own independently optimized multiplication and scheduling implementation, documented in `docs/grouped_mmq_fwd_optimization.md`.
+# Dense MMQ forward optimization
 
 ## Current status
 
-Dense forward has a stable Qwen production baseline and complete DeepSeek-V4-Flash dense `Q8_0` correctness and workload coverage. The next optimization project is defined below: first specialize DeepSeek's exact production shapes, then reuse same-input Q8_1 activations, and only then consider representation-level work for the remaining Qwen and DeepSeek margins.
+Dense `torch_ggml_ops::mmq` forward is at its practical local stopping point on gfx1151 for the existing packed-weight, single-call operator contract.
 
-Done:
-- replaced the excessive small-workgroup Q8_1 launch with one 512-thread workgroup per real activation row.
-- added compile-time row-tile selection and retained `J=64` only for the 64-row Q6_K fallback.
-- kept the measured ordinary `I=64, J=128`, 128-thread geometry.
-- validated zero private segment for the retained quantizer and dense forward specializations.
-- selected 256 rows as the production Qwen LM-head loss chunk at the scheduling layer.
-- validated all seven DeepSeek dense `Q8_0` geometry families, including the LM head, against independent GGUF dequantization through the direct packed-weight path.
-- added model-family-aware dense-forward benchmark cases without flattening the fixed eight-group output-A projection into dense semantics.
+The retained implementation includes:
+- one 512-thread Q8_1 quantization workgroup per real activation row.
+- six exact DeepSeek Q8_0 wrappers covering K=1024/2048/4096/8192 and the J64 language-model-head bodies.
+- eight exact Qwen wrappers covering Q3_K, Q4_K, Q5_K, and Q6_K production K/J combinations.
+- static quant/shape dispatch with generic fallbacks for unsupported or bounded shapes.
+- zero private storage, zero spills, and no dynamic stack for every retained resource-gated specialization.
 
-The Qwen source-of-record benchmark remains `/tmp/mmq_fwd_final_full.json`; DeepSeek has correctness coverage but no accepted performance source of record yet. The production Qwen LM-head decision must be evaluated with the complete loss loop: its M=256 forward call is slower than BF16 in isolation, but the 2,048-row packed loss is faster because M=256 sharply reduces call count and uses the optimized backward kernel.
+Against their generic controls, exact specialization improved the complete DeepSeek matrix by `21.62%` geometrically and the complete Qwen matrix by `10.44%`. Every point improved in its sequential generic/candidate/generic bracket.
 
-Remaining work is deliberately bounded:
-- specialize exact full-tile DeepSeek `Q8_0` bodies and remove the J128 over-computation at LM-head M=32 and M=64.
-- reuse Q8_1 activation workspaces across verified same-input projections in both models.
-- revisit Qwen's narrow Q3_K/Q5_K margins only with exact-shape or profiler-supported decode/LDS changes.
-- treat Qwen Q6_K M=256 and any residual DeepSeek Q8_0 deficit as explicit model-owned representation projects, not another global tile sweep.
+No broad local tile, workgroup, unroll, prefetch, buffering, or LDS-layout sweep remains open. The remaining opportunities require model-owned activation reuse, a prepared Q6 representation, or a narrowly scoped arithmetic experiment that changes Q6 floating-point operation order.
 
-Production dispatch and LM-head chunk choices remain unchanged until the acceptance matrix and complete-loss controls in this document pass.
+Final source-of-record artifacts:
+- DeepSeek: `/tmp/mmq_fwd_ds4_p2_stride76_25.json`.
+- Qwen: `/tmp/mmq_fwd_qwen_p4_exact_25.json`.
+- Qwen complete packed loss: `/tmp/mmq_fwd_qwen_complete_loss_final_25.json`.
 
-## Hardware and measurement rules
+## Latest results
 
-Measurements were taken on:
+All tables report complete public `mmq` latency, including Q8_1 activation quantization and workspace ownership. Ratio is BF16 `torch.mm` latency divided by packed-MMQ latency, so values above `1.00x` favor MMQ. Ordinary rows use `M = batch * 2048`.
 
-```text
-GPU: Radeon 8060S Graphics
-architecture: gfx1151, wave32, 40 CUs
-PyTorch: 2.12.0+rocm7.15.0a20260701
-HIP: 7.14.60850
-```
+### Qwen ordinary projections
 
-The performance reference is `torch.mm` using the same BF16 activation and the logical GGUF weight dequantized to BF16. PyTorch normally dispatches these references to hipBLASLt.
+Each latency cell is `MMQ ms / BF16 ratio` from the final 25-repeat matrix.
 
-The first forward and backward baselines were mistakenly run concurrently and contended for the GPU. They were discarded. All accepted numbers come from sequential runs with no concurrent GPU benchmark or profiler.
+| Family | `(N, K)` | Type | Tensors | B1, M=2,048 | B4, M=8,192 | B16, M=32,768 |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| Attention query/query gate | `(8192, 2048)` | Q3_K | 9 | `2.991 / 1.10x` | `12.370 / 1.06x` | `50.727 / 1.02x` |
+| Attention query/query gate | `(8192, 2048)` | Q4_K | 1 | `2.591 / 1.26x` | `11.046 / 1.20x` | `43.788 / 1.18x` |
+| Narrow K/V/shared gate/up | `(512, 2048)` | Q4_K | 70 | `0.196 / 1.61x` | `0.823 / 1.16x` | `3.433 / 1.07x` |
+| Narrow K/V/shared gate/up | `(512, 2048)` | Q5_K | 21 | `0.196 / 1.62x` | `0.840 / 1.13x` | `3.413 / 1.07x` |
+| Narrow attention key | `(512, 2048)` | Q3_K | 9 | `0.223 / 1.42x` | `0.919 / 1.03x` | `3.869 / 0.95x` |
+| Attention output | `(2048, 4096)` | Q4_K | 10 | `1.347 / 1.38x` | `5.682 / 1.30x` | `23.492 / 1.24x` |
+| Shared-expert down | `(2048, 512)` | Q4_K | 30 | `0.176 / 8.20x` | `0.711 / 7.42x` | `2.980 / 6.99x` |
+| Shared-expert down | `(2048, 512)` | Q5_K | 10 | `0.183 / 7.89x` | `0.711 / 7.43x` | `2.973 / 7.01x` |
 
-On gfx1151, int8 WMMA is approximately as fast as BF16 WMMA. Packed forward wins through lower weight traffic, compact staging, or better geometry rather than a nominal 2x arithmetic advantage.
+The ordinary 24-point geometric ratio is `1.89x` BF16. Narrow Q3_K B16 is the only ordinary point below parity. Its exact packed multiplication is `2.725 ms` versus `3.691 ms` BF16, but Q8_1 activation quantization adds `0.879 ms`, or about `24.4%` of the public call. This is an activation-preparation deficit, not an open Q3_K multiplication-body deficit.
 
-## Benchmark harness and artifacts
+### Qwen language-model head
 
-The forward benchmark is:
+The packed Q6_K head has `(N,K)=(248320,2048)`. Forward-only timings are:
 
-```bash
-source ~/venv_torch/bin/activate
-PYTHONPATH=. python bench/benchmark_mmq_fwd.py
-```
+| Chunk M | Calls for 2,048 rows | MMQ ms/call | BF16 ms/call | Ratio |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 32 | 4.192 | 8.909 | 2.13x |
+| 128 | 16 | 7.983 | 12.892 | 1.61x |
+| 256 | 8 | 16.568 | 13.462 | 0.81x |
 
-A focused example is:
+M256 is slower than persistent BF16 GEMM in isolation, but it remains the production packed-loss schedule because scheduling must include forward MMQ, in-place cross-entropy, and packed MMQ grad-input.
 
-```bash
-PYTHONPATH=. python bench/benchmark_mmq_fwd.py \
-  --cases narrow_q4_k --batches 1,4,16 --warmup 3 --repeats 9
-```
+The final complete 2,048-row bracket used phase order `64/128/256/256/128/64` with 25 repeats per phase:
 
-Primary artifacts:
+| Chunk M | Complete loss ms | Incremental peak allocation | Relative to M256 |
+| ---: | ---: | ---: | ---: |
+| 64 | 328.447 | 69.03 MiB | 1.33x slower |
+| 128 | 293.991 | 130.04 MiB | 1.19x slower |
+| 256 | 246.323 | 253.57 MiB | selected |
 
-```text
-Sequential baseline: /tmp/mmq_fwd_baseline_primary_sequential.json
-Final full forward:  /tmp/mmq_fwd_final_full.json
-```
+M256 is `16.22%` faster than M128 and `25.00%` faster than M64. Loss and packed hidden gradients are identical across chunk sizes.
 
-The `/tmp` paths record measurement provenance and are not repository inputs.
+### DeepSeek ordinary projections
 
-## Production shapes
+DeepSeek has 301 ordinary dense Q8_0 calls across six geometry families. Each latency cell is `MMQ ms / BF16 ratio`.
 
-For ordinary projections, `M = batch * 2048`:
+| Family | `(N, K)` | Tensors | B1, M=2,048 | B4, M=8,192 | B16, M=32,768 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Attention Q-A | `(1024, 4096)` | 43 | `0.630 / 1.57x` | `2.890 / 1.40x` | `11.635 / 1.40x` |
+| Attention Q-B | `(32768, 1024)` | 43 | `5.466 / 1.31x` | `21.945 / 1.30x` | `87.020 / 1.32x` |
+| Attention KV | `(512, 4096)` | 43 | `0.342 / 2.01x` | `1.650 / 1.16x` | `6.761 / 1.13x` |
+| Attention output B | `(4096, 8192)` | 43 | `5.467 / 1.29x` | `22.580 / 1.21x` | `87.816 / 1.25x` |
+| Shared gate/up | `(2048, 4096)` | 86 | `1.293 / 1.46x` | `5.432 / 1.41x` | `22.908 / 1.30x` |
+| Shared down | `(4096, 2048)` | 43 | `1.261 / 1.41x` | `5.247 / 1.39x` | `22.406 / 1.30x` |
 
-| Batch | M |
-| ---: | ---: |
-| 1 | 2,048 |
-| 4 | 8,192 |
-| 16 | 32,768 |
+Every ordinary point beats BF16. Ratios span `1.13-2.01x`, with a geometric ratio of `1.36x` across the 18 unique points.
 
-Representative shapes:
+### DeepSeek language-model head
 
-| Family | `(N, K)` | Weight types | Model tensors |
-| --- | ---: | --- | ---: |
-| Query plus query gate | `(8192, 2048)` | Q3_K, Q4_K | 10 |
-| Key/value/shared gate/up | `(512, 2048)` | Q3_K, Q4_K, Q5_K | 100 |
-| Attention output | `(2048, 4096)` | Q4_K | 10 |
-| Shared-expert down | `(2048, 512)` | Q4_K, Q5_K | 40 |
+The packed Q8_0 head has `(N,K)=(129280,4096)`:
 
-The LM head uses:
+| Chunk M | MMQ ms/call | BF16 ms/call | Ratio |
+| ---: | ---: | ---: | ---: |
+| 32 | 2.849 | 5.353 | 1.88x |
+| 64 | 2.947 | 9.044 | 3.07x |
+| 128 | 5.234 | 13.510 | 2.58x |
+| 256 | 10.547 | 23.715 | 2.25x |
+| 512 | 21.243 | 27.873 | 1.31x |
 
-```text
-N = 248320
-K = 2048
-weight = Q6_K
-production chunk M = 256
-```
+Every isolated forward chunk beats BF16. These timings do not select a production chunk: DeepSeek still needs dense Q8_0 backward and a complete packed-loss loop.
 
-Comparison chunks are `M = 64, 128, 256`.
+### Exact-specialization gains
 
-## DeepSeek-V4-Flash expansion
+| Model | Final matrix | Geometric latency gain vs generic | Checkpoint-weighted gain | Final BF16 comparison |
+| --- | ---: | ---: | ---: | --- |
+| DeepSeek | 33 report points | 21.62% | 14.64-25.36% | Ordinary `1.13-2.01x`; LM head `1.31-3.07x` |
+| Qwen | 33 report points | 10.44% | 3.86-5.10% | Ordinary `0.95-8.20x`; LM head `0.81-2.13x` |
 
-Status: correctness implementation and workload coverage are complete; the performance plan is ready but not yet executed. The target remains gfx1151 with sequence length 2,048 and physical batch sizes 1, 4, and 16. Batch coverage is part of the production contract, not a gradient-accumulation substitute.
+## Production dispatch
 
-For full-sequence dense projections:
+Dense forward device bodies are in project-owned `csrc/mmq_core.cuh`. `tools/build_mmq_bundle.py` generates concrete gfx1151 wrappers, `csrc/mmq_bundle.cpp` performs static selection and launch, and `csrc/mmq_hip.cu` owns validation and tensor/workspace allocation.
 
-| Physical batch | M |
-| ---: | ---: |
-| 1 | 2,048 |
-| 4 | 8,192 |
-| 16 | 32,768 |
-
-The generic dense `Q8_0` specialization now covers every persistent dense matrix family in DeepSeek-V4-Flash:
-
-| Family | `(N, K)` | GGUF type | Tensors | Forward execution |
-| --- | ---: | --- | ---: | --- |
-| Attention Q-A | `(1024, 4096)` | Q8_0 | 43 | dense |
-| Attention Q-B | `(32768, 1024)` | Q8_0 | 43 | dense |
-| Attention KV | `(512, 4096)` | Q8_0 | 43 | dense |
-| Attention output B | `(4096, 8192)` | Q8_0 | 43 | dense |
-| Shared gate/up | `(2048, 4096)` | Q8_0 | 86 | 43 same-input pairs |
-| Shared down | `(4096, 2048)` | Q8_0 | 43 | dense |
-| LM head | `(129280, 4096)` | Q8_0 | 1 | packed loss chunks |
-
-The LM-head chunk candidates are `M = 32, 64, 128, 256, 512`. Tune them by complete packed-loss-loop time and peak allocation separately at physical batch sizes 1, 4, and 16; isolated MMQ throughput is not sufficient.
-
-The implemented correctness contract is:
-- BF16 input and output.
-- Q8_1 dynamic activation quantization.
-- direct packed `Q8_0` decode with no logical weight materialization.
-- runtime M/N/K coverage through the existing dense specialization.
-- independent GGUF-reference tests for all seven ordinary projection families.
-
-The planned optimization contract is:
-- one reusable Q8_1 activation workspace for each shared gate/up pair.
-- explicit production lookup entries keyed by quant type, `(M, N, K)` geometry, direction, and batch/chunk bucket.
-- allocation and event-timed benchmarks for all three physical batch sizes.
-- complete packed-loss-loop selection for the LM-head chunk.
-
-The complete new quant inventory also contains routed `IQ2_XXS` gate/up weights and routed `Q2_K` down weights. Those types are not dense-MMQ targets; their exact expert shapes and schedules are specified in `docs/grouped_mmq_fwd_optimization.md`. The frozen eight-group output-A projection is also handled by the grouped plan rather than flattened into dense `(8192, 4096)` semantics.
-
-## Current implementation
-
-The dense forward device bodies are implemented in project-owned `csrc/mmq_core.cuh`. Production entry points are independently compiled by `tools/build_mmq_bundle.py` and selected and launched through `csrc/mmq_bundle.cpp`; `csrc/mmq_hip.cu` retains only operator validation and tensor/workspace ownership.
-
-The ordinary multiplication geometry remains:
+The common full-tile geometry is:
 
 ```text
 I = 64
@@ -172,419 +112,443 @@ threads = 128, four wave32 waves
 K iteration = 256
 ```
 
-Q6_K calls whose padded row count is 64 use:
+Retained exceptions and exact bodies:
+- Q8_0 K4096 M32 uses bounded J64; M64 uses full J64.
+- Q8_0 K1024/2048/4096/8192 full rows use exact-K J128.
+- Q3_K K2048 uses exact full J128.
+- Q4_K K512/2048/4096 uses exact full J128.
+- Q5_K K512/2048 uses exact full J128.
+- Q6_K K2048 M64 uses exact full J64; rows divisible by 128 use exact full J128.
+- generic bounds-safe J128 bodies remain for every other supported shape; Q6_K rows at or below 64 retain the generic J64 fallback.
 
-```text
-I = 64
-J = 64
-threads = 128
-K iteration = 256
-```
+Exact dispatch requires N divisible by I64 and M divisible by the selected J, except for the intentionally bounded Q8_0 M32 body. Dispatch depends only on quant type and matrix geometry. There is no online autotuning or pointer-identity cache.
 
-Q6_K calls above 64 rows retain `J=128`.
+### Resources
 
-## Accepted changes
+| Body | VGPR | SGPR | Dynamic LDS | Private/spills/stack |
+| --- | ---: | ---: | ---: | --- |
+| Generic Q8_0 J128 control | 248 | 29 | 38,400 B | zero |
+| Exact Q8_0 J128 | 216 | 28 | 38,400 B | zero |
+| Exact/bounded Q8_0 J64 | 132 | 28 | 28,928 B | zero |
+| Exact Q3_K J128 | 196 | 27 | 40,448 B | zero |
+| Exact Q4_K J128 | 239 | 28-29 | 38,400 B | zero |
+| Exact Q5_K J128 | 244 | 28 | 38,400 B | zero |
+| Exact Q6_K J128 | 210 | 27 | 38,400 B | zero |
+| Exact Q6_K J64 | 158 | 27 | 28,928 B | zero |
+| Q8_1 row quantizers | 23-28 (32 allocated) | 17 | zero | zero |
 
-### One activation-quantization workgroup per real row
+The Q3_K/Q4_K/Q5_K/Q6_K generic controls used 216/254/230/225 VGPRs at J128, and generic Q6_K J64 used 171. Exact specialization reduced allocation except for Q5_K, which rose to 244 VGPRs but still improved every measured point.
 
-The original Q8_1 launch used:
+Compatibility entries are not production-tuned without a concrete workload. In particular, generic dense Q2_K J128 uses 112 private bytes and 27 VGPR spills and is deliberately not resource-gated; the DeepSeek Q2_K production workload is routed and uses grouped MMQ instead.
+
+## Remaining work
+
+### Local packed-kernel status
+
+DeepSeek Q8_0 local optimization is exhausted under the current representation and arithmetic contract. Exact full bodies beat BF16 everywhere, and all profiler-supported geometry, loop, barrier, and LDS controls lost.
+
+Qwen Q3_K/Q4_K/Q5_K multiplication bodies are also at a practical stopping point. Every exact body improved its generic control. The only ordinary below-parity public call is narrow Q3_K B16, where the multiplication already beats BF16 and activation preparation is the deficit.
+
+Do not reopen global J64, I128, workgroup-size, split-K, persistent-workgroup, speculative-prefetch, decoded-weight-LDS-cache, or broad swizzle sweeps without a new profile-supported mechanism.
+
+### Optional Q6 effective-scale experiment
+
+One narrowly bounded local Q6_K experiment remains defensible if a small floating-point operation-order change is acceptable.
+
+The current Q6 dot computes an integer WMMA accumulator times an int8 per-16-value scale, converts the product to float, and then applies the block and activation scales. The exact J128 Q6 body has 2,093 normalized instructions versus 1,453 for Q8 and includes 128 `v_mul_lo_u32` instructions. The packed loader already performs vector low/high reconstruction, and generated ISA already hoists packed scales and block factors, so another packed-extraction or metadata-prefetch toggle is not justified.
+
+A project-owned Q6 loader could instead unpack and stage `float(block_d * scale)` once per weight row/K iteration in LDS. The dot would convert the WMMA accumulator first and consume the effective scale, potentially removing the repeated integer scale multiply at a modest LDS cost.
+
+This changes rounding from the current integer-product-first order. It is not allowed under bitwise current-output parity. If tested, retain it only after:
+- zero private storage, spills, and dynamic stack.
+- at least a stable 2% complete-call M256 gain in a 25-repeat bracket.
+- no repeatable M64/M128 regression above 1%.
+- independent GGUF-reference correctness and complete packed-loss acceptance.
+
+This is one semantic experiment, not authorization for another Q6 geometry or layout sweep.
+
+### Same-input activation reuse
+
+This is the highest-confidence whole-call opportunity, but it is a model-integration change.
+
+The DeepSeek call graph confirms two same-input families:
+- attention Q-A and KV consume the same attention `cur`.
+- shared gate and up are parallel branches over the same `build_ffn` input.
+
+All use the D4 Q8_1 layout. Profiling in `/tmp/mmq_fwd_final_components.txt` attributes about `7.5%` of shared-gate B1 and `29.7%` of KV B16 call time to quantization. Qwen narrow Q3_K B16 spends about `24.4%` in quantization.
+
+A prepared-activation or pair/multi-projection API must:
+- quantize once per required Q8_1 metadata layout.
+- own workspace lifetime explicitly for the current stream.
+- preserve ordinary `mmq` as a fallback.
+- preserve output and autograd behavior.
+- avoid a hidden pointer/version/stream cache.
+
+Q4_K/Q5_K use the scale-plus-sum workspace layout; Q3_K/Q6_K/IQ2_S use scale-only. A model layer may need one workspace per layout, but never duplicate preparation for the same input/layout.
+
+This repository does not own the model scheduler or prepared-activation lifetime, so ordinary single-call `mmq` remains allocation-owning.
+
+### Prepared Q6 representation
+
+Qwen Q6_K M256 remains representation/arithmetic-bound. Q8_1 quantization is below `0.1%` of that call, exact bounds/K state added only `2.09-2.56%`, and forward remains `16.568 ms` versus `13.462 ms` BF16 in the final matrix.
+
+A transient BF16 stage is rejected. The optimistic control allocated and copied an already-decoded BF16 weight and then ran `torch.mm`, deliberately excluding decode computation:
+
+| Path | Median |
+| --- | ---: |
+| Direct packed Q6_K | 15.464 ms |
+| Persistent BF16 GEMM reference | 13.555 ms |
+| Optimistic transient BF16 floor | 22.302 ms |
+
+The transient floor loses by `44.21%`, requires a 1,017,118,720-byte workspace, and reaches about 1.145 GB incremental peak allocation. Artifact: `/tmp/mmq_fwd_qwen_q6_transient_floor_25.json`.
+
+The packed LM-head weight is 417,177,600 bytes. A lossless prepared integer-plus-scale layout needs at least 508,559,360 int8 value bytes plus per-16-value and block scales, approximately 519-546 MiB depending on alignment. It must be model-owned and specify preparation cost, lifetime, invalidation, device placement, memory budget, and forward/backward reuse. A hidden persistent BF16 shadow is not acceptable.
+
+### DeepSeek loss scheduling
+
+DeepSeek isolated LM-head forward is complete for M32/M64/M128/M256/M512, but forward timing cannot select a production loss chunk. Dense Q8_0 grad-input and the complete packed-loss loop must exist first. Final selection must include complete-loop latency and peak allocation at physical batches 1, 4, and 16.
+
+## Optimization log
+
+### Q0: activation quantizer and initial Qwen geometry
+
+The original Q8_1 launch used one 64-thread workgroup per `(padded row, K/256 block)`:
 
 ```text
 grid = [rows_padded, K / 256]
 block = 64 threads
 ```
 
-At `K=2048`, it created eight workgroups per activation row and also quantized padded rows. At `M=32768`, it launched 262,144 small workgroups and dominated narrow-N calls.
-
-The accepted launch is:
+At K=2048 and M=32768 it launched 262,144 small workgroups and quantized padded rows. The retained launch is:
 
 ```text
-grid = [rows, 1]
+grid = [real rows, 1]
 block = 512 threads
 ```
 
-Each workgroup owns one real row. Every thread processes four BF16 values per loop iteration, and the block loops only when `K > 2048`.
+Each thread processes four BF16 values per loop iteration; the block loops only when K exceeds 2048. D4/DS4/D2S6 metadata, 32-value reductions, rounding, and workspace semantics are unchanged.
 
-The Q8_1 D4 and DS4 layouts, 32-value reductions, rounding, and workspace representation are unchanged. Padded workspace rows are not written because their corresponding MMQ outputs are bounds-masked.
+On narrow Q4_K M32768, traced quantizer time fell from `5,105.979 us` to `886.928 us`, while multiplication remained roughly `2,565.848 us` versus `2,645.314 us`. Combined traced time fell from about 7.67 to 3.53 ms. This established activation scheduling, not multiplication, as the first-order narrow bottleneck.
 
-### Compile-time `J` and the Q6_K `J=64` specialization
+The pre-exact Qwen source `/tmp/mmq_fwd_final_full.json` recorded the retained effects of the quantizer and initial geometry:
+- query Q3_K improved about 5-8% across batches.
+- narrow Q4_K improved about 2.1-2.2x at B4/B16.
+- attention-output Q4_K improved about 1.28-1.34x.
+- Q6_K M64 improved from 7.413 to 4.202 ms after J64 removed padded-row arithmetic.
+- Q6_K M128/M256 did not benefit from a global J64 policy.
 
-Dense forward was generalized from fixed `J=128` to compile-time `J` in project-owned code.
+The retained general geometry remained I64/J128 with 128 threads. I128, global J64, and smaller workgroup/tile combinations regressed the production mix.
 
-The 64-row Q6_K fallback specialization removes 64 padded rows and halves the accumulator and activation-tile footprint. The production 256-row chunk uses `J=128` because a global `J=64` policy regressed ordinary and larger-row workloads.
+### B0: standalone bundle conversion
 
-## Final retained results
+Dense forward and its activation quantizers moved from the extension fatbinary into independent gfx1151 HSACOs. D4/DS4/D2S6 selection, J128 ordinary geometry, J64 small-row Q6 dispatch, and arithmetic semantics remained unchanged.
 
-The following compares the valid sequential baseline with `/tmp/mmq_fwd_final_full.json`. Ratio means packed-MMQ throughput divided by BF16 throughput.
+The initial nine-repeat before/after comparison measured `-0.23%` geometric movement. A sequential embedded/bundle/embedded 25-repeat control measured the bundle at `+0.87%` geometrically, `+0.76%` by median point, and `+1.05%` by estimated model latency against the embedded midpoint. The two embedded controls drifted by `2.18%`.
 
-| Case | M | Baseline ms | Final ms | Speedup | Final ratio |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Query Q3_K | 2,048 | 3.213 | 3.054 | 1.05x | 1.05x |
-| Query Q3_K | 8,192 | 13.324 | 12.403 | 1.07x | 1.03x |
-| Query Q3_K | 32,768 | 52.589 | 48.828 | 1.08x | 1.03x |
-| Narrow Q4_K | 2,048 | 0.235 | 0.214 | 1.10x | 1.48x |
-| Narrow Q4_K | 8,192 | 1.990 | 0.899 | 2.21x | 1.04x |
-| Narrow Q4_K | 32,768 | 7.636 | 3.590 | 2.13x | 0.99x |
-| Attention output Q4_K | 2,048 | 1.811 | 1.410 | 1.28x | 1.26x |
-| Attention output Q4_K | 8,192 | 7.638 | 5.717 | 1.34x | 1.23x |
-| Attention output Q4_K | 32,768 | 30.624 | 22.986 | 1.33x | 1.20x |
-| Shared down Q4_K | 2,048 | 0.256 | 0.257 | 0.99x | 5.59x |
-| Shared down Q4_K | 8,192 | 1.053 | 0.985 | 1.07x | 5.35x |
-| Shared down Q4_K | 32,768 | 4.150 | 3.939 | 1.05x | 5.26x |
-| LM head Q6_K | 64 | 7.413 | 4.202 | 1.76x | 2.05x |
-| LM head Q6_K | 128 | 8.001 | 7.988 | 1.00x | 1.56x |
-| LM head Q6_K | 256 | 16.097 | 16.127 | 1.00x | 0.81x |
+Approximately 3.2% movements in attention-query Q3_K B4 and attention-output Q4_K B4, and a `-1.5%` narrow Q5_K B1 movement, occurred without a HIP-semantic change. They are code-object placement variance, not optimization evidence.
 
-Secondary final ratios:
+Artifacts:
+- `/tmp/mmq_fwd_pre_bundle.json`.
+- `/tmp/mmq_fwd_post_bundle.json`.
+- `/tmp/mmq_fwd_embedded_pre_control_25.json`.
+- `/tmp/mmq_fwd_bundle_control_25.json`.
+- `/tmp/mmq_fwd_embedded_post_control_25.json`.
 
-| Case | M=2,048 | M=8,192 | M=32,768 |
-| --- | ---: | ---: | ---: |
-| Query Q4_K | 1.13x | 1.12x | 1.10x |
-| Narrow Q5_K | 1.21x | 1.00x | 0.95x |
-| Narrow Q3_K | 1.38x | 0.97x | 0.92x |
-| Shared down Q5_K | 5.28x | 5.15x | 5.13x |
+### D0: DeepSeek baseline and decomposition
 
-The dominant 70-tensor narrow Q4_K path reaches BF16 parity at large M. The 64-row LM-head fallback reaches about 15.49 logical TFLOP/s and 2.05x BF16 throughput.
+The first accepted DeepSeek matrix established:
+- ordinary Q8_0 sustained about 18.4-23.4 logical TFLOP/s.
+- generic LM-head M32/M64/M128 took 5.395/5.630/5.859 ms, exposing J128 padded-row arithmetic.
+- quantization was only `0.3%` of LM-head M32 and `0.4%` of Q-B B1, but `26.3%` of KV B16 and `3.2%` of output-B B1.
+- Qwen narrow Q3_K B16 spent `23.8%` in quantization, while Q6_K M256 spent below `0.1%`.
 
-## Profiling and generated ISA
+Artifacts:
+- `/tmp/mmq_fwd_ds4_plan_baseline_9.json`.
+- `/tmp/mmq_fwd_qwen_plan_control_9.json`.
+- `/tmp/mmq_fwd_p0_components.txt`.
 
-### Narrow Q4_K at `M=32768, N=512, K=2048`
+The first forward/backward baselines had accidentally run concurrently and were discarded. All retained measurements are sequential.
 
-`rocprofv3` tracing reported:
+### D1: exact DeepSeek Q8_0 bodies
 
-| Kernel | Baseline average | Final average | Final resources |
-| --- | ---: | ---: | --- |
-| Q8_1 quantizer | 5,105.979 us | 886.928 us | 32 allocated VGPRs, no LDS, no private segment |
-| Dense MMQ | 2,565.848 us | 2,645.314 us | 256 allocated VGPRs, 38,400-byte LDS, no private segment |
+The generic Q8_0 J128 body used runtime M/N/K state, 248 VGPRs, 29 SGPRs, and 38,400 bytes of dynamic LDS. Production dimensions permit exact K and full I/J specialization.
 
-The quantizer is 5.76x faster. Combined traced time fell from about 7.67 ms to 3.53 ms.
+The first I64/J32/K4096 full body was rejected before installation because it used 48 private bytes and spilled 11 VGPRs. The retained policy is:
+- M32: bounded I64/J64.
+- M64: full I64/J64.
+- all other production rows: exact-K full I64/J128.
 
-The multiplication kernel itself did not improve in this experiment. The end-to-end gain came from eliminating quantization scheduling overhead.
+Exact J128 reduced allocation to 216 VGPRs; J64 uses 132. All retained bodies have zero private storage, spills, and dynamic stack.
 
-Code-object metadata reports 254 architectural VGPRs for Q4_K `J=128`. rocprofv3 rounds the allocation to 256.
+Against the generic bracket midpoint:
+- all 18 ordinary points improved by `9.18-21.75%`.
+- LM M32/M64 improved by `47.40%`/`49.47%`.
+- LM M128/M256/M512 improved by `12.02-12.96%`.
+- the 33-point geometric latency improved by `21.62%`.
+- checkpoint-weighted latency improved by `14.64-25.36%`, depending on provisional LM chunk.
 
-### Q6_K LM head at `M=64`
+Artifacts:
+- `/tmp/mmq_fwd_ds4_p1_generic_before_25.json`.
+- `/tmp/mmq_fwd_ds4_p1_exact_25.json`.
+- `/tmp/mmq_fwd_ds4_p1_generic_after_25.json`.
+- `/tmp/mmq_fwd_ds4_p1_exact_bracket_25.txt`.
+- `/tmp/mmq_fwd_qwen_p1_control_9.json`.
 
-The `J=64` multiplication kernel averages about 4,190 us and uses:
+A detached pre-change build produced byte-identical Qwen quantizer/Q3_K/Q4_K/Q5_K/Q6_K HSACOs and a byte-identical generic Q8_0 fallback, confirming no Qwen device-code change during this phase.
+
+### D2: rejected DeepSeek local controls
+
+Ordinary J64 was rejected for every K class:
+- K4096 Q-A/KV/shared gate/up lost `4.03-8.85%`; LM M128 lost `14.11%`.
+- K1024 Q-B lost `6.03-8.78%`.
+- K8192 output-B lost `3.75-7.12%`.
+- K2048 shared down lost `4.94-5.58%`.
+
+J128 packed-weight reuse outweighs J64's lower VGPR/LDS footprint on every full tile. J64 remains only where M32/M64 would otherwise be padded.
+
+Artifacts:
+- `/tmp/mmq_fwd_ds4_p2_k4096_j64_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_k4096_j128_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_k4096_j64_control_25.txt`.
+- `/tmp/mmq_fwd_ds4_p2_other_j64_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_other_j128_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_other_j64_control_25.txt`.
+
+K-loop unrolling was closed from normalized ISA. Every exact K body has the same 1,453-instruction loop body; each 256-value iteration has only three scalar loop-control instructions around hundreds of load, WMMA, conversion, and FMA instructions. Duplicating the body would increase instruction-cache pressure without removing meaningful control work.
+
+Activation-half double buffering loaded both Q8_1 halves before compute and reduced four barriers per K iteration to two. It remained spill-free at 214 VGPRs/56,832 LDS bytes for J128 and 130 VGPRs/38,144 bytes for J64, but regressed every point:
+- ordinary shapes lost `6.83-25.80%`.
+- LM M32/M64 lost `4.22%`/`2.03%`.
+- full LM tiles lost `12.44-13.16%`.
+
+The extra LDS did not create occupancy, and loading both halves up front disrupted the accepted load/compute cadence.
+
+Artifacts:
+- `/tmp/mmq_fwd_ds4_p2_prefetch_y_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_prefetch_baseline_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_prefetch_y_control_25.txt`.
+
+The accepted stride-76 Q8 body measured `7.73%` LDS bank conflict, about `7.5%` ALU stalled by LDS, 128-cycle derived LDS latency, about 11.6 active waves/CU, and about 66% L2 hit rate. Stride 77 reduced the conflict metric to `5.12%` but doubled ALU stalled by LDS to about `14.3%`. It regressed every point by `3.83-12.86%`, or `8.58%` geometrically. The accepted `+4` Q8 row padding remains.
+
+Artifacts:
+- `/tmp/mmq_fwd_ds4_p2_stride77_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_stride76_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_stride77_control_25.txt`.
+
+### Q1: exact Qwen bodies
+
+Eight exact wrappers were retained:
+- Q3_K K2048 J128.
+- Q4_K K512/K2048/K4096 J128.
+- Q5_K K512/K2048 J128.
+- Q6_K K2048 J64/J128.
+
+Every point improved against its generic midpoint:
+- Q3_K: `0.90-5.26%`.
+- Q4_K: `3.60-31.39%`.
+- Q5_K: `11.66-32.60%`.
+- Q6_K: `2.09-2.56%` at M64/M128/M256.
+- complete 33-point geometric latency: `10.44%`.
+- checkpoint-weighted latency: `3.86-5.10%`.
+
+Artifacts:
+- `/tmp/mmq_fwd_qwen_p4_generic_before_25.json`.
+- `/tmp/mmq_fwd_qwen_p4_exact_25.json`.
+- `/tmp/mmq_fwd_qwen_p4_generic_after_25.json`.
+- `/tmp/mmq_fwd_qwen_p4_exact_bracket_25.txt`.
+
+Exact specialization closed runtime bounds/K state as explanations for Q6 M256. Its residual gap is packed Q6 arithmetic/representation, not geometry.
+
+### R0: representation controls
+
+Transient BF16 materialization was rejected as recorded under Remaining work. The control deliberately excluded decode computation and still lost by `44.21%` with about 1.145 GB incremental peak allocation.
+
+Persistent BF16 shadows are also rejected: they duplicate approximately 1.017 GB for the Q6 head alone and do not preserve packed storage as the authoritative model representation.
+
+A compact lossless integer-plus-scale representation remains a separate model-owned project. Dense evidence does not authorize changing routed or fixed-group representations, which retain their own grouped paths and acceptance matrices.
+
+### L0: complete-loss and release acceptance
+
+The final Qwen complete-loss bracket retained M256 over M64/M128 with exact loss and hidden-gradient agreement. DeepSeek complete-loss selection remains blocked on Q8_0 grad-input.
+
+Final validation passed:
+- 83 project tests.
+- Ruff and compileall.
+- in-place extension build.
+- forced 132-kernel bundle build and freshness check.
+- all requested resource gates.
+- independent two-build reproducibility.
+- `git diff --check`.
+
+## Closed directions and durable reasoning
+
+| Direction | Status and reason |
+| --- | --- |
+| Global J64 | Regressed all ordinary DeepSeek shapes and larger Qwen rows; retain only for padded M32/M64 classes |
+| I128 | Wider output reuse did not repay accumulator/LDS/residency costs in dense and grouped controls |
+| 64/256-thread alternatives | Smaller configurations did not improve the production aggregate; grouped eight-wave ownership is a different contract |
+| K unroll 2/4 | Loop control is negligible beside the 1,453-instruction reduction body |
+| Activation-half double buffering | Spill-free but lost 2-26%; extra LDS and altered cadence outweighed fewer barriers |
+| Generic LDS padding/swizzles | Stride-77 Q8 reduced the conflict metric but increased actual LDS stalls and lost every point |
+| Decoded-weight LDS cache | Grouped controls lost occupancy from the larger LDS footprint; dense full tiles lack a new reuse argument |
+| Speculative packed prefetch | Longer packed/decode live ranges repeatedly lost or crossed resource cliffs in dense/grouped work |
+| Split-K, GSU, Stream-K, persistent workgroups | No reduction/parallelism deficit in the regular dense production grid; grouped controls were neutral or slower |
+| Inactive-M suppression and row tasks | Every dense production tile is active and directly exposed by the regular M/N launch grid |
+| DirectToLds/DirectToVgpr rewrite | Direct paths do not perform GGUF reconstruction; selected BF16 references also do not imply a packed-MMQ implementation |
+| Major WMMA representation rewrite | Requires changed arithmetic/representation ownership and is not a local schedule optimization |
+| gfx1250 arb-stall programming | Capability is unavailable on gfx1151 |
+| Raw code-object or symbol movement | Embedded controls drifted more than the bundle delta; only normalized ISA or HIP-semantic movement is evidence |
+
+Transfer lessons from the other kernel logs:
+
+| Source | Transferable result | Dense-forward boundary |
+| --- | --- | --- |
+| Dense backward | Exact shapes and quant-specific extraction can matter; LDS layouts are body-specific | Backward transposes ownership and uses different producers/consumers, so its swizzle constants do not transfer |
+| Grouped forward | Compile-time N/K, exact full/tail bodies, and bounded decoder unrolling can remove major overhead | Routed/fixed scheduling, serial row reuse, mixed tails, and group-major workspaces do not describe dense full tiles |
+| Grouped backward | Resource cliffs and explicit representation ownership are first-class constraints | Inactive-M consumers, row tasks, pair accumulation, and route policies are grouped-only mechanisms |
+| Kernel bundle | Warm modules, normalized ISA, concrete wrappers, resource checks, and reproducibility are mandatory | Offsets, symbol ordering, and compiler instruction ordering alone are not performance evidence |
+
+Architecture lessons retained for future work:
+- four wave32 waves remain a sound dense-forward workgroup.
+- conventional global-to-VGPR-to-LDS staging is competitive on gfx1151.
+- Q4_K/Q5_K principal LDS reads are already `ds_load_b128`; Q3_K/Q6_K use paired 32/64-bit forms where packed layouts permit.
+- one versus two LDS buffers is shape-specific; buffer count is not an optimization by itself.
+- int8 WMMA is approximately as fast as BF16 WMMA on gfx1151, not nominally 2x faster.
+- packed forward wins through compact traffic/staging and useful geometry, not an assumed arithmetic-rate advantage.
+- real nonzero tensors, event-timed complete calls, normalized ISA, and resource metadata are required for decisions.
+
+## Scope and contracts
+
+Included:
+- BF16 activations and outputs.
+- internal Q8_1 activation quantization.
+- packed GGUF Q3_K/Q4_K/Q5_K/Q6_K/IQ2_S/Q8_0 compatibility.
+- 160 ordinary Qwen projections and the packed Q6_K head.
+- 301 ordinary DeepSeek Q8_0 projections and the packed Q8_0 head.
+- sequence length 2048 at physical batches 1, 4, and 16.
+- direct packed-weight execution without logical weight materialization.
+
+Excluded:
+- grouped/routed/fixed-group multiplication and scheduling.
+- GatedDeltaNet layout permutations.
+- LoRA GEMMs and residual accumulation.
+- model-scheduler ownership and public operator-schema changes.
+- modifications to selectively vendored llama.cpp source.
+
+DeepSeek routed IQ2_XXS gate/up, routed Q2_K down, and fixed eight-group output-A are grouped workloads. They must not be flattened into dense semantics; see `docs/grouped_mmq_fwd_optimization.md`.
+
+The dense-forward optimization and bundle conversion remained in project-owned code and did not modify the selectively vendored llama.cpp sources.
+
+Correctness and compatibility requirements:
+- independent GGUF-reference coverage for every affected quant/shape family.
+- exact current-output comparison when accumulation order is unchanged.
+- normalized RMSE remains approximately 0.6% for Q3_K/Q6_K and 1.1-2.0% for Q4_K/Q5_K.
+- generic bounds-safe fallbacks remain available.
+- no online autotuning or hidden pointer cache.
+
+## Measurement and validation
+
+Hardware and toolchain:
 
 ```text
-176 allocated VGPRs
-28,928-byte LDS
-0-byte private segment
+GPU: Radeon 8060S Graphics
+architecture: gfx1151, wave32, 40 CUs
+PyTorch: 2.12.0+rocm7.15.0a20260701
+HIP: 7.14.60850
 ```
 
-The Q8_1 quantizer is about 3.4 us at this row count. The call is almost entirely multiplication time, and removing padded-row multiplication produced the 1.76x speedup.
+The BF16 reference is `torch.mm(BF16 activation, dequantized BF16 weight.T)`, normally dispatched to hipBLASLt. It is an arithmetic reference, not a storage-equivalent implementation.
 
-### LDS vectorization and layout
+Measurement rules:
+- run GPU benchmarks sequentially with no concurrent profiler or benchmark.
+- warm module loading before timing.
+- use real nonzero tensors, three warmups, and the complete production matrix.
+- bracket any fresh movement above 1% with sequential 25-repeat controls.
+- report unweighted per-point and checkpoint-weighted movement.
+- include quantization, allocation, and workspace ownership in public-call timing.
+- inspect normalized disassembly and VGPR/SGPR/LDS/private/spill/stack metadata.
+- retain resource-gated kernels only with zero private storage, spills, and dynamic stack.
 
-Generated gfx1151 ISA shows that the main forward LDS path is already substantially vectorized.
-
-Q4_K and Q5_K `J=128` use `ds_load_b128` for their principal LDS reads. Their staged operands use dual-address 32-bit stores such as `ds_store_2addr_b32` and `ds_store_2addr_stride64_b32`.
-
-Q3_K and Q6_K use paired 32-bit or 64-bit LDS operations where their packed layouts permit them. Some scale, metadata, and packed fields remain 32-bit because they are not naturally contiguous per thread.
-
-Forward retains the inherited `GGML_PAD(...)` separation and type-specific SRAM strides used by the selectively vendored MMQ templates. This pass did not perform a controlled forward bank-swizzle sweep, so the layout should not be described as proven optimal.
-
-There is no current evidence that forward LDS layout is a large production bottleneck. The dominant shapes already match or beat BF16, and the observed narrow improvement came from the quantizer rather than multiplication.
-
-## Experiment log
-
-### Accepted
-
-| Experiment | Result |
-| --- | --- |
-| One 512-thread Q8_1 block per real row | Removed padded-row work and excessive small workgroups. First-order narrow gain |
-| Compile-time forward `J` | Enabled bounded row-tile specialization without vendor changes |
-| Q6_K `J=64` for padded rows `<=64` | 7.413 to 4.202 ms on the low-memory LM-head fallback |
-| Ordinary `I=64`, `J=128`, 128 threads | Best measured general production configuration |
-
-### Rejected or not generalized
-
-| Experiment | Reason |
-| --- | --- |
-| Global `J=64` | Regressed ordinary and larger-row workloads |
-| `I=128` | Regressed the measured shape mix |
-| Smaller forward thread/tile combinations | Did not improve the production aggregate |
-| A major WMMA representation rewrite | No large remaining production margin and high implementation risk |
-| DirectToLds/DirectToVgpr-style rewrite | Packed reconstruction remains in the path. Selected hipBLASLt references also disable these modes |
-| gfx1250 WMMA arb-stall programming | The capability is not available on gfx1151 |
-
-## Relevant architecture lessons
-
-TensileLite and shipped hipBLASLt remain useful as records of measured gfx1151 geometry and scheduling. They are not directly reusable generators for packed GGUF MMQ.
-
-Relevant forward lessons:
-- four wave32 waves remain a sound workgroup size.
-- conventional global-to-VGPR-to-LDS staging is competitive on gfx1151.
-- one and two LDS buffers both win in different dense shapes, so dual buffering is not a universal rule.
-- wide local reads and aligned LDS layouts are desirable, but must be judged by end-to-end time.
-- source-swap and transposed LDS concepts are useful orientation references rather than drop-in code.
-- generated dense-GEMM solution databases do not model Q8 activation workspaces or GGUF decode.
-
-FeatherOps reinforces several measurement rules:
-- use controlled ablations rather than PC samples alone.
-- inspect generated ISA and resource metadata after layout or vectorization changes.
-- use real nonzero operands because zero WMMA inputs can mislead.
-- keep explicit prefetch state in fixed scalar/vector VGPR values rather than compiler-managed arrays.
-- optimize whole-call time, including quantization and workspace allocation.
-
-## Optimization plan
-
-The retained Qwen implementation has already bounded the global launch-shape neighborhood. This plan does not reopen the rejected `I=128`, global `J=64`, 64/256-thread, split-K, persistent-workgroup, decoded-weight-LDS-cache, or speculative prefetch sweeps. It applies later evidence from dense backward and grouped forward/backward only where dense-forward ownership and tile reuse make the hypothesis transferable.
-
-Evidence carried into this plan:
-
-| Log | Transferable result | Boundary |
-| --- | --- | --- |
-| Dense forward | The 512-thread row quantizer and I64/J128 ordinary body are the production controls; global geometry and speculative prefetch sweeps are closed. | Q6_K M=256 and narrow Q3_K/Q5_K remain measured deficits. |
-| Dense backward | Exact shapes, quant-specific packed extraction, and body-specific LDS layouts can matter materially. | Backward ownership, reuse, and swizzle constants do not select a forward body. |
-| Grouped forward | Compile-time N/K, separate full/tail bodies, bounded decoder unrolling, and Q8_0 J64 produced real gains. | Fixed/routed scheduling, group-major workspaces, and rejected Q8_0 scale staging do not transfer directly. |
-| Grouped backward | Resource cliffs, exact per-body dispatch, and explicit representation ownership are first-class constraints. | Inactive-M suppression, row tasks, and pair accumulation apply to irregular grouped work, not dense full tiles. |
-| Kernel bundle | Warm modules, normalized ISA, concrete static wrappers, resource verification, and independent reproducibility are required controls. | Code-object offsets, symbol order, and launcher movement are not arithmetic evidence. |
-
-The priority order is:
-
-| Phase | Scope | Primary hypothesis | Completion condition |
-| --- | --- | --- | --- |
-| P0 | Rebaseline and decompose | The benchmark must separate quantization, packed arithmetic, allocation, and complete-call costs before choosing a target. | Sequential source-of-record matrices, resources, and representative profiler counters exist for both models. |
-| P1 | DeepSeek exact Q8_0 bodies | Exact N/K and full-tile M/N bodies remove runtime bounds and pointer state; J32/J64 remove LM-head row over-computation. | A simple static Q8_0 dispatch beats or matches the generic body across all production shapes with no protected regression. |
-| P2 | DeepSeek profile-guided controls | A bounded J64/J128 or K-loop change can lower the current 248-VGPR/38,400-byte-LDS pressure where occupancy or loop overhead is exposed. | Retain only changes with a measured shape-specific gain and a matching ISA/resource explanation. |
-| P3 | Same-input activation reuse | Quantizing one BF16 activation once per metadata layout removes duplicate Q8_1 work and allocation without changing arithmetic. | Shared gate/up pairs and other audited same-input families use explicit prepared workspaces with exact output parity. |
-| P4 | Remaining Qwen local work | Exact full-tile bodies or profiler-supported Q3_K/Q5_K producer changes may close the narrow-projection margin. | The Qwen matrix improves without reopening broad geometry sweeps or regressing the established LM-head schedule. |
-| P5 | Representation projects | Q6_K M=256 and any residual Q8_0 margin require reusable prepared weights, not more local scheduling guesses. | A separately owned representation wins after preparation, memory, forward, and backward reuse are included. |
-| P6 | Loss-loop and release acceptance | Single-call gains matter only if production-weighted and complete-loss behavior also improves. | Correctness, resources, 25-repeat controls, full matrices, and loss-loop checks all pass. |
-
-### P0: establish source-of-record baselines
-
-Run GPU jobs sequentially with warmed modules and real nonzero tensors. Record a nine-repeat baseline first; any fresh median movement above 1% requires a sequential 25-repeat baseline/candidate/bracket control before a semantic decision.
-
-The DeepSeek matrix is:
-- six ordinary Q8_0 shapes at M=2,048, 8,192, and 32,768.
-- LM-head Q8_0 at M=32, 64, 128, 256, and 512.
-- report the 43 shared gate/up pairs as 86 model calls while retaining one unique matrix shape.
-- report checkpoint-weighted latency separately from the unweighted geometric median.
-
-The Qwen control matrix remains every existing forward case at physical batches 1, 4, and 16, plus Q6_K LM-head M=64, 128, and 256. Do not infer arithmetic movement from raw code-object offsets or bundle symbol order; compare normalized ISA and HIP semantics.
-
-Create explicit timing components for:
-- Q8_1 workspace allocation.
-- Q8_1 quantization for each required metadata layout.
-- packed multiplication with a prepared workspace.
-- the complete public `mmq` call.
-- BF16 reference multiplication.
-
-Use these baseline commands as the starting controls:
+Benchmark examples:
 
 ```bash
-PYTHONPATH=. python bench/benchmark_mmq_fwd.py \
-  --model /home/wd/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf \
-  --model-family deepseek --batches 1,4,16 \
-  --lm-head-chunks 32,64,128,256,512 \
-  --warmup 3 --repeats 9 \
-  --output /tmp/mmq_fwd_ds4_plan_baseline_9.json
+source ~/venv_torch/bin/activate
 
 PYTHONPATH=. python bench/benchmark_mmq_fwd.py \
-  --model /home/wd/models/qwen3.6/Qwen3.6-35B-A3B-APEX-I-Mini.gguf \
+  --model ~/models/qwen3.6/Qwen3.6-35B-A3B-APEX-I-Mini.gguf \
   --model-family qwen --batches 1,4,16 \
-  --lm-head-chunks 64,128,256 \
-  --warmup 3 --repeats 9 \
-  --output /tmp/mmq_fwd_qwen_plan_control_9.json
+  --lm-head-chunks 64,128,256 --warmup 3 --repeats 9
+
+PYTHONPATH=. python bench/benchmark_mmq_fwd.py \
+  --model ~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf \
+  --model-family deepseek --batches 1,4,16 \
+  --lm-head-chunks 32,64,128,256,512 --warmup 3 --repeats 9
 ```
 
-Before changing a kernel, record normalized disassembly, VGPR/SGPR counts, static and dynamic LDS, private storage, spills, and dynamic stack. Profile one narrow, one wide, and one long-K DeepSeek shape plus Q8_0 LM-head M=32 and M=256. Counters should decide whether P2 investigates occupancy, global/LDS traffic, bank conflicts, or loop/control overhead.
+`--transient-bf16-control` enables the optimistic allocate/copy-predecoded-BF16/GEMM representation floor. It deliberately excludes decode compute and must not be interpreted as an implementable transient path by itself.
 
-P0 stops when repeated controls are stable enough to distinguish a 1% change. If they are not, increase repetitions and bracket each candidate; do not compensate by widening the candidate set.
-
-P0 completed. Source artifacts are `/tmp/mmq_fwd_ds4_plan_baseline_9.json`, `/tmp/mmq_fwd_qwen_plan_control_9.json`, and `/tmp/mmq_fwd_p0_components.txt`. The 33-point DeepSeek report established:
-- ordinary Q8_0 sustains about 18.4-23.4 logical TFLOP/s; KV at B16 is the only ordinary point below BF16, at `0.985x`, while Q-B remains close at `1.008-1.045x` for B4/B16.
-- LM-head M=32, M=64, and M=128 take `5.395`, `5.630`, and `5.859 ms`; the nearly flat latency confirms that the generic J128 body over-computes the two smaller chunks.
-- profiler decomposition attributes only `0.3%` of LM-head M32 and `0.4%` of Q-B B1 to Q8_1 quantization, but `26.3%` of KV B16 and `3.2%` of output-B B1.
-- Qwen narrow Q3_K B16 spends `23.8%` in Q8_1 quantization, while Q6_K M256 spends less than `0.1%`; the latter is a packed arithmetic/representation limit.
-
-The public call owns allocation and does not expose a prepared arithmetic entry point, so allocation remains included in whole-call event timing and peak-memory reporting. Separate prepared-workspace arithmetic timing is deferred to P3, where such an internal entry point would be real production code rather than a synthetic benchmark ABI.
-
-### P1: specialize exact DeepSeek Q8_0 production bodies
-
-The generic dense Q8_0 kernel is correct but uses one J128 runtime-M/N/K body for every DeepSeek matrix. Its current code object uses 248 VGPRs, 29 SGPRs, and 38,400 bytes of dynamic LDS, with zero private storage, spills, and dynamic stack. That is a valid baseline but leaves little resource headroom and computes four 32-row minitiles for LM-head M=32 and two for M=64.
-
-Implement a small Q8_0-only specialization family with compile-time K, compile-time row tile, and full-I/full-J body flags. All production N values are multiples of I64, ordinary M values are multiples of J128, and LM-head candidates are multiples of 32, so production wrappers do not require mixed output tails.
-
-The bounded candidates are:
-
-| Production class | Required candidates | Reason |
-| --- | --- | --- |
-| Ordinary M=2,048/8,192/32,768 | I64/J128 full body; I64/J64 as one control | J128 maximizes weight reuse; J64 may lower VGPR/LDS pressure and expose more workgroups for N=512/1024. |
-| LM head M=32 | I64/J32 full body; spill-free I64/J64 bounded fallback | Prefer no row over-computation, but retain the smallest body that passes the resource gate. |
-| LM head M=64 | I64/J64 full body | Avoid 2x row-tile over-computation. |
-| LM head M=128 | I64/J128 and I64/J64 full bodies | Establish the crossover once rather than assuming it. |
-| LM head M=256/512 | I64/J128 full body | Preserve packed-weight reuse unless measurements reject it. |
-
-Do not add I128. Dense Qwen and grouped-forward experiments already show that wider output tiles increase reuse only by accepting occupancy and scheduling costs, and DeepSeek Q8_0 has no evidence that changes that tradeoff.
-
-Key the host lookup only by `Q8_0`, K bucket, and M row-tile/full-body class. N should select a different body only if profiling proves that narrow N=512/1024 needs J64. Do not generate one unique wrapper per tensor name when several shapes share the same semantics.
-
-The first implementation should make only these semantic changes:
-- compile out M/N load and store predicates for exact full tiles.
-- replace runtime K-derived bounds and offsets with typed compile-time values.
-- use affine pointer increments where they shorten live ranges.
-- retain the existing Q8_1 metadata layout, Q8_0 decode, WMMA operation, output type, and accumulation order.
-
-P1 acceptance requires exact parity with the current packed implementation where the accumulation order is unchanged, plus the independent BF16/GGUF-reference envelope already enforced by `tests/test_deepseek_mmq.py`. Retain a specialization only if it improves its intended production class without a greater than 1% regression in another class that shares the wrapper.
-
-P1 completed. The first I64/J32/K4096 full body was rejected before installation because it used 48 private bytes and spilled 11 VGPRs. The retained M=32 body is bounded I64/J64; M=64 uses full I64/J64, and every other production shape uses an exact-K full I64/J128 body.
-
-Retained resources are:
-- generic Q8_0 J128: 248 VGPRs and 29 SGPRs.
-- exact Q8_0 J128: 216 VGPRs and 28 SGPRs.
-- exact/bounded Q8_0 J64: 132 VGPRs and 28 SGPRs.
-- all retained bodies: zero private storage, zero spills, no dynamic stack; LDS is 38,400 bytes for J128 and 28,928 bytes for J64.
-
-The sequential 25-repeat generic/candidate/generic bracket is recorded in `/tmp/mmq_fwd_ds4_p1_generic_before_25.json`, `/tmp/mmq_fwd_ds4_p1_exact_25.json`, `/tmp/mmq_fwd_ds4_p1_generic_after_25.json`, and `/tmp/mmq_fwd_ds4_p1_exact_bracket_25.txt`. Against the generic midpoint:
-- all 18 ordinary points improved by `9.18-21.75%`.
-- LM-head M=32 and M=64 improved by `47.40%` and `49.47%`.
-- LM-head M=128/256/512 improved by `12.02-12.96%`.
-- the full 33-point geometric latency improved by `21.62%`.
-- checkpoint-weighted latency improved by `14.64-25.36%`, depending on batch and provisional LM chunk.
-
-All affected correctness tests passed (`36 passed`). A clean detached build of the pre-change source produced byte-identical Qwen Q8_1, Q3_K, Q4_K, Q5_K, and Q6_K HSACOs, as well as a byte-identical generic Q8_0 fallback. The existing Qwen cases therefore retain identical device code; `/tmp/mmq_fwd_qwen_p1_control_9.json` is retained only as a runtime-variance control.
-
-### P2: run only profile-supported DeepSeek controls
-
-P2 is conditional on P0/P1 evidence. It is not a generic tuning sweep.
-
-Allowed controls are:
-- J64 versus J128 for ordinary Q8_0 shapes, one exact body at a time.
-- K-loop unroll factors 1, 2, and at most 4 for K=1,024/2,048/4,096/8,192, only when loop/control instructions are exposed.
-- one Q8_0 LDS producer-layout or swizzle comparison when bank-conflict counters identify a problem.
-- shorter-lived Q8 scale/decode values when VGPR lifetime, rather than memory latency, is the measured occupancy limiter.
-
-Transfer the grouped evidence conservatively. Fixed-group Q8_0 forward established J64 as the only spill-free useful local body in that ownership model, while grouped backward showed that Q8_0 can profit from a large M tile in a different decode-to-BF16 algorithm. Neither result selects a dense-forward geometry by itself. The dense P1 A/B decides.
-
-Do not repeat grouped Q8_0 scale staging, group-major workspace repacking, or generic swizzle sweeps: they regressed there, and there is no dense-specific hypothesis until counters say otherwise. Inactive-M suppression and row-task scheduling also do not transfer: every dense production tile is active and the regular M/N grid already exposes work directly.
-
-A retained P2 kernel must have zero private storage, zero spills, no dynamic stack, and LDS within the gfx1151 budget. A faster candidate at an occupancy cliff is accepted only after a sequential 25-repeat control across every dispatch class that would use it.
-
-P2 geometry controls were rejected:
-- Dispatching the spill-free J64/K4096 body for Q-A, KV, shared gate/up, and LM-head M128 regressed every point in a sequential 25-repeat J64/J128 comparison. Ordinary points lost `4.03-8.85%`, LM-head M128 lost `14.11%`, and checkpoint-weighted latency lost `8.02-8.65%`. Artifacts are `/tmp/mmq_fwd_ds4_p2_k4096_j64_25.json`, `/tmp/mmq_fwd_ds4_p2_k4096_j128_25.json`, and `/tmp/mmq_fwd_ds4_p2_k4096_j64_control_25.txt`.
-- Exact J64 bodies for K=1,024/2,048/8,192 also regressed every production point. Q-B lost `6.03-8.78%`, output-B lost `3.75-7.12%`, and shared down lost `4.94-5.58%` in the 25-repeat control. Artifacts are `/tmp/mmq_fwd_ds4_p2_other_j64_25.json`, `/tmp/mmq_fwd_ds4_p2_other_j128_25.json`, and `/tmp/mmq_fwd_ds4_p2_other_j64_control_25.txt`.
-
-J128 packed-weight reuse outweighs J64's lower VGPR/LDS footprint for every full production tile. J64 remains retained only where M=32/64 would otherwise be padded; the dense Q8_0 I/J geometry neighborhood is closed.
-
-P2 K-loop inspection also closed generic unrolling without a compile/benchmark sweep. The K=1,024/2,048/4,096/8,192 exact bodies each contain the same 1,453-instruction loop body. K changes address immediates and one outer trip-count compare; each 256-value iteration has only three scalar loop-control instructions around hundreds of load, WMMA, conversion, and FMA instructions. Loop control is not exposed enough to justify duplicated bodies or increased instruction-cache pressure.
-
-P2 activation-half double buffering was rejected. The candidate used a second LDS activation tile to load both Q8_1 halves before compute and reduce four barriers per K iteration to two. It remained spill-free at 214 VGPRs/56,832 LDS bytes for J128 and 130 VGPRs/38,144 LDS bytes for J64, but every 25-repeat point regressed: ordinary shapes lost `6.83-25.80%`, LM M32/M64 lost `4.22%`/`2.03%`, and full LM tiles lost `12.44-13.16%`. Loading both halves up front disrupts the accepted load/compute cadence and the extra LDS does not create occupancy. Artifacts are `/tmp/mmq_fwd_ds4_p2_prefetch_y_25.json`, `/tmp/mmq_fwd_ds4_p2_prefetch_baseline_25.json`, and `/tmp/mmq_fwd_ds4_p2_prefetch_y_control_25.txt`.
-
-P2 LDS profiling and its one allowed layout control are also complete. The accepted stride-76 body measured `7.73%` LDS bank conflict, about `7.5%` ALU stalled by LDS, 128-cycle derived LDS latency, mean active-CU occupancy of about 11.6 waves, and about 66% L2 hit rate. A stride-77 Q8_0 control made row starts coprime with 32 banks and reduced the conflict metric to `5.12%`, but ALU stalled by LDS doubled to about `14.3%`. The 25-repeat matrix regressed every point by `3.83-12.86%`, with an `8.58%` geometric and `7.12-8.62%` checkpoint-weighted loss. Artifacts are `/tmp/mmq_fwd_ds4_p2_stride77_25.json`, `/tmp/mmq_fwd_ds4_p2_stride76_25.json`, and `/tmp/mmq_fwd_ds4_p2_stride77_control_25.txt`. The accepted `+4` Q8 row padding and load/compute cadence remain.
-
-P2 is complete. No local DeepSeek Q8_0 geometry, loop-control, barrier, or profiler-supported LDS experiment remains open.
-
-### P3: reuse Q8_1 activations explicitly
-
-Same-input activation reuse is the highest-confidence whole-call opportunity. DeepSeek has 43 Q8_0 shared gate/up pairs with one common D4 Q8_1 layout. Audit the model call graph for attention Q-A/KV and any other same-input families before claiming reuse; tensor shapes alone are not proof that activations are identical.
-
-Implement either an internal prepared-activation entry point or a pair/multi-projection entry point. It must:
-- quantize once per required Q8_1 metadata layout.
-- launch the existing statically selected arithmetic body for each weight.
-- own workspace lifetime explicitly for the current stream.
-- preserve ordinary `mmq` as the fallback and preserve the public operator schema.
-- avoid a hidden pointer cache.
-
-For Qwen, first inventory actual same-input projection groups. Q4_K/Q5_K require the scale-plus-sum layout; Q3_K/Q6_K/IQ2_S require the scale-only layout. A layer that consumes both classes may prepare two workspaces, but never more than one per layout.
-
-Benchmark single calls, pairs, and the checkpoint-weighted layer schedule. Include allocation and quantization in the candidate timing. Acceptance requires bitwise equality with two independent ordinary calls, unchanged autograd behavior, no extra persistent weight memory, and a positive whole-layer gain at physical batches 1, 4, and 16. If quantization plus allocation is below 1% of the paired calls, stop this phase rather than complicating ownership.
-
-### P4: bounded remaining Qwen work
-
-The old global fused-kernel sweep remains closed. The only local Qwen experiment reopened by later logs is exact production specialization, because grouped forward repeatedly benefited when runtime bounds and K-derived state became compile-time facts.
-
-Start with full-I/full-J, compile-time-K bodies for:
-- narrow Q3_K `(N, K) = (512, 2048)` at M=32,768, currently about 8% behind BF16.
-- narrow Q5_K `(512, 2048)` at M=32,768, currently about 5% behind BF16.
-- Q6_K LM head `(248320, 2048)` at M=256 as a protected control, not as a new geometry sweep.
-
-If exact specialization does not move normalized ISA or latency, stop it. For Q3_K/Q5_K, one quant-specific packed extraction or LDS producer-layout control is allowed only after profiling shows exposed decode instructions or bank conflicts. Dense-backward swizzles are hypotheses, not reusable constants: forward stores packed tiles and has different consumers and bank mappings.
-
-Do not retry global J64, I128, split-K, persistent scheduling, decoded-weight LDS caching, or speculative deep prefetch. Do not treat the approximately 3.2% bundle-only movements in attention-query Q3_K or attention-output Q4_K as optimization evidence; those controls had no HIP-semantic change.
-
-Qwen acceptance is the complete existing forward matrix, not only the two narrow points. Preserve Q6_K M=64/M=128 fallbacks and the current M=256 production loss schedule.
-
-P4 completed on 2026-07-25. Eight retained exact wrappers cover Q3_K/K2048; Q4_K/K512, K2048, and K4096; Q5_K/K512 and K2048; and Q6_K/K2048 at J64/J128. Dispatch requires N divisible by 64 and M divisible by the selected J; generic fallbacks remain for every other shape.
-
-The wrappers have zero private storage, zero spills, and no dynamic stack. Relative to generic bodies, exact resources are:
-- Q3_K J128: 216 to 196 VGPRs.
-- Q4_K J128: 254 to 239 VGPRs.
-- Q5_K J128: 230 to 244 VGPRs; the candidate still wins despite the increase.
-- Q6_K J128/J64: 225/171 to 210/158 VGPRs.
-
-The sequential 25-repeat generic/candidate/generic bracket is recorded in `/tmp/mmq_fwd_qwen_p4_generic_before_25.json`, `/tmp/mmq_fwd_qwen_p4_exact_25.json`, `/tmp/mmq_fwd_qwen_p4_generic_after_25.json`, and `/tmp/mmq_fwd_qwen_p4_exact_bracket_25.txt`. Every point improved against the generic midpoint:
-- Q3_K gained `0.90-5.26%`.
-- Q4_K gained `3.60-31.39%`.
-- Q5_K gained `11.66-32.60%`.
-- Q6_K gained `2.09-2.56%` across M=64/128/256.
-- the full 33-point geometric latency improved by `10.44%`.
-- checkpoint-weighted latency improved by `3.86-5.10%`, depending on batch and LM chunk.
-
-The exact bodies close the previous narrow Q3_K/Q5_K BF16 margins. Q6_K M256 improves from the generic bracket midpoint of `16.981 ms` to `16.568 ms`, but remains below the `13.462 ms` BF16 reference; its remaining limit is representation-level rather than bounds or runtime shape state.
-
-### P5: representation-level projects
-
-Enter P5 only after exact bodies and shared activation reuse have been measured. Representation ownership must be explicit at model preparation time, with documented memory cost, lifetime, invalidation, device placement, and forward/backward reuse. Do not add hidden persistent BF16 shadows.
-
-For Qwen Q6_K M=256, the leading candidate is a compact integer-plus-scale representation that is lossless relative to the existing packed quantized values and laid out for the WMMA consumer. It must avoid repeated 6-bit reconstruction while remaining materially smaller than BF16 and usable by both forward and backward. Measure model-load preparation separately and report packed bytes, prepared bytes, and peak bytes.
-
-For Qwen Q3_K/Q5_K, add a prepared representation only if P4 proves packed decode is the remaining limit and the checkpoint-weighted reuse repays its memory. Do not generalize from one narrow tensor type to every quant family.
-
-DeepSeek Q8_0 is already an integer-plus-scale format. If P1/P2 still lose materially, compare two floors before designing storage:
-- a one-time tile-major Q8_0 repack that preserves values and scales.
-- an optimistic BF16 dense floor with decode and allocation accounted for separately.
-
-A tile-major Q8_0 representation is preferred over BF16 if it closes the layout cost while remaining close to packed size. Any BF16 or decoded dense stage must include preparation in first-use latency and peak allocation, and must beat direct packed execution over its real reuse count. Keep routed and fixed-group DeepSeek weights on their existing packed paths; dense evidence does not authorize changing grouped representations.
-
-### P6: complete-loss and release acceptance
-
-Forward timing alone may propose an LM-head chunk, but it cannot select production scheduling. Qwen must rerun the complete 2,048-row packed-loss loop for M=64, 128, and 256 after any retained forward or representation change. Its current control is 229.958 ms at M=256 versus 312.690 ms at M=64.
-
-DeepSeek must measure M=32, 64, 128, 256, and 512 at physical batches 1, 4, and 16, including peak allocation. Final chunk selection is deferred until the Q8_0 dense-backward path and complete packed-loss loop exist; isolated forward results should be recorded but must not set production dispatch.
-
-Every retained phase must pass:
-- independent GGUF-reference correctness for every affected quant/shape family.
-- exact current-output comparison where semantics and accumulation order are unchanged.
-- the complete Qwen and DeepSeek forward benchmark matrices with three warmups and at least nine measured repeats.
-- sequential 25-repeat A/B controls for any median movement above 1%.
-- checkpoint-weighted latency and unweighted per-point summaries.
-- zero private storage, zero spills, no dynamic stack, and acceptable LDS for every new resource-gated kernel.
-- `python tools/build_mmq_bundle.py --force --jobs "$(nproc)"`, bundle freshness, symbol/resource checks, and independent `--verify-reproducible` validation.
-- the complete project test suite, Ruff, compileall, and `git diff --check`.
-
-Static dispatch may depend only on quant type, M row/chunk bucket, N/K shape class, or an explicitly prepared activation/weight representation. No online autotuning or pointer-identity cache is permitted. A candidate that fails its phase gate is removed before the next phase so the final dispatch table contains only independently justified bodies.
-
-## Correctness and compatibility
-
-The current complete project suite passes:
+Final project validation:
 
 ```text
 pytest -q tests/
-83 passed
+83 passed, 14 warnings
 ```
 
-The historical downstream integration suite also passed 9 tests, including the production 256-row packed-loss schedule. Current project validation is self-contained.
+The downstream complete-loss harness independently validated the final Qwen M64/M128/M256 schedule. No DeepSeek complete-loss result exists yet.
 
-Forward normalized RMSE remains within the existing Q8_1 envelope:
-- approximately 0.6% for Q3_K and Q6_K.
-- approximately 1.1-2.0% for Q4_K and Q5_K.
+## Artifact index
 
-The resource-gated quantizer specializations have zero-byte private segments and no spills. Dense-forward compatibility entries retain their historical compiler resource profiles; in particular, `Q2_K` J128 uses 112 private bytes and 27 VGPR spills and is deliberately not resource-gated. No file under `csrc/vendor/llama_cpp/*` was modified by the bundle conversion.
+Latest acceptance:
+- `/tmp/mmq_fwd_ds4_p2_stride76_25.json`.
+- `/tmp/mmq_fwd_qwen_p4_exact_25.json`.
+- `/tmp/mmq_fwd_qwen_complete_loss_final_25.json`.
+- `/tmp/mmq_fwd_final_components.txt`.
+- `/tmp/mmq_fwd_qwen_q6_transient_floor_25.json`.
 
-## Architecture-specific bundle conversion
+Historical retained baselines:
+- `/tmp/mmq_fwd_baseline_primary_sequential.json`.
+- `/tmp/mmq_fwd_final_full.json`.
+- `/tmp/mmq_fwd_ds4_plan_baseline_9.json`.
+- `/tmp/mmq_fwd_qwen_plan_control_9.json`.
+- `/tmp/mmq_fwd_p0_components.txt`.
 
-Dense forward and its activation quantizers moved from the extension fatbinary into the generalized gfx1151 package documented in `docs/kernel_bundle.md`. The conversion retains D4/DS4/D2S6 workspace selection, J128 ordinary geometry, and the J64 `Q6_K` small-row threshold. It removes direct launches and device entry points from `csrc/mmq_hip.cu`.
+DeepSeek exact-body controls:
+- `/tmp/mmq_fwd_ds4_p1_generic_before_25.json`.
+- `/tmp/mmq_fwd_ds4_p1_exact_25.json`.
+- `/tmp/mmq_fwd_ds4_p1_generic_after_25.json`.
+- `/tmp/mmq_fwd_ds4_p1_exact_bracket_25.txt`.
+- `/tmp/mmq_fwd_qwen_p1_control_9.json`.
 
-The initial nine-repeat before/after comparison measured `-0.23%` geometric dense-forward latency. Sequential embedded/bundle/embedded 25-repeat controls measured the bundle at `+0.87%` geometrically, `+0.76%` by median point, and `+1.05%` by estimated model latency against the bracket midpoint. The embedded controls themselves drifted by `+2.18%`.
+DeepSeek rejected local controls:
+- `/tmp/mmq_fwd_ds4_p2_k4096_j64_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_k4096_j128_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_k4096_j64_control_25.txt`.
+- `/tmp/mmq_fwd_ds4_p2_other_j64_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_other_j128_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_other_j64_control_25.txt`.
+- `/tmp/mmq_fwd_ds4_p2_prefetch_y_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_prefetch_baseline_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_prefetch_y_control_25.txt`.
+- `/tmp/mmq_fwd_ds4_p2_stride77_25.json`.
+- `/tmp/mmq_fwd_ds4_p2_stride77_control_25.txt`.
 
-Notable midpoint comparisons are about `+3.2%` for attention-query `Q3_K` batch 4 and attention-output `Q4_K` batch 4, and `-1.5%` for narrow `Q5_K` batch 1. These are code-object layout effects, not retained tile or dispatch changes. Source artifacts are `/tmp/mmq_fwd_pre_bundle.json`, `/tmp/mmq_fwd_post_bundle.json`, and the three `/tmp/mmq_fwd_*_control_25.json` files.
+Qwen exact-body controls:
+- `/tmp/mmq_fwd_qwen_p4_generic_before_25.json`.
+- `/tmp/mmq_fwd_qwen_p4_exact_25.json`.
+- `/tmp/mmq_fwd_qwen_p4_generic_after_25.json`.
+- `/tmp/mmq_fwd_qwen_p4_exact_bracket_25.txt`.
+
+Bundle controls:
+- `/tmp/mmq_fwd_pre_bundle.json`.
+- `/tmp/mmq_fwd_post_bundle.json`.
+- `/tmp/mmq_fwd_embedded_pre_control_25.json`.
+- `/tmp/mmq_fwd_bundle_control_25.json`.
+- `/tmp/mmq_fwd_embedded_post_control_25.json`.
+
+The `/tmp` artifacts are measurement provenance, not repository inputs.
 
 ## Tool notes
 
-- PC sampling heavily perturbs short kernels, so use it qualitatively.
+- PC sampling heavily perturbs short kernels; use it qualitatively.
 - `roc-obj-ls` is broken in the active environment because of a `rocm_sdk_core._cli` import error.
 - Code-object inspection uses `.hip_fatbin`, `clang-offload-bundler`, `llvm-readobj`, `llvm-nm`, and `llvm-objdump`.

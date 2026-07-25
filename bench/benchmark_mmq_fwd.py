@@ -59,6 +59,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--correctness-rows", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20260705)
     parser.add_argument(
+        "--transient-bf16-control",
+        action="store_true",
+        help=(
+            "time an optimistic transient representation floor: allocate and "
+            "copy a predecoded BF16 weight, then run torch.mm"
+        ),
+    )
+    parser.add_argument(
         "--cases",
         type=str,
         default="",
@@ -163,6 +171,36 @@ def benchmark_bf16(
     return result
 
 
+def benchmark_transient_bf16_floor(
+    input: torch.Tensor,
+    logical_weight: torch.Tensor,
+    warmup: int,
+    repeats: int,
+) -> dict:
+    def function() -> torch.Tensor:
+        transient_weight = torch.empty_like(logical_weight)
+        transient_weight.copy_(logical_weight)
+        return torch.mm(input, transient_weight.transpose(0, 1))
+
+    times = cuda_event_times_ms(function, warmup, repeats)
+    allocated, reserved = incremental_peak_bytes(function)
+    result = summarize_timing(
+        times,
+        input.shape[0],
+        logical_weight.shape[0],
+        logical_weight.shape[1],
+    )
+    result.update(
+        {
+            "incremental_peak_allocated_bytes": allocated,
+            "incremental_peak_reserved_bytes": reserved,
+            "workspace_bytes": logical_weight.numel() * logical_weight.element_size(),
+            "decode_compute_included": False,
+        }
+    )
+    return result
+
+
 def print_result(row: dict) -> None:
     mmq = row["mmq"]
     bf16 = row["torch_bf16"]
@@ -221,6 +259,12 @@ def main() -> None:
             "output_dtype": str(torch.bfloat16),
             "activation_quantization": "Q8_1",
             "torch_reference": "torch.mm(BF16, dequantized_BF16_weight.T)",
+            "transient_bf16_control": args.transient_bf16_control,
+            "transient_bf16_control_scope": (
+                "allocate + copy predecoded BF16 weight + torch.mm; decode excluded"
+                if args.transient_bf16_control
+                else None
+            ),
         },
         "results": [],
     }
@@ -312,6 +356,7 @@ def main() -> None:
             logical_weight = logical_weight.contiguous()
 
             bf16_by_m = {}
+            transient_bf16_by_m = {}
             correctness_by_m = {}
             for m_index, rows in enumerate(unique_m):
                 input_seed = args.seed + case_index * 1000 + m_index
@@ -319,6 +364,10 @@ def main() -> None:
                 bf16_by_m[rows] = benchmark_bf16(
                     input, logical_weight, args.warmup, args.repeats
                 )
+                if args.transient_bf16_control:
+                    transient_bf16_by_m[rows] = benchmark_transient_bf16_floor(
+                        input, logical_weight, args.warmup, args.repeats
+                    )
                 checked_rows = min(args.correctness_rows, rows)
                 correctness_input = input[:checked_rows].clone()
                 correctness_by_m[rows] = correctness_metrics(
@@ -374,6 +423,15 @@ def main() -> None:
                     ),
                     "correctness": correctness_by_m[rows],
                 }
+                if args.transient_bf16_control:
+                    transient = transient_bf16_by_m[rows]
+                    result["transient_bf16_materialization_floor"] = transient
+                    result["transient_bf16_workspace_bytes"] = transient[
+                        "workspace_bytes"
+                    ]
+                    result["packed_to_transient_bf16_floor_latency_ratio"] = (
+                        mmq_result["median_ms"] / transient["median_ms"]
+                    )
                 report["results"].append(result)
                 print_result(result)
 
