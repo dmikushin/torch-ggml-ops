@@ -1294,7 +1294,8 @@ static __device__ __forceinline__ void grouped_mmq_pair_grad_input_q3_n64_large_
 static constexpr int GROUPED_BACKWARD_TILED_Q5_OUT_FEATURES = 2048;
 static constexpr int GROUPED_BACKWARD_TILED_Q5_IN_FEATURES = 512;
 static constexpr int GROUPED_BACKWARD_TILED_Q5_BLOCKS_PER_ROW = 2;
-static constexpr int GROUPED_BACKWARD_TILED_Q5_SWIZZLE = 4;
+static constexpr int GROUPED_BACKWARD_TILED_Q5_SWIZZLE = 8;
+static constexpr int GROUPED_BACKWARD_TILED_Q5_SMALL_SWIZZLE = 4;
 
 using grouped_backward_q5_shared_tile = backward_shared_b_tile<
     GROUPED_BACKWARD_TILED_N,
@@ -1305,7 +1306,7 @@ using grouped_backward_q5_small_shared_tile = backward_shared_b_tile<
     GROUPED_BACKWARD_SMALL_N,
     GROUPED_BACKWARD_TILED_K,
     0,
-    GROUPED_BACKWARD_TILED_Q5_SWIZZLE>;
+    GROUPED_BACKWARD_TILED_Q5_SMALL_SWIZZLE>;
 
 template <
     int N_TILES,

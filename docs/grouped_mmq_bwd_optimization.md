@@ -193,6 +193,10 @@ The only local checks still allowed before a representation project are:
 2. A fresh profiler check for exposed global-wait or barrier latency in Q4_K and IQ2_S. A second LDS buffer or wider stores are allowed only if counters show that wait is exposed and the resource report remains clean.
 3. A direct decode-width or extraction comparison only when it changes a real packed decode operation and leaves the selected tile, K depth, swizzle, and prefetch unchanged. The result must improve the dense shared-down control too.
 
+P6.1 completed the Q5_K four- versus eight-BF16 control. A universal swizzle8 regressed the B1/M64 routes by 5.6-22.5%, but improved every B4/B16 row-task route. The retained body-specific layout keeps swizzle4 for M64 and uses swizzle8 for row tasks. Sequential warmed 25-repeat controls measured 4.2-6.4% gains at B4 and 5.2-6.6% at B16; row-task resources fall from 256 to 233 VGPRs with zero private bytes or spills. Artifacts: `/tmp/grouped_mmq_bwd_qwen_q5_swizzle8_full.json`, `/tmp/grouped_mmq_bwd_qwen_q5_swizzle8_rowtask_control_25.json`, and `/tmp/grouped_mmq_bwd_qwen_q5_swizzle4_rowtask_control_25.json`.
+
+P6.2 closes additional local Q4_K/IQ2_S scheduling work. The retained profiler evidence already shows approximately 0.004 ms task construction, low LDS stalls, high Q4_K L2 hit rate, and zero private bytes/spills. There is no exposed task, LDS, or spill bottleneck that justifies a second buffer, wider store, or reopened geometry sweep. Their remaining deficit is packed decode/representation cost, also present in the dense shared-down controls.
+
 ### P7: Run representation-level Qwen and DeepSeek experiments
 
 If P6 confirms decode cost, move to representations that reduce repeated work rather than another fused-kernel schedule sweep. Evaluate the following in order:
