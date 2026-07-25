@@ -9,6 +9,14 @@ def _fixed_grouped_mmq_fake(
     return input.new_empty((*input.shape[:-1], packed_weight.shape[1]))
 
 
+@torch.library.register_fake("torch_ggml_ops::fixed_grouped_mmq_grad_input")
+def _fixed_grouped_mmq_grad_input_fake(
+    grad_output: torch.Tensor,
+    packed_weight: torch.Tensor,
+) -> torch.Tensor:
+    return grad_output.new_empty((*grad_output.shape[:-1], packed_weight.shape[-1] // 34 * 32))
+
+
 @torch.library.register_fake("torch_ggml_ops::grouped_mmq")
 def _grouped_mmq_fake(
     input: torch.Tensor,
@@ -116,20 +124,45 @@ torch.library.register_autograd(
 )
 
 
+def _setup_fixed_grouped_mmq_context(ctx, inputs, output) -> None:
+    _input, packed_weight = inputs
+    if ctx.needs_input_grad[0]:
+        ctx.save_for_backward(packed_weight)
+
+
 def _fixed_grouped_mmq_backward(ctx, grad_output: torch.Tensor):
-    raise RuntimeError("torch_ggml_ops::fixed_grouped_mmq does not support backward")
+    grad_input = None
+    if ctx.needs_input_grad[0]:
+        (packed_weight,) = ctx.saved_tensors
+        grad_input = torch.ops.torch_ggml_ops.fixed_grouped_mmq_grad_input.default(
+            grad_output.contiguous(), packed_weight
+        )
+    return grad_input, None
 
 
 torch.library.register_autograd(
     "torch_ggml_ops::fixed_grouped_mmq",
     _fixed_grouped_mmq_backward,
+    setup_context=_setup_fixed_grouped_mmq_context,
 )
+
+
+def _fixed_grouped_mmq_grad_input_backward(ctx, grad_grad_input: torch.Tensor):
+    raise RuntimeError(
+        "torch_ggml_ops::fixed_grouped_mmq_grad_input does not support higher-order gradients"
+    )
 
 
 def _grouped_mmq_grad_input_backward(ctx, grad_grad_input: torch.Tensor):
     raise RuntimeError(
         "torch_ggml_ops::grouped_mmq_grad_input does not support higher-order gradients"
     )
+
+
+torch.library.register_autograd(
+    "torch_ggml_ops::fixed_grouped_mmq_grad_input",
+    _fixed_grouped_mmq_grad_input_backward,
+)
 
 
 torch.library.register_autograd(

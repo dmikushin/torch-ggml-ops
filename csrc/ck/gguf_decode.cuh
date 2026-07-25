@@ -32,7 +32,13 @@ static __device__ __forceinline__ int k_min(
 
 template <ggml_type type>
 static constexpr __host__ __device__ int gguf_block_bytes() {
-    if constexpr (type == GGML_TYPE_Q3_K) {
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        return sizeof(block_q8_0);
+    } else if constexpr (type == GGML_TYPE_Q2_K) {
+        return sizeof(block_q2_K);
+    } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
+        return sizeof(block_iq2_xxs);
+    } else if constexpr (type == GGML_TYPE_Q3_K) {
         return sizeof(block_q3_K);
     } else if constexpr (type == GGML_TYPE_Q4_K) {
         return sizeof(block_q4_K);
@@ -42,6 +48,8 @@ static constexpr __host__ __device__ int gguf_block_bytes() {
         return sizeof(block_q6_K);
     } else if constexpr (type == GGML_TYPE_IQ2_S) {
         return sizeof(block_iq2_s);
+    } else {
+        return 0;
     }
 }
 
@@ -50,6 +58,60 @@ static __device__ __forceinline__ float decode_gguf_value(
         const char * packed_row,
         int block_index,
         int value_index);
+
+template <>
+__device__ __forceinline__ float decode_gguf_value<GGML_TYPE_Q8_0>(
+        const char * packed_row,
+        int block_index,
+        int value_index) {
+    const auto & block = reinterpret_cast<const block_q8_0 *>(packed_row)[block_index];
+    return fp16_to_fp32(block.d) * static_cast<float>(block.qs[value_index]);
+}
+
+template <>
+__device__ __forceinline__ float decode_gguf_value<GGML_TYPE_Q2_K>(
+        const char * packed_row,
+        int block_index,
+        int value_index) {
+    const auto & block = reinterpret_cast<const block_q2_K *>(packed_row)[block_index];
+    const int group = value_index >> 4;
+    const int local = value_index & 15;
+    const int group_in_half = group & 7;
+    const int half = group >> 3;
+    const int shift = (group_in_half >> 1) * 2;
+    const int byte = half * 32 + (group_in_half & 1) * 16 + local;
+    const uint8_t packed = block.qs[byte];
+    const int quant = (packed >> shift) & 0x03;
+    const uint8_t scale_min = block.scales[group];
+    const float scale = fp16_to_fp32(block.d) * static_cast<float>(scale_min & 0x0f);
+    const float minimum = fp16_to_fp32(block.dmin) * static_cast<float>(scale_min >> 4);
+    return scale * static_cast<float>(quant) - minimum;
+}
+
+template <>
+__device__ __forceinline__ float decode_gguf_value<GGML_TYPE_IQ2_XXS>(
+        const char * packed_row,
+        int block_index,
+        int value_index) {
+    const auto & block = reinterpret_cast<const block_iq2_xxs *>(packed_row)[block_index];
+    const int group = value_index >> 5;
+    const int local = value_index & 31;
+    const int sub_group = local >> 3;
+    const int element = local & 7;
+    const int q_word = 2 * group;
+    const int q2 = get_int_b2(block.qs, q_word);
+    const uint8_t * grid_indices = reinterpret_cast<const uint8_t *>(&q2);
+    const uint32_t sign_data = static_cast<uint32_t>(
+        get_int_b2(block.qs, q_word + 1));
+    const uint8_t signs = static_cast<uint8_t>(unpack_ksigns(
+        sign_data >> (7 * sub_group)));
+    const uint64_t grid = iq2xxs_grid[grid_indices[sub_group]];
+    const int magnitude = static_cast<int>((grid >> (8 * element)) & 0xff);
+    const int sign = (signs & (1 << element)) == 0 ? 1 : -1;
+    const float db = fp16_to_fp32(block.d) *
+        (0.5f + static_cast<float>(sign_data >> 28)) * 0.25f;
+    return db * static_cast<float>(magnitude * sign);
+}
 
 template <>
 __device__ __forceinline__ float decode_gguf_value<GGML_TYPE_Q3_K>(

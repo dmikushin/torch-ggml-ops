@@ -335,6 +335,99 @@ Tensor new_grouped_backward_row_task_workspace(
         ScalarType::Byte);
 }
 
+Tensor fixed_grouped_mmq_grad_input_cuda(
+        const Tensor & grad_output,
+        const Tensor & packed_weight) {
+    constexpr int groups = 8;
+    constexpr int in_features = 4096;
+    constexpr int row_bytes = (in_features / QK8_0) * sizeof(block_q8_0);
+
+    STD_TORCH_CHECK(grad_output.is_cuda(), "grad_output must be a CUDA/HIP tensor");
+    STD_TORCH_CHECK(packed_weight.is_cuda(), "packed_weight must be a CUDA/HIP tensor");
+    STD_TORCH_CHECK(
+        grad_output.get_device_index() == packed_weight.get_device_index(),
+        "grad_output and packed_weight must be on the same device");
+    STD_TORCH_CHECK(
+        grad_output.scalar_type() == ScalarType::BFloat16,
+        "grad_output must have dtype torch.bfloat16");
+    STD_TORCH_CHECK(
+        packed_weight.scalar_type() == ScalarType::Byte,
+        "packed_weight must have dtype torch.uint8");
+    STD_TORCH_CHECK(
+        grad_output.is_contiguous(),
+        "grad_output must be contiguous; torch_ggml_ops will not insert a hidden copy");
+    STD_TORCH_CHECK(
+        packed_weight.is_contiguous(),
+        "packed_weight must be contiguous; torch_ggml_ops will not insert a hidden copy");
+    STD_TORCH_CHECK(
+        grad_output.storage_offset() == 0,
+        "grad_output must have zero storage offset");
+    STD_TORCH_CHECK(
+        packed_weight.storage_offset() == 0,
+        "packed_weight must have zero storage offset");
+    STD_TORCH_CHECK(
+        grad_output.dim() >= 2 &&
+            grad_output.size(grad_output.dim() - 2) == groups,
+        "fixed_grouped_mmq_grad_input grad_output must have shape [..., 8, out_features]");
+    STD_TORCH_CHECK(
+        packed_weight.dim() == 3 &&
+            packed_weight.size(0) == groups &&
+            packed_weight.size(2) == row_bytes,
+        "fixed_grouped_mmq_grad_input packed_weight must have shape [8, out_features, 4352]");
+
+    const int64_t out_features = grad_output.size(grad_output.dim() - 1);
+    STD_TORCH_CHECK(out_features > 0, "grad_output final dimension must be positive");
+    STD_TORCH_CHECK(
+        packed_weight.size(1) == out_features,
+        "packed_weight output dimension must match grad_output");
+    STD_TORCH_CHECK(
+        out_features <= std::numeric_limits<int>::max(),
+        "out_features exceeds the kernel limit");
+    const int64_t total_rows = grad_output.numel() / out_features;
+    const int64_t tokens = total_rows / groups;
+    STD_TORCH_CHECK(tokens > 0, "zero-token gradients are not supported");
+    STD_TORCH_CHECK(
+        total_rows <= std::numeric_limits<int>::max(),
+        "fixed-group gradient row count exceeds the kernel limit");
+    STD_TORCH_CHECK(
+        tokens <= std::numeric_limits<int>::max(),
+        "fixed-group token count exceeds the kernel limit");
+    const int64_t bytes_per_group = out_features * row_bytes;
+    STD_TORCH_CHECK(
+        packed_weight.numel() == groups * bytes_per_group,
+        "fixed-group packed_weight byte count is inconsistent with its logical shape");
+
+    const auto grad_address = reinterpret_cast<uintptr_t>(grad_output.const_data_ptr());
+    const auto packed_address = reinterpret_cast<uintptr_t>(packed_weight.const_data_ptr());
+    STD_TORCH_CHECK(grad_address % 16 == 0, "grad_output data pointer must be 16-byte aligned");
+    STD_TORCH_CHECK(packed_address % 16 == 0, "packed_weight data pointer must be 16-byte aligned");
+
+    const int32_t device_index = grad_output.get_device_index();
+    torch::stable::accelerator::DeviceGuard guard(device_index);
+    std::vector<int64_t> grad_input_sizes(grad_output.sizes().begin(), grad_output.sizes().end());
+    grad_input_sizes[grad_input_sizes.size() - 2] = groups;
+    grad_input_sizes.back() = in_features;
+    Tensor grad_input = torch::stable::new_empty(
+        grad_output,
+        torch::headeronly::IntHeaderOnlyArrayRef(
+            grad_input_sizes.data(), grad_input_sizes.size()),
+        ScalarType::BFloat16);
+
+    void * stream_pointer = nullptr;
+    TORCH_ERROR_CODE_CHECK(
+        aoti_torch_get_current_cuda_stream(device_index, &stream_pointer));
+    hipStream_t stream = static_cast<hipStream_t>(stream_pointer);
+    torch_ggml_ops::mmq_bundle::launch_fixed_grouped_backward(
+        grad_output.const_data_ptr(),
+        static_cast<const char *>(packed_weight.const_data_ptr()),
+        grad_input.mutable_data_ptr(),
+        static_cast<int>(tokens),
+        static_cast<int>(out_features),
+        bytes_per_group,
+        stream);
+    return grad_input;
+}
+
 Tensor fixed_grouped_mmq_cuda(
         const Tensor & input,
         const Tensor & packed_weight) {
@@ -1030,6 +1123,8 @@ std::tuple<Tensor, Tensor> grouped_mmq_pair_cuda(
 
 STABLE_TORCH_LIBRARY(torch_ggml_ops, m) {
     m.def("fixed_grouped_mmq(Tensor input, Tensor packed_weight) -> Tensor");
+    m.def(
+        "fixed_grouped_mmq_grad_input(Tensor grad_output, Tensor packed_weight) -> Tensor");
     m.def("mmq(Tensor input, Tensor packed_weight, int quant_type, int out_features) -> Tensor");
     m.def(
         "mmq_grad_input(Tensor grad_output, Tensor packed_weight, int quant_type, "
@@ -1051,6 +1146,9 @@ STABLE_TORCH_LIBRARY(torch_ggml_ops, m) {
 
 STABLE_TORCH_LIBRARY_IMPL(torch_ggml_ops, CUDA, m) {
     m.impl("fixed_grouped_mmq", TORCH_BOX(&fixed_grouped_mmq_cuda));
+    m.impl(
+        "fixed_grouped_mmq_grad_input",
+        TORCH_BOX(&fixed_grouped_mmq_grad_input_cuda));
     m.impl("mmq", TORCH_BOX(&mmq_cuda));
     m.impl("mmq_grad_input", TORCH_BOX(&mmq_grad_input_cuda));
     m.impl("grouped_mmq_grad_input", TORCH_BOX(&grouped_mmq_grad_input_cuda));

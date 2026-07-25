@@ -2,7 +2,7 @@
 
 ## Status at a glance
 
-The production optimization pass for grouped MMQ backward on gfx1151 is complete for the current Qwen packed GGUF representations. This completion claim does not include the planned DeepSeek-V4-Flash grouped workloads described below.
+The production optimization pass for grouped MMQ backward on gfx1151 is complete for the current Qwen packed GGUF representations. DeepSeek-V4-Flash backward support is now implemented and correctness-tested, but its production dispatch and optimization pass remain open.
 
 Sources of record:
 
@@ -36,22 +36,159 @@ Final outcome:
 
 ### Remaining work
 
-There is no pending local tile, scheduler, decoder-width, swizzle, prefetch, or integration task for the current Qwen execution model. DeepSeek-V4-Flash is a new shape/type expansion with separate work listed below.
+The current Qwen implementation is the production control, not the end of the grouped-backward project. The retained fused Q3_K and IQ2_S gate/up kernels are already strong wins and should be protected. The remaining Qwen work is concentrated in single-down Q4_K and IQ2_S, with Q5_K deferred unless a shared representation change makes it cheap to evaluate. DeepSeek-V4-Flash arithmetic support is correctness-complete but has no production-tuned backward dispatch yet.
 
-Further performance work on those Qwen kernels is representation-level and should begin only with a design that changes reuse across calls or changes the format consumed by the arithmetic kernel. Candidate directions are:
-- a compact lossless decoded cache substantially smaller than BF16.
-- cross-call decoded-weight reuse.
-- reusable device task/decode metadata.
-- a transient active-expert decode amortized over several projections or calls.
-- a persistent lossless integer-plus-scale representation consumed directly by grouped WMMA.
+The work is deliberately split into two tracks:
 
-Any future path must include decode time, workspace allocation, routing behavior, and complete public-operator latency in its acceptance benchmark. It must preserve sparse active-expert behavior and must not become a permanent full BF16 shadow copy.
+- **DeepSeek production enablement:** establish a valid fixed-group benchmark, specialize `IQ2_XXS` pair, `Q2_K` single, and fixed eight-group `Q8_0` kernels, then select route and token-size dispatch.
+- **Qwen deficit reduction:** address repeated packed-weight decode for single-down Q4_K and IQ2_S through reusable representations or decode amortization. Do not reopen the accepted local geometry neighborhoods without new profiler evidence.
+
+The plan below is the next optimization program. Each experiment gets a short log entry and a source-of-record artifact before the next experiment begins. Failed experiments are reverted with Git and remain documented with their reason for rejection.
+
+## Optimization plan
+
+### P0: Lock the measurement and implementation controls
+
+Before changing a kernel, make the DeepSeek benchmark a valid production comparison and capture the current implementation as the control.
+
+1. Extend `bench/benchmark_grouped_mmq_bwd.py` so model-family selection is explicit and the three DeepSeek cases use the correct contracts. The current harness defaults to Qwen and routes every non-pair case through the routed single operator; it cannot yet measure fixed output-A. Add a fixed-group path with token rows `M = batch * 2048`, cotangent shape `[M, 8, 1024]`, result shape `[M, 8, 4096]`, eight independent packed weights, and a BF16 reference with the same public layout. Do not represent fixed output-A as fabricated route metadata.
+2. Keep the routed DeepSeek path at `R = batch * 2048 * 6`, with the existing uniform, skewed, sparse, and boundary distributions. Record inactive experts, group-size histograms, non-multiple-16/64/128 counts, and total row-task counts. The fixed path has no routing distribution.
+3. Compare each packed result with both an independent Transformers GGUF dequantization reference and the dense packed reference. For routed pair backward, retain the one-FP32-accumulator/one-BF16-rounding contract as the primary packed reference; separately report the expected difference from two independently rounded AITER results. For fixed Q8_0, compare the public `[M, 8, K]` layout directly.
+4. Record complete public-operator latency, arithmetic latency, incremental allocation, and reference latency. Separate the approximately 0.004 ms row-task builder from arithmetic when profiling, but include it in complete operator acceptance. Warm module loading before every timing series.
+5. Use the latest consolidated Qwen result as the Qwen control and create a same-build DeepSeek control, for example `/tmp/grouped_mmq_bwd_ds4_baseline_full.json`. The expected first DeepSeek matrix is 27 points: three fixed Q8_0 points, twelve IQ2_XXS pair points, and twelve Q2_K single points.
+6. Run all GPU benchmarks and profilers sequentially with real nonzero tensors. Use the normal `3` warmups and `9` repeats for matrix coverage. Any fresh median movement above 1% gets a sequential 25-repeat A/B control. Compile bundle candidates with all CPU cores by default: `python tools/build_mmq_bundle.py --force --jobs "$(nproc)"`; use one job only for compiler debugging.
+
+P0 is complete only when the current Qwen matrix remains unchanged, the DeepSeek matrix runs end to end, fixed output-A allocation and layout are recorded, and all three new baseline code objects have resource metadata.
+
+### P1: Resource and ISA reconnaissance
+
+Compile the current generic DeepSeek entries and inspect their code objects before selecting a production geometry:
+
+- `GroupedBwdPairIQ2XXSGeneric`.
+- `GroupedBwdSingleQ2KGeneric`.
+- `GroupedBwdFixedQ80G8K4096`.
+
+Capture normalized disassembly, VGPR/SGPR counts, LDS, private bytes, spills, dynamic stack, wave count, and code-object symbols. The generic bodies are correctness fallbacks, not presumed production kernels. Add resource gates to every retained DeepSeek specialization and require zero private bytes, zero VGPR/SGPR spills, zero dynamic stack, and LDS within the 64 KiB workgroup limit. Treat 256 VGPRs as the practical warning boundary because the Qwen Q5_K row-task kernel already sits there.
+
+Use the source-level HIP semantics as the hypothesis, not raw instruction movement: tile ownership, reuse of BF16 cotangent fragments, packed metadata lifetime, decoder sharing, row-task order, and bounds specialization. Normalize disassembly before comparing artifacts. A changed code-object offset, symbol order, or translation-unit layout is not evidence of an optimization.
+
+### P2: Tune the fixed eight-group Q8_0 path
+
+This is a separate operator family, not a routed special case. It has eight fixed groups, token-major public input/output layout, `(N, K) = (1024, 4096)`, and 43 model calls. The current body uses the generic eight-wave `M=128, N=16, K=16` structure. The first local goal is to remove its narrow output ownership and repeated synchronization while preserving the `[tokens, 8, features]` contract.
+
+Run the following bounded source A/Bs against the fixed-group baseline:
+
+1. Add exact-shape four-wave bodies with `K=32`, `N=64`, and `M=64` and `M=128`. Load one weight tile cooperatively, reuse each cotangent fragment across the four adjacent input-column tiles, and keep the group in `blockIdx.z`. Compile-time `out_features=1024`, `in_features=4096`, eight groups, and 128 threads should remove runtime shape state.
+2. Test `M=256, N=64, K=32` only if the `M=128` body is spill-free and the fixed batch-1/4/16 matrix shows a large-group benefit. Do not carry a larger M tile into production merely because it reduces grid size; the fixed path has only eight groups and may become latency-bound at batch 1.
+3. Compare Q8-specific decoder choices: direct scalar `qs` plus shared FP16 scale, a width-16 decoder that shares one scale across a 32-value block, and a width-32 decoder that loads one complete `Q8_0` block. The choice must be based on decode instruction count and LDS/VGPR lifetime, not on a nominal int8 throughput assumption. Preserve FP32 accumulation and BF16 stores.
+4. Test group-major versus token-major cotangent staging only as a paired layout experiment. The public tensor remains token-major. Do not add a transpose or a second public buffer unless its allocation and complete latency are included.
+
+Profile the best fixed candidates at all three token counts. A candidate is retained only if it improves complete fixed-group latency, including the public layout conversion already required by the contract, with no resource-gate failure or allocation regression. The BF16 BMM comparison remains the reference; the packed kernel does not need to beat BMM to be accepted, but any deficit must be recorded as representation or arithmetic work rather than hidden in dispatch.
+
+### P3: Tune routed IQ2_XXS gate/up backward
+
+DeepSeek gate/up is the highest-priority new routed kernel because it is a fused pair called 43 times and has `R = 12,288/49,152/196,608` rows. Its pair fusion should remain the control: one output allocation, two packed weight decodes, one FP32 accumulator set, and one BF16 rounding.
+
+Start with shape-specialized bodies rather than changing the generic ABI:
+
+- S1: `M=64, N=64, K=32`, 128 threads for mean groups around 48-64.
+- Medium: `M=128, N=64, K=32` for groups around 80-127.
+- Large: `M=128, N=128, K=32` only if resources and measured cotangent reuse justify the wider input tile. If the wider tile reaches the resource cliff, keep `N=64` and expose more N workgroups.
+- Optional large-row body: `M=256, N=64, K=32` only after the `M=128` comparison shows that serial row traversal, not decode or occupancy, is limiting B16.
+
+IQ2_XXS is not IQ2_S with a renamed enum. Its 32-value subgroups use two grid-index words, parity-adjusted sign data, and a block scale. Implement a decoder whose cooperative width matches those sharing boundaries. Compare width 16 and width 32 only after the S1 body is resource-clean; width 8 is not a default fallback because the IQ2_S log showed duplicated scale work and loader overhead. Record grid lookup, sign unpack, scale formation, and conversion costs separately in the disassembly/profiler notes.
+
+For the pair layout, begin with the retained IQ2_S pair principles: separate weight LDS tiles, a four-BF16-style swizzle candidate, and dead decode temporaries before WMMA. A sixteen-BF16 swizzle is a control, not an assumption. Do not add long-lived decoded tiles or cross-iteration packed prefetch until a resource report proves there is room; the Qwen pair kernels already use 194/219 VGPRs for IQ2_S.
+
+### P4: Tune routed Q2_K down backward
+
+DeepSeek Q2_K down is the highest-priority new single because it is called 43 times and has the largest routed output shape `(N, K) = (4096, 2048)`. It should be treated as a separate decoder and dispatch family. The forward log's factor-4 Q2 scale/min unrolling is useful evidence for metadata reuse, but it does not prove the backward tile or unroll is optimal.
+
+Use this bounded sequence:
+
+1. Build exact-shape S1 `M=64, N=64, K=32` and medium/large `M=128, N=64, K=32` bodies. Keep the reduction K tile at 32 initially; the dense/grouped logs show that K=64 and broader synchronizing bodies are not default opportunities.
+2. Implement a Q2_K width-16 cooperative decoder that loads the packed two-bit values and shares the 16-value scale/min group. Compare generator-controlled metadata unroll 1, 2, and 4 in the fixed body. Stop at the first resource cliff; the forward result that unroll 4 was best and spill-free is a hypothesis to test, not a production rule.
+3. Test `N=128` only as a resource-bounded comparison against `N=64`. Q2_K has a large input feature tile and may benefit from fewer N workgroups, but any extra scale/min state competes directly with occupancy. Do not use fabricated zero lanes as a substitute for a bounded tail body.
+4. Add a large-row M-major task body after the serial S1/S2 matrix. Keep all N workgroups for one row task adjacent, as required by the Qwen row-task results. Compare serial, M-major tasks, and a split full/tail task list only when metadata is already reusable; the Qwen split-list experiment regressed nonuniform B4 by 6-14%.
+
+The first Q2_K dispatch candidates are S1 below average 80 rows, S2 at 80-127, and row tasks at 128+, but this is only an initial bracket. Select thresholds from route-bucket results at 48, 64, 80, 96, 128, 192, 256, and 768 rows, using complete public latency and the four DeepSeek distributions.
+
+### P5: Select DeepSeek routing and fixed-shape dispatch
+
+After P2-P4, create explicit lookup entries keyed by quant type, pair/single/fixed operator, exact `(M, N, K)` geometry, and route bucket. Dispatch may use host-visible `rows`, `num_groups`, shape, and quant type, but must not inspect device offsets or synchronize metadata to the host.
+
+Evaluate thresholds independently for IQ2_XXS pair and Q2_K single. Do not copy Qwen thresholds automatically: DeepSeek uses top-six routing, a mean of 48 rows at batch 1, and much larger N/output-feature dimensions. The candidate threshold matrix should cover:
+
+| Family | Small | Medium | Large | Primary evidence |
+| --- | --- | --- | --- | --- |
+| IQ2_XXS pair | serial S1 | serial S2 or `M=128` | M-major row tasks or `M=128/256` | B1/B4/B16, all routes, 43 paired calls |
+| Q2_K single | serial S1 | serial S2 | M-major row tasks | B1/B4/B16, all routes, 43 calls |
+| Q8_0 fixed | `M=64` | `M=128` | `M=256` if justified | token rows 2,048/8,192/32,768 |
+
+Use one matrix per threshold candidate and choose the lowest checkpoint-weighted estimate, not the fastest uniform point. Preserve sparse active-expert behavior and ensure no arithmetic workgroup is launched for an inactive expert. If a row-task builder is used for paired gate/up, build it once and reuse it for both projections.
+
+### P6: Address the remaining Qwen single-down deficits
+
+The Qwen final matrix identifies the work precisely:
+
+- single-down Q4_K: 1/12 wins, median packed/AITER throughput near `0.86x`, 18 layers, arithmetic bodies around 10-11 ms at large routed batches;
+- single-down IQ2_S: 3/12 wins, median near `0.93x`, 20 layers, with the most visible small/nonuniform deficit;
+- single-down Q5_K: only two edge layers, several 1.8-2.7% bundle regressions, and a 256-VGPR row-task kernel; defer unless a shared representation experiment covers it without additional live state;
+- fused Q3_K and IQ2_S pairs: 24/24 wins and checkpoint-weighted advantage; keep as non-regression controls rather than retuning targets.
+
+Do not restart the closed local neighborhoods: Qwen already rejected universal S2, `M=256,N=64` IQ2_S reuse, N-major tasks, fixed 1,024-program persistence, runtime full/tail branching, split task lists, IQ2_S width 8, and broad swizzle/prefetch changes. The same logs also close J128/I128, K64, two-LDS, GSU, split-K, grouped Stream-K, direct-to-VGPR, and compiler-managed local-array prefetch without new profiler evidence.
+
+The only local checks still allowed before a representation project are:
+
+1. One current-HSACO Q5_K four- versus eight-BF16 swizzle control, because the dense log identifies a modest remaining margin. Keep geometry, decoder, prefetch, and row ordering identical.
+2. A fresh profiler check for exposed global-wait or barrier latency in Q4_K and IQ2_S. A second LDS buffer or wider stores are allowed only if counters show that wait is exposed and the resource report remains clean.
+3. A direct decode-width or extraction comparison only when it changes a real packed decode operation and leaves the selected tile, K depth, swizzle, and prefetch unchanged. The result must improve the dense shared-down control too.
+
+### P7: Run representation-level Qwen and DeepSeek experiments
+
+If P6 confirms decode cost, move to representations that reduce repeated work rather than another fused-kernel schedule sweep. Evaluate the following in order:
+
+1. **Transient active-expert decode plus dense stage.** Decode only the active experts for the current call into a compact project-owned buffer, then use an existing dense/grouped BF16 stage. Include decode, active-expert selection, workspace allocation, synchronization, dense arithmetic, and release in the timed path. Keep a control that uses the same stage with already-dequantized weights so decode cost is visible. This is a diagnostic and a possible production path, not an excuse to compare against AITER with setup excluded.
+2. **Persistent lossless integer-plus-scale cache.** Store a WMMA-friendly representation that preserves each GGUF quantized value exactly: Q4_K/Q5_K/Q2_K retain packed quant fields plus scale/min metadata; IQ2_S/IQ2_XXS retain grid IDs, signs, and scale factors; Q8_0 retains signed bytes and block scales. Decode codebook values in the arithmetic kernel or in a reusable tile stage. Prefer compact data and metadata reuse over a permanent BF16 shadow copy. Measure cache build once, cache reuse, invalidation, and model-load memory.
+3. **Cross-call active-expert reuse.** The same expert weights recur across forward and backward projections and across tokens. Test reuse at the layer or model-call lifetime, preserving only active-expert sparsity where possible. Measure both a cold call and a steady-state sequence; a cache that wins only after an unbounded warm-up is not a production result.
+4. **Reusable device task/decode metadata.** If route metadata is stable for several projections, persist row tasks and packed tile descriptors on device. Measure the creation cost once and amortized cost across the paired gate/up call. Do not persist a fixed 1,024-program traversal or split full/tail lists merely to avoid a small builder; previous controls rejected those behaviors.
+
+The representation work must cover Qwen Q4_K and IQ2_S first because their call counts and deficits are largest. Run Q2_K and IQ2_XXS through the same design only after their DeepSeek local baseline identifies a material decode deficit. Q8_0 is already compact, so prioritize a tile-friendly lossless layout or reuse rather than a BF16 decode cache.
+
+### P8: Acceptance, regression, and handoff
+
+Every retained candidate must pass all of these gates:
+
+- **Correctness:** exact packed-versus-dense checks for singles; the established fused-pair one-rounding envelope; independent Transformers GGUF error checks for Qwen and DeepSeek; fixed Q8_0 public layout checks; tails, inactive experts, duplicate routes, and boundary group sizes.
+- **Autograd/API:** direct operators, forward autograd, fixed output-A autograd, current-stream behavior, fake/meta registrations, allocation shape, and no higher-order-gradient contract changes.
+- **Resources:** zero private bytes, zero VGPR/SGPR spills, zero dynamic stack, and valid LDS. Record VGPR/SGPR, LDS, waves, and normalized disassembly for every retained entry.
+- **Performance:** complete public latency including task construction, decode, workspace, and layout conversion; arithmetic-only timing for diagnosis; allocation growth; packed-versus-AITER comparison; and checkpoint-weighted estimates. A candidate must show a repeatable material gain on its target family, with no repeatable regression in the full Qwen controls or DeepSeek matrix.
+- **Reproducibility:** fresh 9-repeat matrix followed by sequential 25-repeat controls for movements above 1%; no concurrent GPU activity; same-build bundle artifacts; all-CPU-core compilation; and source-only packaging checks.
+- **Scope:** preserve the route ABI, no CPU metadata descriptors or `.item()`, no hidden synchronization, no changes under `csrc/vendor/llama_cpp/*`, no direct hipBLASLt linkage, and no permanent full BF16 shadow copy without an explicit memory/latency decision.
+
+Suggested retention rule: accept a local candidate only when it improves at least one long-running or high-call target by 2% or more in a sequential control, does not regress its family controls by more than 1%, preserves all resource gates, and does not worsen the checkpoint-weighted estimate. A dispatch threshold may trade individual route buckets only when the complete weighted matrix improves and no sparse or boundary contract is lost.
+
+### Priority order
+
+Execute the work in this order:
+
+1. P0 harness and DeepSeek baseline.
+2. P1 resource/ISA reconnaissance.
+3. P3 IQ2_XXS pair and P4 Q2_K single local bodies, in parallel only at the source/build-analysis level; GPU timing remains sequential.
+4. P2 fixed Q8_0, because it has a distinct layout and a potentially large 43-call impact.
+5. P5 DeepSeek dispatch thresholds and row-task selection.
+6. P6 Qwen Q4_K and IQ2_S representation diagnosis, with Q5_K only as a shared-control case.
+7. P7 transient/persistent representations and cross-call reuse.
+8. P8 complete validation, documentation, and commit.
+
+The stopping rule is explicit: if a new DeepSeek body is spill-free but loses against its generic or dense control, or if a Qwen representation change does not improve both grouped and dense shared-down controls after decode and allocation are included, revert it and close that neighborhood. Do not convert assembly movement, a uniform-only gain, or an allocation-excluded decode benchmark into a production claim.
 
 ## Scope and production contract
 
-This document covers routed grouped MMQ input-gradient operators:
+This document covers grouped MMQ input-gradient operators:
 - `grouped_mmq_grad_input` for one frozen packed expert projection.
 - `grouped_mmq_pair_grad_input` for the fused gate/up input gradient.
+- `fixed_grouped_mmq_grad_input` for the eight-group DeepSeek output-A projection.
 
 For a routed expert group, forward computes:
 
@@ -118,11 +255,13 @@ The production sequence length is 2,048 and top-k is 8.
 | 4 | 65,536 | 256 |
 | 16 | 262,144 | 1,024 |
 
-### Planned DeepSeek-V4-Flash expansion
+### DeepSeek-V4-Flash expansion
 
-Status: not implemented or tuned. DeepSeek introduces two routed expert formats and one semantically distinct fixed-group projection. All three require production configurations for physical batch sizes 1, 4, and 16 at sequence length 2,048.
+Status: implemented and correctness-tested; not yet production-dispatched or tuned. DeepSeek introduces two routed expert formats and one semantically distinct fixed-group projection. All three require production configurations for physical batch sizes 1, 4, and 16 at sequence length 2,048.
 
-| Workload | Forward weight per group/expert `(N, K)` | Backward GEMM | GGUF type | Tensors | Planned operator |
+The current tests use real checkpoint tensors, independent Transformers GGUF dequantization, routed single and pair input-gradient references, and fixed-group output-A input-gradient references. They cover the new operators at a small physical sample; production matrices and optimization evidence remain future work.
+
+| Workload | Forward weight per group/expert `(N, K)` | Backward GEMM | GGUF type | Tensors | Operator |
 | --- | ---: | --- | --- | ---: | --- |
 | Grouped output A, 8 fixed groups | `(1024, 4096)` | `(M, 1024) x (1024, 4096)` per group | Q8_0 | 43 | dedicated fixed-group input gradient |
 | Routed gate/up, 256 experts | `(2048, 4096)` | two `(R, 2048) x (2048, 4096)` contributions | IQ2_XXS | 43 pairs | `grouped_mmq_pair_grad_input` |
@@ -867,7 +1006,7 @@ Do not edit `~/transformers-qwen3-moe-fused`. It is legacy/reference-only.
 
 ## Architecture-specific bundle conversion
 
-Grouped backward now ships 22 independent gfx1151 entries: five generic single kernels, five generic pair kernels, and twelve geometry-specific single, pair, and row-task kernels. `csrc/ck/grouped_mmq_backward.cuh` and `csrc/ck/grouped_mmq_backward_tiled.cuh` expose reusable device bodies; `csrc/mmq_bundle.cpp` owns the retained static selection and all HIP module launches.
+Grouped backward now ships 27 independent gfx1151 entries: seven generic single kernels, seven generic pair kernels, one fixed-group Q8_0 kernel, and twelve geometry-specific single, pair, and row-task kernels. `csrc/ck/grouped_mmq_backward.cuh` and `csrc/ck/grouped_mmq_backward_tiled.cuh` expose reusable device bodies; `csrc/mmq_bundle.cpp` owns the retained static selection and all HIP module launches.
 
 The conversion removed the legacy in-header launchers, unreachable large serial down kernels superseded by row tasks, and the superseded N=128 Q3 pair family. Forward and backward now share one packaged row-task descriptor builder with a host-selected row tile.
 

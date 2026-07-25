@@ -38,6 +38,7 @@ constexpr int kBackwardWaves = 4;
 constexpr int kBackwardTile = 16;
 constexpr int kGroupedBackwardThreads = 256;
 constexpr int kGroupedBackwardN = 16;
+constexpr int kGroupedBackwardMPerBlock = 128;
 constexpr int kGroupedBackwardTiledN = 128;
 
 struct LoadedKernel {
@@ -180,6 +181,20 @@ int backward_quant_index(std::int32_t quant_type) {
         case kQuantIQ2_S: return 4;
         default: fail("unsupported quant_type " + std::to_string(quant_type) +
             " for backward MMQ");
+    }
+}
+
+int grouped_backward_quant_index(std::int32_t quant_type) {
+    switch (quant_type) {
+        case kQuantQ2_K: return 0;
+        case kQuantQ3_K: return 1;
+        case kQuantQ4_K: return 2;
+        case kQuantQ5_K: return 3;
+        case kQuantQ6_K: return 4;
+        case kQuantIQ2_XXS: return 5;
+        case kQuantIQ2_S: return 6;
+        default: fail("unsupported quant_type " + std::to_string(quant_type) +
+            " for grouped backward MMQ");
     }
 }
 
@@ -518,20 +533,24 @@ MMQKernelId grouped_backward_generic_kernel(
         std::int32_t quant_type,
         bool pair) {
     constexpr std::array single_ids{
+        MMQKernelId::GroupedBwdSingleQ2KGeneric,
         MMQKernelId::GroupedBwdSingleQ3KGeneric,
         MMQKernelId::GroupedBwdSingleQ4KGeneric,
         MMQKernelId::GroupedBwdSingleQ5KGeneric,
         MMQKernelId::GroupedBwdSingleQ6KGeneric,
+        MMQKernelId::GroupedBwdSingleIQ2XXSGeneric,
         MMQKernelId::GroupedBwdSingleIQ2SGeneric,
     };
     constexpr std::array pair_ids{
+        MMQKernelId::GroupedBwdPairQ2KGeneric,
         MMQKernelId::GroupedBwdPairQ3KGeneric,
         MMQKernelId::GroupedBwdPairQ4KGeneric,
         MMQKernelId::GroupedBwdPairQ5KGeneric,
         MMQKernelId::GroupedBwdPairQ6KGeneric,
+        MMQKernelId::GroupedBwdPairIQ2XXSGeneric,
         MMQKernelId::GroupedBwdPairIQ2SGeneric,
     };
-    const int index = backward_quant_index(quant_type);
+    const int index = grouped_backward_quant_index(quant_type);
     return pair ? pair_ids[index] : single_ids[index];
 }
 
@@ -778,6 +797,36 @@ void launch_dense_backward(
             ? (m_blocks + selection.group_m - 1) / selection.group_m
             : 1),
         kBackwardThreads,
+        1,
+        1,
+        0,
+        stream,
+        arguments);
+}
+
+void launch_fixed_grouped_backward(
+        const void * grad_output,
+        const char * packed_weight,
+        void * grad_input,
+        int tokens,
+        int out_features,
+        std::int64_t bytes_per_group,
+        hipStream_t stream) {
+    void * arguments[]{
+        &grad_output,
+        &packed_weight,
+        &grad_input,
+        &tokens,
+        &out_features,
+        &bytes_per_group,
+    };
+    launch(
+        MMQKernelId::GroupedBwdFixedQ80G8K4096,
+        256,
+        static_cast<unsigned int>((tokens + kGroupedBackwardMPerBlock - 1) /
+            kGroupedBackwardMPerBlock),
+        8,
+        kGroupedBackwardThreads,
         1,
         1,
         0,

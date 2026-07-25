@@ -176,6 +176,25 @@ void MMQ_BUNDLE_KERNEL_SYMBOL(MMQ_GROUPED_PAIR_ARGUMENTS) {
 }
 #endif
 
+#elif MMQ_BUNDLE_GROUPED_BWD_KIND == 15
+
+extern "C" __launch_bounds__(torch_ggml_ops::ck::GROUPED_BACKWARD_THREADS, 1) __global__
+void MMQ_BUNDLE_KERNEL_SYMBOL(
+        const __hip_bfloat16 * __restrict__ grad_output,
+        const char * __restrict__ packed_weight,
+        __hip_bfloat16 * __restrict__ grad_input,
+        int tokens,
+        int out_features,
+        int64_t bytes_per_group) {
+    torch_ggml_ops::ck::fixed_grouped_q8_0_grad_input_body(
+        grad_output,
+        packed_weight,
+        grad_input,
+        tokens,
+        out_features,
+        bytes_per_group);
+}
+
 #elif MMQ_BUNDLE_GROUPED_BWD_KIND >= 12 && MMQ_BUNDLE_GROUPED_BWD_KIND <= 14
 
 #define MMQ_GROUPED_ROW_TASK_ARGUMENTS \

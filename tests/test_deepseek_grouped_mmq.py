@@ -77,6 +77,53 @@ def _reference_grouped(
     return _grouped_linear(input, logical, offsets)
 
 
+def _reference_grouped_grad_input(
+    grad_output: torch.Tensor,
+    packed: torch.Tensor,
+    experts: torch.Tensor,
+    offsets: torch.Tensor,
+    quant_type: gguf.GGMLQuantizationType,
+    in_features: int,
+    out_features: int,
+) -> torch.Tensor:
+    logical = dequantize_gguf_tensor(
+        packed.index_select(0, experts),
+        quant_type,
+        dtype=grad_output.dtype,
+        device=grad_output.device,
+    ).reshape(experts.numel(), out_features, in_features)
+    expected = torch.empty(
+        grad_output.shape[0], in_features, device=grad_output.device, dtype=grad_output.dtype
+    )
+    for group, (row_start, row_end) in enumerate(
+        zip((0, *offsets[:-1].tolist()), offsets.tolist(), strict=True)
+    ):
+        expected[row_start:row_end] = grad_output[row_start:row_end] @ logical[group]
+    return expected
+
+
+def _reference_fixed_grad_input(
+    grad_output: torch.Tensor,
+    packed: torch.Tensor,
+    quant_type: gguf.GGMLQuantizationType,
+    in_features: int,
+) -> torch.Tensor:
+    expected = torch.empty(
+        *grad_output.shape[:-1], in_features,
+        device=grad_output.device,
+        dtype=grad_output.dtype,
+    )
+    for group in range(8):
+        logical = dequantize_gguf_tensor(
+            packed[group],
+            quant_type,
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        ).reshape(grad_output.shape[-1], in_features)
+        expected[:, group] = grad_output[:, group] @ logical
+    return expected
+
+
 def _assert_q8_activation_error(
     actual: torch.Tensor,
     expected: torch.Tensor,
@@ -152,7 +199,7 @@ def test_deepseek_iq2_xxs_pair_matches_transformers_dequantization(
 
 
 @pytest.mark.parametrize("qname", tuple(_ROUTED_PROJECTIONS))
-def test_deepseek_formats_remain_forward_only(
+def test_deepseek_routed_backward_matches_transformers_dequantization(
     reader: gguf.GGUFReader,
     qname: str,
 ) -> None:
@@ -160,17 +207,93 @@ def test_deepseek_formats_remain_forward_only(
         reader, _ROUTED_PROJECTIONS[qname]
     )
     experts, offsets = _routing()
-    grad_output = torch.randn(10, 37, device="cuda", dtype=torch.bfloat16)
+    generator = torch.Generator(device="cuda").manual_seed(4321)
+    grad_output = torch.randn(
+        10, 37, generator=generator, device="cuda", dtype=torch.bfloat16
+    )
 
-    with pytest.raises(RuntimeError, match="unsupported quant_type"):
-        torch.ops.torch_ggml_ops.grouped_mmq_grad_input.default(
-            grad_output,
-            packed,
-            experts,
-            offsets,
-            int(quant_type),
-            in_features,
+    expected = _reference_grouped_grad_input(
+        grad_output,
+        packed,
+        experts,
+        offsets,
+        quant_type,
+        in_features,
+        37,
+    )
+    actual = torch.ops.torch_ggml_ops.grouped_mmq_grad_input.default(
+        grad_output,
+        packed,
+        experts,
+        offsets,
+        int(quant_type),
+        in_features,
+    )
+
+    assert actual.shape == (10, in_features)
+    assert actual.dtype == torch.bfloat16
+    _assert_q8_activation_error(actual, expected)
+
+    input = torch.randn(
+        10, in_features, generator=generator, device="cuda", dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    torch_ggml_ops.grouped_mmq(
+        input, packed, experts, offsets, int(quant_type), 37
+    ).backward(grad_output)
+    _assert_q8_activation_error(input.grad, expected)
+
+
+def test_deepseek_iq2_xxs_pair_backward_matches_transformers_dequantization(
+    reader: gguf.GGUFReader,
+) -> None:
+    gate, quant_type, in_features = _packed_experts(
+        reader, "blk.0.ffn_gate_exps.weight"
+    )
+    up, up_quant_type, up_in_features = _packed_experts(
+        reader, "blk.0.ffn_up_exps.weight"
+    )
+    assert up_quant_type == quant_type
+    assert up_in_features == in_features
+    experts, offsets = _routing()
+    generator = torch.Generator(device="cuda").manual_seed(6789)
+    first_grad = torch.randn(
+        10, 37, generator=generator, device="cuda", dtype=torch.bfloat16
+    )
+    second_grad = torch.randn(
+        10, 37, generator=generator, device="cuda", dtype=torch.bfloat16
+    )
+    gate_logical = dequantize_gguf_tensor(
+        gate.index_select(0, experts), quant_type,
+        dtype=torch.bfloat16, device="cuda",
+    ).reshape(experts.numel(), 37, in_features)
+    up_logical = dequantize_gguf_tensor(
+        up.index_select(0, experts), quant_type,
+        dtype=torch.bfloat16, device="cuda",
+    ).reshape(experts.numel(), 37, in_features)
+    expected = torch.empty(10, in_features, device="cuda", dtype=torch.bfloat16)
+    for group, (row_start, row_end) in enumerate(
+        zip((0, *offsets[:-1].tolist()), offsets.tolist(), strict=True)
+    ):
+        expected[row_start:row_end] = (
+            first_grad[row_start:row_end] @ gate_logical[group] +
+            second_grad[row_start:row_end] @ up_logical[group]
         )
+
+    actual = torch.ops.torch_ggml_ops.grouped_mmq_pair_grad_input.default(
+        first_grad, second_grad, gate, up, experts, offsets, int(quant_type), in_features
+    )
+    _assert_q8_activation_error(actual, expected)
+
+    input = torch.randn(
+        10, in_features, generator=generator, device="cuda", dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    first, second = torch_ggml_ops.grouped_mmq_pair(
+        input, gate, up, experts, offsets, int(quant_type), 37
+    )
+    torch.autograd.backward((first, second), (first_grad, second_grad))
+    _assert_q8_activation_error(input.grad, expected)
 
 
 @pytest.mark.parametrize("out_features", [37, 1024])
@@ -218,7 +341,7 @@ def test_deepseek_fixed_q8_0_forward_matches_transformers_dequantization(
     _assert_q8_activation_error(actual, expected)
 
 
-def test_deepseek_fixed_q8_0_opcheck_compile_and_backward_rejection(
+def test_deepseek_fixed_q8_0_opcheck_compile_and_backward(
     reader: gguf.GGUFReader,
 ) -> None:
     tensor = _tensor(reader, "blk.0.attn_output_a.weight")
@@ -256,5 +379,17 @@ def test_deepseek_fixed_q8_0_opcheck_compile_and_backward_rejection(
     actual = compiled(input.detach(), packed)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    with pytest.raises(RuntimeError, match="does not support backward"):
-        torch_ggml_ops.fixed_grouped_mmq(input, packed).sum().backward()
+    grad_output = torch.randn(
+        1, 8, 37, device="cuda", dtype=torch.bfloat16, generator=torch.Generator(device="cuda").manual_seed(3456)
+    )
+    expected_grad = _reference_fixed_grad_input(
+        grad_output, packed, tensor.tensor_type, 4096
+    )
+    actual_grad = torch.ops.torch_ggml_ops.fixed_grouped_mmq_grad_input.default(
+        grad_output, packed
+    )
+    _assert_q8_activation_error(actual_grad, expected_grad)
+
+    input = input.detach().requires_grad_()
+    torch_ggml_ops.fixed_grouped_mmq(input, packed).backward(grad_output)
+    _assert_q8_activation_error(input.grad, expected_grad)

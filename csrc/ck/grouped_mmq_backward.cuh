@@ -301,4 +301,91 @@ static __device__ __forceinline__ void grouped_mmq_pair_grad_input_body(
     }
 }
 
+static __device__ __forceinline__ void fixed_grouped_q8_0_grad_input_body(
+        const __hip_bfloat16 * __restrict__ grad_output,
+        const char * __restrict__ packed_weight,
+        __hip_bfloat16 * __restrict__ grad_input,
+        int tokens,
+        int out_features,
+        int64_t bytes_per_group) {
+    constexpr int groups = 8;
+    constexpr int in_features = 4096;
+    constexpr int blocks_per_weight_row = in_features / QK8_0;
+    constexpr int packed_row_bytes =
+        blocks_per_weight_row * sizeof(block_q8_0);
+
+    const int input_column_start =
+        blockIdx.x * GROUPED_BACKWARD_N_PER_BLOCK;
+    const int token_block_start =
+        blockIdx.y * GROUPED_BACKWARD_M_PER_BLOCK;
+    const int group = blockIdx.z;
+    const int wave = threadIdx.x / GROUPED_BACKWARD_WAVE_SIZE;
+    const int lane = threadIdx.x % GROUPED_BACKWARD_WAVE_SIZE;
+    const int token_start = token_block_start +
+        wave * GROUPED_BACKWARD_M_PER_WAVE;
+    const int64_t group_weight_offset =
+        static_cast<int64_t>(group) * bytes_per_group;
+    const char * group_weight = packed_weight + group_weight_offset;
+
+    __shared__ __hip_bfloat16 shared_b[
+        GROUPED_BACKWARD_N_PER_BLOCK * GROUPED_BACKWARD_K_PER_ITERATION];
+    f32_accumulator accumulator;
+
+    for (int output_start = 0; output_start < out_features;
+         output_start += GROUPED_BACKWARD_K_PER_ITERATION) {
+        const int index = threadIdx.x;
+        const int k = index / GROUPED_BACKWARD_N_PER_BLOCK;
+        const int local_input_column = index % GROUPED_BACKWARD_N_PER_BLOCK;
+        const int output_feature = output_start + k;
+        const int input_column = input_column_start + local_input_column;
+        if (input_column < in_features && output_feature < out_features) {
+            const char * packed_row = group_weight +
+                static_cast<int64_t>(output_feature) * packed_row_bytes;
+            shared_b[
+                local_input_column * GROUPED_BACKWARD_K_PER_ITERATION + k] =
+                __float2bfloat16(decode_gguf_value<GGML_TYPE_Q8_0>(
+                    packed_row,
+                    input_column / QK8_0,
+                    input_column % QK8_0));
+        } else {
+            shared_b[
+                local_input_column * GROUPED_BACKWARD_K_PER_ITERATION + k] =
+                __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+
+        bf16_fragment a_fragment{};
+        bf16_fragment b_fragment{};
+        __hip_bfloat16 * a = fragment_data(a_fragment);
+        __hip_bfloat16 * b = fragment_data(b_fragment);
+        const int token = token_start + c_row(lane);
+#pragma unroll
+        for (int k_fragment = 0;
+             k_fragment < GROUPED_BACKWARD_K_PER_ITERATION;
+             ++k_fragment) {
+            const int feature = output_start + k_fragment;
+            a[k_fragment] = token < tokens && feature < out_features
+                ? grad_output[
+                    (static_cast<int64_t>(token) * groups + group) *
+                        out_features + feature]
+                : __float2bfloat16(0.0f);
+            b[k_fragment] = shared_b[
+                c_row(lane) * GROUPED_BACKWARD_K_PER_ITERATION + k_fragment];
+        }
+        wmma_f32_16x16x16_bf16(accumulator, a_fragment, b_fragment);
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int element = 0; element < 8; ++element) {
+        const int token = token_start + c_column(lane, element);
+        const int input_column = input_column_start + c_row(lane);
+        if (token < tokens && input_column < in_features) {
+            grad_input[
+                (static_cast<int64_t>(token) * groups + group) * in_features +
+                input_column] = __float2bfloat16(accumulator.values[element]);
+        }
+    }
+}
+
 } // namespace torch_ggml_ops::ck

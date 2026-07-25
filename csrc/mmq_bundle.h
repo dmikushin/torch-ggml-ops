@@ -87,6 +87,15 @@ void launch_dense_backward(
     int in_features,
     hipStream_t stream);
 
+void launch_fixed_grouped_backward(
+    const void * grad_output,
+    const char * packed_weight,
+    void * grad_input,
+    int tokens,
+    int out_features,
+    std::int64_t bytes_per_group,
+    hipStream_t stream);
+
 void launch_grouped_backward(
     std::int32_t quant_type,
     const void * grad_output,

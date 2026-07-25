@@ -98,7 +98,7 @@ The DeepSeek checkpoint is `DeepSeek-V4-Flash-IQ2XXS.gguf`, with sequence length
 | 4 | 8,192 | 49,152 | 192 |
 | 16 | 32,768 | 196,608 | 768 |
 
-Output A consumes logical input `[..., 8, 4096]` and preserves eight independent logical weights. It uses token rows M, not routed rows R, and includes the group-major to public token-major output conversion in the BF16 reference. The routed pair shares one Q8_1 workspace. The three DeepSeek arithmetic branches are forward-only until independent backward decoders exist.
+Output A consumes logical input `[..., 8, 4096]` and preserves eight independent logical weights. It uses token rows M, not routed rows R, and includes the group-major to public token-major output conversion in the BF16 reference. The routed pair shares one Q8_1 workspace. DeepSeek backward decoders are now implemented and correctness-tested; their production dispatch and optimization remain in `docs/grouped_mmq_bwd_optimization.md`.
 
 ## Measurement and acceptance
 

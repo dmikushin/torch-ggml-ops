@@ -37,7 +37,8 @@ QUANT_TYPES = (
     ("IQ2_S", 22),
 )
 BACKWARD_QUANT_TYPES = tuple(
-    item for item in QUANT_TYPES if item[0] in {"Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_S"}
+    item for item in QUANT_TYPES
+    if item[0] in {"Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ2_S"}
 )
 ROW_TASK_TYPES = tuple(
     item for item in QUANT_TYPES if item[0] in {"Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_S"}
@@ -541,6 +542,12 @@ def _grouped_backward_specs() -> list[KernelSpec]:
     specs.extend(
         (
             _grouped_backward_spec(
+                "GroupedBwdFixedQ80G8K4096",
+                "grouped_bwd_fixed_q8_0_g8_k4096",
+                15,
+                enforce_resource_gate=True,
+            ),
+            _grouped_backward_spec(
                 "GroupedBwdSingleQ4KN2048K512M64N64",
                 "grouped_bwd_single_q4_k_n2048_k512_mt64_nt64",
                 3,
@@ -614,7 +621,7 @@ def _grouped_backward_specs() -> list[KernelSpec]:
             ),
         )
     )
-    assert len(specs) == 22
+    assert len(specs) == 27
     return specs
 
 
@@ -673,7 +680,7 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
     specs.extend(_grouped_forward_specs())
     specs.extend(_dense_backward_specs())
     specs.extend(_grouped_backward_specs())
-    assert len(specs) == 108
+    assert len(specs) == 113
     assert len({spec.cpp_id for spec in specs}) == len(specs)
     assert len({spec.symbol for spec in specs}) == len(specs)
     return tuple(specs)
