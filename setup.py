@@ -1,3 +1,5 @@
+import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,6 +24,32 @@ BUNDLE_BUILD_INPUTS = [
 ]
 
 CUDAExtension = cpp_extension.CUDAExtension
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _enable_ccache() -> None:
+    if _env_flag_enabled("TORCH_GGML_OPS_DISABLE_CCACHE"):
+        return
+    ccache = shutil.which("ccache")
+    hipcc = shutil.which("hipcc")
+    if ccache is None or hipcc is None:
+        return
+
+    os.environ.setdefault(
+        "PYTORCH_NVCC",
+        f"{shlex.quote(ccache)} {shlex.quote(hipcc)}",
+    )
+    if "CXX" not in os.environ:
+        for candidate in (Path("/usr/lib/ccache/c++"), Path("/usr/lib64/ccache/c++")):
+            if candidate.is_file():
+                os.environ["CXX"] = str(candidate)
+                break
+
+
+_enable_ccache()
 
 
 class BuildExtension(cpp_extension.BuildExtension):

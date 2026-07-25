@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CSRC = ROOT / "csrc"
 PACKAGE_DIR = ROOT / "torch_ggml_ops" / "kernels" / "gfx1151"
 GENERATED_HEADER = CSRC / "generated" / "mmq_bundle_table.cuh"
+GENERATED_SOURCE_DIR = ROOT / "build" / "mmq_bundle_sources" / "gfx1151"
 ARCH = "gfx1151"
 ABI_PREFIX = "torch_ggml_ops_mmq_gfx1151_v1_"
 
@@ -708,12 +709,25 @@ def _common_args(hipcc: Path) -> list[str]:
         str(hipcc),
         "--genco",
         "--no-gpu-bundle-output",
+        "-c",
         "-O3",
         "-std=c++17",
         f"--offload-arch={ARCH}",
         f"-I{CSRC}",
         f"-ffile-prefix-map={ROOT}=.",
     ]
+
+
+def _ccache_namespace(hipcc: Path, compiler_identity: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(compiler_identity.encode())
+    digest.update("\0".join(_common_args(hipcc)[1:]).encode())
+    return f"torch-ggml-ops-mmq-{digest.hexdigest()[:16]}"
+
+
+def _generated_source(spec: KernelSpec, source_text: str) -> Path:
+    source_digest = hashlib.sha256(source_text.encode()).hexdigest()[:16]
+    return GENERATED_SOURCE_DIR / f"{spec.cpp_id}-{source_digest}.cu"
 
 
 def _build_input_digest(
@@ -831,47 +845,62 @@ def _compile_one(
     hipcc: Path,
     readelf: Path,
     env: dict[str, str],
+    ccache: Path | None,
 ) -> tuple[str, bytes]:
     temporary = output_dir / f"{spec.cpp_id}.hsaco"
-    source = output_dir / f".{spec.cpp_id}.cu"
     source_text = render_wrapper(spec.symbol, spec.config)
-    source.write_text(source_text)
+    source = _generated_source(spec, source_text)
+    source.parent.mkdir(parents=True, exist_ok=True)
+    if not source.is_file():
+        source.write_text(source_text)
+    elif source.read_text() != source_text:
+        raise RuntimeError(f"generated source hash collision at {source}")
     command = [
+        *([str(ccache)] if ccache is not None else []),
         *_common_args(hipcc),
         f"-cuid={spec.cuid}",
         str(source),
         "-o",
         str(temporary),
     ]
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, env=env)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"failed to compile {spec.cpp_id}\ncommand: {' '.join(command)}\n"
-                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}\n"
-                f"generated source:\n{source_text}"
-            )
-        data = _verify_artifact(temporary, spec, readelf)
-        temporary.chmod(0o644)
-        temporary.rename(output_dir / spec.filename)
-        return spec.cpp_id, data
-    finally:
-        source.unlink(missing_ok=True)
+    result = subprocess.run(command, capture_output=True, text=True, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"failed to compile {spec.cpp_id}\ncommand: {' '.join(command)}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}\n"
+            f"generated source:\n{source_text}"
+        )
+    data = _verify_artifact(temporary, spec, readelf)
+    temporary.chmod(0o644)
+    temporary.rename(output_dir / spec.filename)
+    return spec.cpp_id, data
 
 
 def _compile_all(
-    specs: tuple[KernelSpec, ...], hipcc: Path, jobs: int
+    specs: tuple[KernelSpec, ...],
+    hipcc: Path,
+    jobs: int,
+    ccache: Path | None,
+    ccache_namespace: str,
 ) -> tuple[Path, list[bytes]]:
     readelf = _find_tool(hipcc, "llvm-readelf")
     PACKAGE_DIR.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".mmq-gfx1151-", dir=PACKAGE_DIR.parent))
     env = os.environ.copy()
     env.update({"LC_ALL": "C", "LANG": "C", "SOURCE_DATE_EPOCH": "0"})
+    if ccache is not None:
+        inherited_namespace = env.get("CCACHE_NAMESPACE")
+        env["CCACHE_NAMESPACE"] = ":".join(
+            part for part in (inherited_namespace, ccache_namespace) if part
+        )
+        env.setdefault("CCACHE_COMPILERCHECK", "content")
     try:
         images_by_id: dict[str, bytes] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
             futures = {
-                executor.submit(_compile_one, spec, staging, hipcc, readelf, env): spec
+                executor.submit(
+                    _compile_one, spec, staging, hipcc, readelf, env, ccache
+                ): spec
                 for spec in specs
             }
             for future in concurrent.futures.as_completed(futures):
@@ -921,6 +950,7 @@ def main() -> None:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--verify-reproducible", action="store_true")
+    parser.add_argument("--no-ccache", action="store_true")
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
@@ -932,7 +962,8 @@ def main() -> None:
         raise FileNotFoundError("hipcc is required to build the MMQ bundle")
     hipcc = hipcc_value.resolve()
     specs = kernel_specs()
-    build_input = _build_input_digest(hipcc, _compiler_identity(hipcc), specs)
+    compiler_identity = _compiler_identity(hipcc)
+    build_input = _build_input_digest(hipcc, compiler_identity, specs)
 
     if args.check:
         if not _bundle_is_current(build_input, specs):
@@ -947,10 +978,25 @@ def main() -> None:
         print(f"MMQ gfx1151 bundle is current ({len(specs)} kernels)")
         return
 
-    first_dir, first_images = _compile_all(specs, hipcc, args.jobs)
+    disable_ccache = args.no_ccache or os.environ.get(
+        "TORCH_GGML_OPS_DISABLE_CCACHE", ""
+    ).lower() in {"1", "true", "yes", "on"}
+    ccache_value = None if disable_ccache else shutil.which("ccache")
+    ccache = Path(ccache_value).resolve() if ccache_value else None
+    if args.verify_reproducible:
+        ccache = None
+    ccache_namespace = _ccache_namespace(hipcc, compiler_identity)
+    if ccache is not None:
+        print(f"using ccache: {ccache}", flush=True)
+
+    first_dir, first_images = _compile_all(
+        specs, hipcc, args.jobs, ccache, ccache_namespace
+    )
     try:
         if args.verify_reproducible:
-            second_dir, second_images = _compile_all(specs, hipcc, args.jobs)
+            second_dir, second_images = _compile_all(
+                specs, hipcc, args.jobs, None, ccache_namespace
+            )
             try:
                 if first_images != second_images:
                     mismatches = [

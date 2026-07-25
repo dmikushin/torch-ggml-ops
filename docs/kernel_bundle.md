@@ -64,7 +64,7 @@ These bodies may use templates and compile-time parameters, but do not own packa
 
 `tools/mmq_bundle_wrapper_source.py` renders one small `.cu` translation unit per kernel specification. Each unit exposes one literal `extern "C" __global__` symbol, states its launch signature, and calls one selected device body with explicit template arguments.
 
-Forward, dense-backward, and grouped-backward entries remain separate when they have incompatible argument ABIs or launch-bound contracts. The generated units contain no family or geometry selector macros and no model-level dispatch policy. They are temporary build inputs; sdists contain the typed renderer and device sources rather than 118 duplicated generated files.
+Forward, dense-backward, and grouped-backward entries remain separate when they have incompatible argument ABIs or launch-bound contracts. The generated units contain no family or geometry selector macros and no model-level dispatch policy. They are deterministic ignored build inputs under `build/`; sdists contain the typed renderer and device sources rather than the duplicated generated files.
 
 ### Deterministic generator
 
@@ -163,7 +163,7 @@ The generator performs the following transaction:
    - ordered kernel specifications;
    - the concrete-wrapper renderer;
    - included project-owned device headers.
-3. Compile every entry independently with `hipcc --genco` for the target architecture.
+3. Compile every entry independently with `hipcc --genco -c` for the target architecture.
 4. Verify the artifact format, target architecture, and expected exported symbol.
 5. Read compiler resource metadata and apply the entry's resource gate when requested.
 6. Write artifacts and the generated host table to staging paths.
@@ -171,6 +171,16 @@ The generator performs the following transaction:
 8. Remove stale artifacts that are no longer in the inventory.
 
 The current gfx1151 build uses direct unbundled GPU code-object output, optimization level `-O3`, an explicit C++ language level, a source-prefix map, and a deterministic per-symbol Clang CUID. Changes to these options are build-input changes and invalidate the generated set.
+
+## Compile cache
+
+When `ccache` is available, the generator invokes `ccache hipcc` automatically. The explicit compile-only flag is required because ccache otherwise classifies `hipcc --genco` as a link operation and does not store it.
+
+Generated wrappers use deterministic content-addressed source paths under `build/mmq_bundle_sources/<architecture>`. This keeps the ccache key stable across transactional artifact staging directories. The cache namespace includes the HIP compiler identity and common compiler options. Source contents and included header contents remain normal ccache inputs, so a wrapper-only change misses only that wrapper while a shared device-header change correctly misses every affected entry.
+
+The aggregate bundle digest and atomic installation policy are unchanged. When that digest is stale, every entry is still invoked and every resulting artifact still passes ELF, symbol, architecture, and resource verification; unchanged invocations can be ccache hits. A missing, disabled, evicted, or cold cache falls back to normal compilation.
+
+`--no-ccache` or `TORCH_GGML_OPS_DISABLE_CCACHE=1` disables cache use. `--verify-reproducible` always bypasses ccache so its two builds are independent. `setup.py` also configures PyTorch's `PYTORCH_NVCC` hook, and the standard ccache compiler masquerade when available, for the extension translation units while preserving explicit user compiler settings.
 
 ## Reproducibility
 
@@ -181,6 +191,7 @@ The generator therefore uses:
 - stable locale settings;
 - a stable source-date setting;
 - source-prefix mapping;
+- deterministic content-addressed wrapper source paths;
 - ordered specifications;
 - deterministic per-symbol CUIDs;
 - staging directories outside installed output names;
