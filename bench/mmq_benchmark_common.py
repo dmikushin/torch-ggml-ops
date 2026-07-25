@@ -1,6 +1,7 @@
 """Shared utilities for dense MMQ forward and backward benchmarks."""
 
 import argparse
+import math
 import os
 import statistics
 from dataclasses import dataclass
@@ -18,6 +19,10 @@ DEFAULT_MODEL = Path(
     )
 )
 MODEL_FAMILY_CHOICES = ("auto", "qwen", "deepseek")
+DEFAULT_LM_HEAD_CHUNKS = {
+    "qwen": (64, 128, 256),
+    "deepseek": (32, 64, 128, 256, 512),
+}
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,17 @@ class WeightCase:
     lm_head: bool = False
     model_family: str = "qwen"
     expected_quant_type: str | None = None
+
+
+@dataclass(frozen=True)
+class DenseTensorCase:
+    name: str
+    tensor_name: str
+    tensor_suffix: str
+    out_features: int
+    in_features: int
+    tensor_count: int
+    lm_head: bool = False
 
 
 # One real checkpoint tensor represents each (N, K, quant_type) combination
@@ -122,88 +138,93 @@ CASES = (
     ),
 )
 
-DEEPSEEK_FORWARD_CASES = (
-    WeightCase(
-        "ds4_attn_q_a_q8_0",
-        "blk.0.attn_q_a.weight",
-        1024,
-        4096,
-        43,
-        "primary",
-        "attention query A projection",
-        model_family="deepseek",
-        expected_quant_type="Q8_0",
+DEEPSEEK_DENSE_TENSOR_CASES = (
+    DenseTensorCase(
+        "attention_q_a", "blk.0.attn_q_a.weight", ".attn_q_a.weight",
+        1024, 4096, 43,
     ),
-    WeightCase(
-        "ds4_attn_q_b_q8_0",
-        "blk.0.attn_q_b.weight",
-        32768,
-        1024,
-        43,
-        "primary",
-        "attention query B projection",
-        model_family="deepseek",
-        expected_quant_type="Q8_0",
+    DenseTensorCase(
+        "attention_q_b", "blk.0.attn_q_b.weight", ".attn_q_b.weight",
+        32768, 1024, 43,
     ),
-    WeightCase(
-        "ds4_attn_kv_q8_0",
-        "blk.0.attn_kv.weight",
-        512,
-        4096,
-        43,
-        "primary",
-        "attention key/value projection",
-        model_family="deepseek",
-        expected_quant_type="Q8_0",
+    DenseTensorCase(
+        "attention_kv", "blk.0.attn_kv.weight", ".attn_kv.weight",
+        512, 4096, 43,
     ),
-    WeightCase(
-        "ds4_attn_output_b_q8_0",
-        "blk.0.attn_output_b.weight",
-        4096,
-        8192,
-        43,
-        "primary",
-        "attention output B projection",
-        model_family="deepseek",
-        expected_quant_type="Q8_0",
+    DenseTensorCase(
+        "attention_output_b", "blk.0.attn_output_b.weight",
+        ".attn_output_b.weight", 4096, 8192, 43,
     ),
-    WeightCase(
-        "ds4_shared_gate_up_q8_0",
-        "blk.0.ffn_gate_shexp.weight",
-        2048,
-        4096,
-        86,
-        "primary",
-        "shared-expert gate/up geometry",
-        model_family="deepseek",
-        expected_quant_type="Q8_0",
+    DenseTensorCase(
+        "shared_gate", "blk.0.ffn_gate_shexp.weight",
+        ".ffn_gate_shexp.weight", 2048, 4096, 43,
     ),
-    WeightCase(
-        "ds4_shared_down_q8_0",
-        "blk.0.ffn_down_shexp.weight",
-        4096,
-        2048,
-        43,
-        "primary",
-        "shared-expert down projection",
-        model_family="deepseek",
-        expected_quant_type="Q8_0",
+    DenseTensorCase(
+        "shared_up", "blk.0.ffn_up_shexp.weight",
+        ".ffn_up_shexp.weight", 2048, 4096, 43,
     ),
-    WeightCase(
-        "ds4_lm_head_q8_0",
-        "output.weight",
-        129280,
-        4096,
-        1,
-        "primary",
-        "chunked language-model head",
+    DenseTensorCase(
+        "shared_down", "blk.0.ffn_down_shexp.weight",
+        ".ffn_down_shexp.weight", 4096, 2048, 43,
+    ),
+    DenseTensorCase(
+        "lm_head", "output.weight", "output.weight", 129280, 4096, 1,
         lm_head=True,
+    ),
+)
+_DEEPSEEK_TENSORS = {case.name: case for case in DEEPSEEK_DENSE_TENSOR_CASES}
+
+
+def _deepseek_weight_case(
+    tensor_case_name: str,
+    benchmark_name: str,
+    description: str,
+    *,
+    model_tensor_count: int | None = None,
+) -> WeightCase:
+    tensor_case = _DEEPSEEK_TENSORS[tensor_case_name]
+    return WeightCase(
+        benchmark_name,
+        tensor_case.tensor_name,
+        tensor_case.out_features,
+        tensor_case.in_features,
+        tensor_case.tensor_count if model_tensor_count is None else model_tensor_count,
+        "primary",
+        description,
+        lm_head=tensor_case.lm_head,
         model_family="deepseek",
         expected_quant_type="Q8_0",
+    )
+
+
+DEEPSEEK_CASES = (
+    _deepseek_weight_case(
+        "attention_q_a", "ds4_attn_q_a_q8_0", "attention query A projection"
+    ),
+    _deepseek_weight_case(
+        "attention_q_b", "ds4_attn_q_b_q8_0", "attention query B projection"
+    ),
+    _deepseek_weight_case(
+        "attention_kv", "ds4_attn_kv_q8_0", "attention key/value projection"
+    ),
+    _deepseek_weight_case(
+        "attention_output_b", "ds4_attn_output_b_q8_0",
+        "attention output B projection",
+    ),
+    _deepseek_weight_case(
+        "shared_gate", "ds4_shared_gate_up_q8_0",
+        "shared-expert gate/up geometry", model_tensor_count=86,
+    ),
+    _deepseek_weight_case(
+        "shared_down", "ds4_shared_down_q8_0", "shared-expert down projection"
+    ),
+    _deepseek_weight_case(
+        "lm_head", "ds4_lm_head_q8_0", "chunked language-model head"
     ),
 )
 
-FORWARD_CASES = CASES + DEEPSEEK_FORWARD_CASES
+DEEPSEEK_FORWARD_CASES = DEEPSEEK_CASES
+FORWARD_CASES = CASES + DEEPSEEK_CASES
 
 
 def parse_int_list(value: str) -> tuple[int, ...]:
@@ -279,8 +300,12 @@ def make_bf16_input(rows: int, features: int, seed: int) -> torch.Tensor:
     )
 
 
-def load_packed_tensor(tensor: gguf.ReaderTensor) -> torch.Tensor:
-    host = np.array(tensor.data, dtype=np.uint8, copy=True, order="C")
+def load_packed_tensor(
+    tensor: gguf.ReaderTensor,
+    out_features: int | None = None,
+) -> torch.Tensor:
+    data = tensor.data if out_features is None else tensor.data[:out_features]
+    host = np.array(data, dtype=np.uint8, copy=True, order="C")
     packed = torch.from_numpy(host).to("cuda")
     del host
     return packed
@@ -294,6 +319,65 @@ def resolve_model_family(
         "deepseek" if "blk.0.attn_output_a.weight" in tensor_names else "qwen"
     )
     return (detected if requested == "auto" else requested), detected
+
+
+def resolve_lm_head_chunks(
+    requested: tuple[int, ...] | None,
+    model_family: str,
+) -> tuple[int, ...]:
+    return DEFAULT_LM_HEAD_CHUNKS[model_family] if requested is None else requested
+
+
+def validate_weight_case(
+    tensor: gguf.ReaderTensor,
+    case: WeightCase,
+) -> tuple[int, str, tuple[int, ...]]:
+    logical_shape = tuple(int(value) for value in reversed(tensor.shape))
+    expected_shape = (case.expected_out_features, case.expected_in_features)
+    if logical_shape != expected_shape:
+        raise RuntimeError(
+            f"{case.tensor_name} has logical shape {logical_shape}, expected "
+            f"{expected_shape}"
+        )
+    quant_type = int(tensor.tensor_type)
+    quant_name = tensor.tensor_type.name
+    if case.expected_quant_type is not None and quant_name != case.expected_quant_type:
+        raise RuntimeError(
+            f"{case.tensor_name} has quant type {quant_name}, expected "
+            f"{case.expected_quant_type}"
+        )
+    physical_shape = tuple(int(value) for value in tensor.data.shape)
+    return quant_type, quant_name, physical_shape
+
+
+def make_row_specs(
+    case: WeightCase,
+    batches: tuple[int, ...],
+    sequence_length: int,
+    lm_head_chunks: tuple[int, ...],
+) -> tuple[list[dict[str, int]], tuple[int, ...]]:
+    if case.lm_head:
+        specs = [
+            {
+                "batch": batch,
+                "m": chunk,
+                "model_rows": batch * sequence_length,
+                "calls": math.ceil(batch * sequence_length / chunk),
+            }
+            for chunk in lm_head_chunks
+            for batch in batches
+        ]
+        return specs, lm_head_chunks
+    specs = [
+        {
+            "batch": batch,
+            "m": batch * sequence_length,
+            "model_rows": batch * sequence_length,
+            "calls": 1,
+        }
+        for batch in batches
+    ]
+    return specs, tuple(spec["m"] for spec in specs)
 
 
 def _select_cases(
@@ -319,13 +403,7 @@ def _select_cases(
     return cases
 
 
-def select_cases(case_names: str, primary_only: bool) -> tuple[WeightCase, ...]:
-    """Select the established Qwen cases used by dense backward."""
-
-    return _select_cases(case_names, primary_only, CASES)
-
-
-def select_forward_cases(
+def select_cases(
     case_names: str,
     primary_only: bool,
     model_family: str,
@@ -334,3 +412,11 @@ def select_forward_cases(
         case for case in FORWARD_CASES if case.model_family == model_family
     )
     return _select_cases(case_names, primary_only, available_cases)
+
+
+def select_forward_cases(
+    case_names: str,
+    primary_only: bool,
+    model_family: str,
+) -> tuple[WeightCase, ...]:
+    return select_cases(case_names, primary_only, model_family)

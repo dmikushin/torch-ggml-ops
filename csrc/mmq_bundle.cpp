@@ -36,6 +36,8 @@ constexpr int kForwardBlockY = 4;
 constexpr int kBackwardThreads = 128;
 constexpr int kBackwardWaves = 4;
 constexpr int kBackwardTile = 16;
+constexpr int kQ80BlockValues = 32;
+constexpr int kKQuantBlockValues = 256;
 constexpr int kGroupedBackwardThreads = 256;
 constexpr int kGroupedBackwardN = 16;
 constexpr int kGroupedBackwardMPerBlock = 128;
@@ -174,11 +176,12 @@ int forward_quant_index(std::int32_t quant_type) {
 
 int backward_quant_index(std::int32_t quant_type) {
     switch (quant_type) {
-        case kQuantQ3_K: return 0;
-        case kQuantQ4_K: return 1;
-        case kQuantQ5_K: return 2;
-        case kQuantQ6_K: return 3;
-        case kQuantIQ2_S: return 4;
+        case kQuantQ8_0: return 0;
+        case kQuantQ3_K: return 1;
+        case kQuantQ4_K: return 2;
+        case kQuantQ5_K: return 3;
+        case kQuantQ6_K: return 4;
+        case kQuantIQ2_S: return 5;
         default: fail("unsupported quant_type " + std::to_string(quant_type) +
             " for backward MMQ");
     }
@@ -502,6 +505,9 @@ DenseBackwardSelection dense_backward_selection(
         int rows,
         int out_features,
         int in_features) {
+    if (quant_type == kQuantQ8_0) {
+        return {MMQKernelId::DenseBwdQ80NT64KI16G0, 4, 16, 0, 1};
+    }
     if (quant_type == kQuantQ3_K || quant_type == kQuantQ4_K ||
         quant_type == kQuantQ5_K) {
         const bool full_tiles = rows > 256 && rows % 128 == 0 &&
@@ -843,7 +849,10 @@ void launch_dense_backward(
         selection.group_m < m_blocks
         ? selection.group_m
         : m_blocks;
-    int blocks_per_weight_row = in_features / 256;
+    const int block_values = quant_type == kQuantQ8_0
+        ? kQ80BlockValues
+        : kKQuantBlockValues;
+    int blocks_per_weight_row = in_features / block_values;
     void * arguments[]{
         &grad_output,
         &packed_weight,

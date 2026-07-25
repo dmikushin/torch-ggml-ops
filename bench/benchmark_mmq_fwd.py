@@ -16,7 +16,6 @@ normally dispatched to hipBLASLt.
 import argparse
 import gc
 import json
-import math
 from pathlib import Path
 
 import gguf
@@ -28,11 +27,14 @@ from mmq_benchmark_common import (
     incremental_peak_bytes,
     load_packed_tensor,
     make_bf16_input,
+    make_row_specs,
     parse_int_list,
+    resolve_lm_head_chunks,
     resolve_model_family,
-    select_forward_cases,
+    select_cases,
     summarize_timing,
     synchronize,
+    validate_weight_case,
 )
 from transformers.integrations.gguf_dequant import dequantize_gguf_tensor
 
@@ -53,7 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--sequence-length", type=int, default=2048)
     parser.add_argument("--batches", type=parse_int_list, default=(1, 4, 16))
-    parser.add_argument("--lm-head-chunks", type=parse_int_list, default=(64, 128, 256))
+    parser.add_argument(
+        "--lm-head-chunks",
+        type=parse_int_list,
+        default=None,
+        help="comma-separated chunks; defaults to the selected model family",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--correctness-rows", type=int, default=8)
@@ -226,12 +233,12 @@ def main() -> None:
     properties = torch.cuda.get_device_properties(device)
     reader = gguf.GGUFReader(args.model)
     tensors = {tensor.name: tensor for tensor in reader.tensors}
-    quant_names = {int(value): value.name for value in gguf.GGMLQuantizationType}
     model_family, detected_model_family = resolve_model_family(
         args.model_family, set(tensors)
     )
+    lm_head_chunks = resolve_lm_head_chunks(args.lm_head_chunks, model_family)
 
-    cases = select_forward_cases(args.cases, args.primary_only, model_family)
+    cases = select_cases(args.cases, args.primary_only, model_family)
     missing = [case.tensor_name for case in cases if case.tensor_name not in tensors]
     if missing:
         raise RuntimeError(f"checkpoint is missing benchmark tensors: {missing}")
@@ -250,7 +257,7 @@ def main() -> None:
             "requested_model_family": args.model_family,
             "sequence_length": args.sequence_length,
             "batches": list(args.batches),
-            "lm_head_chunks": list(args.lm_head_chunks),
+            "lm_head_chunks": list(lm_head_chunks),
             "warmup": args.warmup,
             "repeats": args.repeats,
             "correctness_rows": args.correctness_rows,
@@ -283,54 +290,19 @@ def main() -> None:
     with torch.inference_mode():
         for case_index, case in enumerate(cases):
             tensor = tensors[case.tensor_name]
-            logical_shape = tuple(int(value) for value in reversed(tensor.shape))
-            if logical_shape != (
-                case.expected_out_features,
-                case.expected_in_features,
-            ):
-                raise RuntimeError(
-                    f"{case.tensor_name} has logical shape {logical_shape}, expected "
-                    f"{(case.expected_out_features, case.expected_in_features)}"
-                )
-
-            quant_type = int(tensor.tensor_type)
-            quant_name = quant_names.get(quant_type, str(quant_type))
-            if (
-                case.expected_quant_type is not None
-                and quant_name != case.expected_quant_type
-            ):
-                raise RuntimeError(
-                    f"{case.tensor_name} has quant type {quant_name}, expected "
-                    f"{case.expected_quant_type}"
-                )
-            physical_shape = tuple(int(value) for value in tensor.data.shape)
+            quant_type, quant_name, physical_shape = validate_weight_case(
+                tensor, case
+            )
             packed_weight = load_packed_tensor(tensor)
             if packed_weight.dtype != torch.uint8 or not packed_weight.is_contiguous():
                 raise RuntimeError("packed benchmark weight is not contiguous uint8")
 
-            if case.lm_head:
-                row_specs = [
-                    {
-                        "batch": batch,
-                        "m": chunk,
-                        "model_rows": batch * args.sequence_length,
-                        "calls": math.ceil(batch * args.sequence_length / chunk),
-                    }
-                    for chunk in args.lm_head_chunks
-                    for batch in args.batches
-                ]
-                unique_m = args.lm_head_chunks
-            else:
-                row_specs = [
-                    {
-                        "batch": batch,
-                        "m": batch * args.sequence_length,
-                        "model_rows": batch * args.sequence_length,
-                        "calls": 1,
-                    }
-                    for batch in args.batches
-                ]
-                unique_m = tuple(spec["m"] for spec in row_specs)
+            row_specs, unique_m = make_row_specs(
+                case,
+                args.batches,
+                args.sequence_length,
+                lm_head_chunks,
+            )
 
             mmq_by_m = {}
             for m_index, rows in enumerate(unique_m):

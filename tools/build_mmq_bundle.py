@@ -290,7 +290,17 @@ def _dense_backward_spec(
 
 
 def _dense_backward_specs() -> list[KernelSpec]:
-    specs: list[KernelSpec] = []
+    specs: list[KernelSpec] = [
+        _dense_backward_spec(
+            "DenseBwdQ80NT64KI16G0",
+            "dense_bwd_q8_0_nt64_ki16_g0",
+            QuantType.Q8_0,
+            4,
+            16,
+            group_m=0,
+            decoder_width=16,
+        )
+    ]
 
     def generic(
         label: str,
@@ -471,7 +481,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
             ),
         )
     )
-    assert len(specs) == 36
+    assert len(specs) == 37
     return specs
 
 
@@ -726,7 +736,7 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
     specs.extend(_grouped_forward_specs())
     specs.extend(_dense_backward_specs())
     specs.extend(_grouped_backward_specs())
-    assert len(specs) == 132
+    assert len(specs) == 133
     assert len({spec.cpp_id for spec in specs}) == len(specs)
     assert len({spec.symbol for spec in specs}) == len(specs)
     return tuple(specs)

@@ -578,6 +578,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
         int in_features,
         int blocks_per_weight_row) {
     constexpr int N_PER_BLOCK = N_TILES * BACKWARD_N_PER_TILE;
+    constexpr int WEIGHT_BLOCK_VALUES =
+        type == GGML_TYPE_Q8_0 ? QK8_0 : QK_K;
     constexpr int M_PER_WAVE = M_TILES_PER_WAVE * BACKWARD_M_PER_TILE;
     constexpr int M_PER_BLOCK = M_PER_WAVE * BACKWARD_WAVES;
     const int wave = threadIdx.x / BACKWARD_WAVE_SIZE;
@@ -616,8 +618,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                     __hip_bfloat16 values[16];
                     decode_backward_tile_sixteen_q6<PACK_Q6_QUANT_BYTES>(
                         packed_row,
-                        input_column / QK_K,
-                        input_column % QK_K,
+                        input_column / WEIGHT_BLOCK_VALUES,
+                        input_column % WEIGHT_BLOCK_VALUES,
                         values);
 #pragma unroll
                     for (int index = 0; index < 16; ++index) {
@@ -642,8 +644,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
             const int first_k = threadIdx.x >> 3;
             const int second_k = first_k + 16;
             const int input_column = input_column_start + local_input_column;
-            const int block_index = input_column / QK_K;
-            const int value_index = input_column % QK_K;
+            const int block_index = input_column / WEIGHT_BLOCK_VALUES;
+            const int value_index = input_column % WEIGHT_BLOCK_VALUES;
             const int group = value_index >> 5;
             const int byte = (group >> 1) * 32 + (value_index & 31);
             const char * first_packed_row = packed_weight +
@@ -681,8 +683,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
             const int first_k = threadIdx.x >> 3;
             const int second_k = first_k + 16;
             const int input_column = input_column_start + local_input_column;
-            const int block_index = input_column / QK_K;
-            const int value_index = input_column % QK_K;
+            const int block_index = input_column / WEIGHT_BLOCK_VALUES;
+            const int value_index = input_column % WEIGHT_BLOCK_VALUES;
             const int low_byte =
                 (value_index >> 7) * 32 + (value_index & 31);
             const int high_byte = value_index & 31;
@@ -725,8 +727,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
             const int first_k = threadIdx.x >> 3;
             const int second_k = first_k + 16;
             const int input_column = input_column_start + local_input_column;
-            const int block_index = input_column / QK_K;
-            const int value_index = input_column % QK_K;
+            const int block_index = input_column / WEIGHT_BLOCK_VALUES;
+            const int value_index = input_column % WEIGHT_BLOCK_VALUES;
             const int group = value_index >> 5;
             const int low_byte = (group >> 1) * 32 + (value_index & 31);
             const int high_byte = value_index & 31;
@@ -763,8 +765,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
             }
         } else if constexpr (
             DECODER_WIDTH > 0 &&
-            (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
-             type == GGML_TYPE_Q5_K)
+            (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q3_K ||
+             type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)
         ) {
             constexpr int groups_per_row = N_PER_BLOCK / DECODER_WIDTH;
 #pragma unroll
@@ -782,8 +784,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                     __hip_bfloat16 values[DECODER_WIDTH];
                     decode_backward_tile_group<type, DECODER_WIDTH>(
                         packed_row,
-                        input_column / QK_K,
-                        input_column % QK_K,
+                        input_column / WEIGHT_BLOCK_VALUES,
+                        input_column % WEIGHT_BLOCK_VALUES,
                         values);
 #pragma unroll
                     for (int index = 0; index < DECODER_WIDTH; ++index) {
@@ -800,8 +802,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                     __hip_bfloat16 values[DECODER_WIDTH];
                     decode_backward_tile_group<type, DECODER_WIDTH>(
                         packed_row,
-                        input_column / QK_K,
-                        input_column % QK_K,
+                        input_column / WEIGHT_BLOCK_VALUES,
+                        input_column % WEIGHT_BLOCK_VALUES,
                         values);
 #pragma unroll
                     for (int index = 0; index < DECODER_WIDTH; ++index) {
@@ -837,8 +839,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                     __hip_bfloat16 values[4];
                     decode_backward_tile_quad<type>(
                         packed_row,
-                        input_column / QK_K,
-                        input_column % QK_K,
+                        input_column / WEIGHT_BLOCK_VALUES,
+                        input_column % WEIGHT_BLOCK_VALUES,
                         values);
 #pragma unroll
                     for (int index = 0; index < 4; ++index) {
@@ -874,8 +876,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                         static_cast<int64_t>(output_column) * packed_row_bytes;
                     decode_backward_tile_pair<type>(
                         packed_row,
-                        input_column / QK_K,
-                        input_column % QK_K,
+                        input_column / WEIGHT_BLOCK_VALUES,
+                        input_column % WEIGHT_BLOCK_VALUES,
                         shared_b[local_input_column * K_ITERATION + k],
                         shared_b[(local_input_column + 1) * K_ITERATION + k]);
                 } else {
@@ -899,8 +901,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                     shared_b[local_input_column * K_ITERATION + k] =
                         decode_backward_tile_value<type>(
                             packed_row,
-                            input_column / QK_K,
-                            input_column % QK_K,
+                            input_column / WEIGHT_BLOCK_VALUES,
+                            input_column % WEIGHT_BLOCK_VALUES,
                             local_input_column % BACKWARD_N_PER_TILE);
                 } else {
                     shared_b[local_input_column * K_ITERATION + k] =
