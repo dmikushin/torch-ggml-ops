@@ -670,7 +670,9 @@ DenseBackwardSelection dense_backward_selection(
             }
             return {
                 in_features >= 2048
-                    ? MMQKernelId::DenseBwdQ5KFullK2048
+                    ? rows == 2048
+                        ? MMQKernelId::DenseBwdQ5KFullK2048ScalarExtraction
+                        : MMQKernelId::DenseBwdQ5KFullK2048
                     : MMQKernelId::DenseBwdQ5KFullK512,
                 8, 32, 1, 2};
         }

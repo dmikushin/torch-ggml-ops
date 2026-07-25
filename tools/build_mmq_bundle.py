@@ -611,7 +611,26 @@ def _dense_backward_specs() -> list[KernelSpec]:
             ),
         )
     )
-    assert len(specs) == 73
+    specs.extend(
+        (
+            _dense_backward_spec(
+                "DenseBwdQ5KFullK2048ScalarExtraction",
+                "dense_bwd_q5_k_full_k2048_scalar_extraction",
+                QuantType.Q5_K,
+                8,
+                32,
+                group_m=1,
+                m_tiles_per_wave=2,
+                decoder_width=16,
+                prefetch_local=True,
+                full_tiles=True,
+                prefetch_packed=True,
+                vector_local_load=True,
+                lds_swizzle_chunk=8,
+            ),
+        )
+    )
+    assert len(specs) == 74
     return specs
 
 
@@ -866,7 +885,7 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
     specs.extend(_grouped_forward_specs())
     specs.extend(_dense_backward_specs())
     specs.extend(_grouped_backward_specs())
-    assert len(specs) == 169
+    assert len(specs) == 170
     assert len({spec.cpp_id for spec in specs}) == len(specs)
     assert len({spec.symbol for spec in specs}) == len(specs)
     return tuple(specs)

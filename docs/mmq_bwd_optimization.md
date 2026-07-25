@@ -1050,6 +1050,42 @@ Q4_K shared down remains a performance control because the bundle improved it by
 
 Retain each QB1 result independently. A Q3_K win does not authorize a shared template change for Q4_K/Q5_K, and a Q5_K extraction result does not authorize changing shared-down Q5_K. Run the complete Qwen matrix after every retained wrapper or dispatch change and preserve DeepSeek byte/ISA controls.
 
+QB1 result: one row-specific Q5_K extraction control retained; Q3_K, Q6_K, and shared-down swizzle controls rejected.
+
+Artifacts:
+
+```text
+/tmp/mmq_bwd_qwen_qb1_q3_selected_before_25.json
+/tmp/mmq_bwd_qwen_qb1_q3_scalar_25.json
+/tmp/mmq_bwd_qwen_qb1_q3_no_prefetch_25.json
+/tmp/mmq_bwd_qwen_qb1_q3_no_swizzle_25.json
+/tmp/mmq_bwd_qwen_qb1_q3_selected_after_25.json
+/tmp/mmq_bwd_qwen_qb1_q5_narrow_selected_before_25.json
+/tmp/mmq_bwd_qwen_qb1_q5_narrow_scalar_25.json
+/tmp/mmq_bwd_qwen_qb1_q5_narrow_selected_after_25.json
+/tmp/mmq_bwd_qwen_qb1_q6_m256_packed_before_25.json
+/tmp/mmq_bwd_qwen_qb1_q6_m256_scalar_25.json
+/tmp/mmq_bwd_qwen_qb1_q6_m256_packed_after_25.json
+/tmp/mmq_bwd_qwen_qb1_q5_shared_swizzle4_before_25.json
+/tmp/mmq_bwd_qwen_qb1_q5_shared_swizzle8_25.json
+/tmp/mmq_bwd_qwen_qb1_q5_shared_swizzle4_after_25.json
+/tmp/mmq_bwd_qwen_qb1_final_25.json
+/tmp/mmq_bwd_qwen_qb1_final_narrow_q5_25.json
+/tmp/mmq_bwd_ds4_qb1_control_9.json
+```
+
+Wide Q3_K keeps its packed quant extraction, two-row packed prefetch, and eight-BF16 XOR layout. Scalar extraction regresses `1.06-3.97%`; removing packed prefetch regresses `10.57-11.78%`; removing the swizzle regresses `4.15-10.01%`. All three candidates are removed.
+
+Narrow Q5_K selects scalar extraction only at 2,048 rows, where it improves `17.41%`. It regresses `2.34%/6.52%` at 8,192/32,768 rows, which retain packed extraction. The retained scalar wrapper uses 247 VGPRs, 17 SGPRs, 8 KiB LDS, zero private storage/spills, and no dynamic stack.
+
+The isolated shared-down Q5_K bracket initially measured swizzle8 at `-0.36%/+2.51%/+0.80%` for B1/B4/B16. The complete Qwen matrix at `/tmp/mmq_bwd_qwen_qb1_final_25.json` then measured B4 at `1.570 ms`, worse than the QB0 `1.469 ms`. The gain was not stable in the complete matrix, so shared-down keeps swizzle4 and the candidate wrapper is removed.
+
+Q6_K M256 keeps packed extraction. The scalar candidate regresses `2.14%` and is removed.
+
+The final 170-kernel matrix measures narrow Q5_K at `0.208/0.778/3.019 ms`. Relative to QB0, checkpoint-weighted ordinary Qwen latency improves `0.94%/0.16%/0.63%` at B1/B4/B16. Q6_K M256 remains neutral at `12.520 ms`, and the complete DeepSeek control preserves Q8_0 dispatch and correctness. The full suite passes `100` tests with 14 existing warnings, and freshness plus independent reproducibility checks pass.
+
+This closes QB1 and the authorized local Qwen backward search. Further shared-down work remains deferred to QB2's model-owned representation project.
+
 ### QB2: deferred Qwen shared-down representation project
 
 Status: deferred because this pass is limited to optimizations implemented inside this repository. No prepared-weight ownership, lifetime, invalidation, or model-load policy will be added in the current work.
