@@ -812,6 +812,16 @@ void launch_fixed_grouped_backward(
         int out_features,
         std::int64_t bytes_per_group,
         hipStream_t stream) {
+    MMQKernelId id = MMQKernelId::GroupedBwdFixedQ80G8K4096;
+    int n_per_block = kGroupedBackwardN;
+    int m_per_block = kGroupedBackwardMPerBlock;
+    int threads = kGroupedBackwardThreads;
+    if (out_features == 1024) {
+        n_per_block = 64;
+        threads = kBackwardThreads;
+        id = MMQKernelId::GroupedBwdFixedQ80G8K4096M256N64;
+        m_per_block = 256;
+    }
     void * arguments[]{
         &grad_output,
         &packed_weight,
@@ -821,12 +831,11 @@ void launch_fixed_grouped_backward(
         &bytes_per_group,
     };
     launch(
-        MMQKernelId::GroupedBwdFixedQ80G8K4096,
-        256,
-        static_cast<unsigned int>((tokens + kGroupedBackwardMPerBlock - 1) /
-            kGroupedBackwardMPerBlock),
+        id,
+        static_cast<unsigned int>((4096 + n_per_block - 1) / n_per_block),
+        static_cast<unsigned int>((tokens + m_per_block - 1) / m_per_block),
         8,
-        kGroupedBackwardThreads,
+        threads,
         1,
         1,
         0,

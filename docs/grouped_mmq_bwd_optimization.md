@@ -104,6 +104,12 @@ Run the following bounded source A/Bs against the fixed-group baseline:
 
 Profile the best fixed candidates at all three token counts. A candidate is retained only if it improves complete fixed-group latency, including the public layout conversion already required by the contract, with no resource-gate failure or allocation regression. The BF16 BMM comparison remains the reference; the packed kernel does not need to beat BMM to be accepted, but any deficit must be recorded as representation or arithmetic work rather than hidden in dispatch.
 
+P2.1 replaced the generic eight-wave N16/K16 body with an exact-shape four-wave N64/K32 body. M64 measured `10.693/43.965/173.436 ms` and M128 measured `6.400/26.059/101.364 ms`; M128 won every token count. The permitted M256 control then measured `6.237/25.427/97.204 ms`. A warmed sequential 25-repeat control confirmed M256 at `6.155/25.181/97.642 ms` versus M128 at `6.423/26.205/102.159 ms`, gains of 3.91-4.42%. M256 uses 209 VGPRs, 23 SGPRs, 4,096 bytes LDS, zero private bytes, zero spills, and no dynamic stack.
+
+P2.2 tested Q8-specific decode and LDS layouts at retained M256/N64/K32. Width 32 regressed B1/B4/B16 by 2.4-4.3% and raised VGPR use to 216; width 16 remains retained. Four-BF16 XOR swizzling regressed all three points by 3.8-5.1%; the unswizzled layout remains retained. The production body now beats BF16 BMM throughput by 15-24% at all three batches. Artifacts: `/tmp/grouped_mmq_bwd_ds4_q80_tiled_width16.json`, `/tmp/grouped_mmq_bwd_ds4_q80_m64_full.json`, `/tmp/grouped_mmq_bwd_ds4_q80_m128_full.json`, `/tmp/grouped_mmq_bwd_ds4_q80_m256_full.json`, `/tmp/grouped_mmq_bwd_ds4_q80_m256_control_25.json`, `/tmp/grouped_mmq_bwd_ds4_q80_m128_control_25.json`, `/tmp/grouped_mmq_bwd_ds4_q80_m256_w32_full.json`, and `/tmp/grouped_mmq_bwd_ds4_q80_m256_s4_full.json`.
+
+P2.3 replaced numeric forward and grouped-backward wrapper ordinals with Python `ForwardKind`, `GroupedBackwardKind`, and `QuantType` enums plus semantic one-hot compiler defines. Rejected fixed candidates were removed from the settled bundle. All 118 entries rebuilt successfully; the symbolic-selector M256 control measured `6.191/25.217/97.345 ms`. A sequential warmed 25-repeat generic control measured `50.116/210.112/851.591 ms`, so the retained body provides `8.09x`, `8.33x`, and `8.75x` end-to-end speedups. Artifacts: `/tmp/grouped_mmq_bwd_ds4_q80_m256_symbolic_control_25.json` and `/tmp/grouped_mmq_bwd_ds4_q80_generic_control_25.json`.
+
 ### P3: Tune routed IQ2_XXS gate/up backward
 
 Status: P3.1 retained; local decoder/layout controls remain.
@@ -154,7 +160,9 @@ The first Q2_K dispatch candidates are S1 below average 80 rows, S2 at 80-127, a
 
 ### P5: Select DeepSeek routing and fixed-shape dispatch
 
-Status: the first B16 routed matrix is now practical and complete; threshold selection remains.
+Status: P2-P4 production dispatch is selected. IQ2_XXS uses M64/N64 with width-16 decode and swizzle4 at all route sizes. Q2_K uses M64/U1 below `128 * num_groups`, M128/U2 below `512 * num_groups`, and M128/U1 otherwise. Fixed Q8_0 uses M256/N64/K32 with width-16 decode and no swizzle at all target token counts.
+
+The current 27-point source-of-record matrix is `/tmp/grouped_mmq_bwd_ds4_p2_p4_final_full.json`. Fixed Q8_0 wins all three BF16 BMM comparisons at `1.16-1.26x`; IQ2_XXS wins all twelve AITER comparisons at `1.53-2.22x`; Q2_K wins all twelve at `1.06-2.19x`. The same-build Qwen control is `/tmp/grouped_mmq_bwd_qwen_post_symbolic_fixed_control.json`; against the pre-selector control it improves geometric latency by 0.28% and median-point latency by 0.45%, with all 60 correctness checks unchanged.
 
 After P2-P4, create explicit lookup entries keyed by quant type, pair/single/fixed operator, exact `(M, N, K)` geometry, and route bucket. Dispatch may use host-visible `rows`, `num_groups`, shape, and quant type, but must not inspect device offsets or synchronize metadata to the host.
 

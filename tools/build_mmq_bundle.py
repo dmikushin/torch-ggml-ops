@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
+from enum import Enum, IntEnum
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,16 +27,50 @@ WRAPPERS = (
     CSRC / GROUPED_BACKWARD_WRAPPER,
 )
 
-QUANT_TYPES = (
-    ("Q8_0", 8),
-    ("Q2_K", 10),
-    ("Q3_K", 11),
-    ("Q4_K", 12),
-    ("Q5_K", 13),
-    ("Q6_K", 14),
-    ("IQ2_XXS", 16),
-    ("IQ2_S", 22),
-)
+class QuantType(IntEnum):
+    Q8_0 = 8
+    Q2_K = 10
+    Q3_K = 11
+    Q4_K = 12
+    Q5_K = 13
+    Q6_K = 14
+    IQ2_XXS = 16
+    IQ2_S = 22
+
+
+class ForwardKind(Enum):
+    QUANTIZE = "MMQ_BUNDLE_FORWARD_QUANTIZE"
+    DENSE = "MMQ_BUNDLE_FORWARD_DENSE"
+    GROUPED_SERIAL = "MMQ_BUNDLE_FORWARD_GROUPED_SERIAL"
+    GROUPED_ROW_TASK = "MMQ_BUNDLE_FORWARD_GROUPED_ROW_TASK"
+    FIXED_GROUPED = "MMQ_BUNDLE_FORWARD_FIXED_GROUPED"
+    ROW_TASK_SETUP = "MMQ_BUNDLE_FORWARD_ROW_TASK_SETUP"
+
+
+class GroupedBackwardKind(Enum):
+    GENERIC_SINGLE = "MMQ_BUNDLE_GROUPED_BWD_GENERIC_SINGLE"
+    GENERIC_PAIR = "MMQ_BUNDLE_GROUPED_BWD_GENERIC_PAIR"
+    Q4_SINGLE_M64 = "MMQ_BUNDLE_GROUPED_BWD_Q4_SINGLE_M64"
+    Q4_SINGLE_M128 = "MMQ_BUNDLE_GROUPED_BWD_Q4_SINGLE_M128"
+    Q3_PAIR_M64 = "MMQ_BUNDLE_GROUPED_BWD_Q3_PAIR_M64"
+    Q3_PAIR_M128 = "MMQ_BUNDLE_GROUPED_BWD_Q3_PAIR_M128"
+    Q5_SINGLE_M64 = "MMQ_BUNDLE_GROUPED_BWD_Q5_SINGLE_M64"
+    IQ2_S_SINGLE_M64 = "MMQ_BUNDLE_GROUPED_BWD_IQ2_S_SINGLE_M64"
+    IQ2_S_SINGLE_M128 = "MMQ_BUNDLE_GROUPED_BWD_IQ2_S_SINGLE_M128"
+    IQ2_S_PAIR_M64 = "MMQ_BUNDLE_GROUPED_BWD_IQ2_S_PAIR_M64"
+    IQ2_S_PAIR_M128 = "MMQ_BUNDLE_GROUPED_BWD_IQ2_S_PAIR_M128"
+    Q4_ROW_TASK = "MMQ_BUNDLE_GROUPED_BWD_Q4_ROW_TASK"
+    Q5_ROW_TASK = "MMQ_BUNDLE_GROUPED_BWD_Q5_ROW_TASK"
+    IQ2_S_ROW_TASK = "MMQ_BUNDLE_GROUPED_BWD_IQ2_S_ROW_TASK"
+    FIXED_Q8_0_GENERIC = "MMQ_BUNDLE_GROUPED_BWD_FIXED_Q8_0_GENERIC"
+    Q2_K_SINGLE_M64_U1 = "MMQ_BUNDLE_GROUPED_BWD_Q2_K_SINGLE_M64_U1"
+    Q2_K_SINGLE_M128_U1 = "MMQ_BUNDLE_GROUPED_BWD_Q2_K_SINGLE_M128_U1"
+    IQ2_XXS_PAIR_M64 = "MMQ_BUNDLE_GROUPED_BWD_IQ2_XXS_PAIR_M64"
+    Q2_K_SINGLE_M128_U2 = "MMQ_BUNDLE_GROUPED_BWD_Q2_K_SINGLE_M128_U2"
+    FIXED_Q8_0_M256 = "MMQ_BUNDLE_GROUPED_BWD_FIXED_Q8_0_M256"
+
+
+QUANT_TYPES = tuple((quant_type.name, quant_type) for quant_type in QuantType)
 BACKWARD_QUANT_TYPES = tuple(
     item for item in QUANT_TYPES
     if item[0] in {"Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ2_S"}
@@ -79,9 +114,9 @@ def _quant_suffix(name: str) -> str:
 def _forward_spec(
     cpp_id: str,
     suffix: str,
-    kind: int,
+    kind: ForwardKind,
     *,
-    quant_type: int = 0,
+    quant_type: int | QuantType = 0,
     j: int = 0,
     nrows_weight: int = 0,
     blocks_per_weight_row: int = 0,
@@ -93,7 +128,7 @@ def _forward_spec(
     enforce_resource_gate: bool = False,
 ) -> KernelSpec:
     defines = [
-        ("MMQ_BUNDLE_FORWARD_KIND", kind),
+        (kind.value, 1),
         ("MMQ_BUNDLE_QUANT_TYPE", quant_type),
         ("MMQ_BUNDLE_J", j),
         ("MMQ_BUNDLE_NROWS_WEIGHT", nrows_weight),
@@ -121,8 +156,8 @@ def _grouped_forward_specs() -> list[KernelSpec]:
         _forward_spec(
             "GroupedFwdFixedQ80G8K4096J64Full",
             "grouped_fwd_fixed_q8_0_g8_k4096_j64_full",
-            5,
-            quant_type=8,
+            ForwardKind.FIXED_GROUPED,
+            quant_type=QuantType.Q8_0,
             j=64,
             blocks_per_weight_row=16,
             groups=8,
@@ -131,8 +166,8 @@ def _grouped_forward_specs() -> list[KernelSpec]:
         _forward_spec(
             "GroupedFwdFixedQ80G8K4096J64Bounded",
             "grouped_fwd_fixed_q8_0_g8_k4096_j64_bounded",
-            5,
-            quant_type=8,
+            ForwardKind.FIXED_GROUPED,
+            quant_type=QuantType.Q8_0,
             j=64,
             blocks_per_weight_row=16,
             groups=8,
@@ -146,7 +181,7 @@ def _grouped_forward_specs() -> list[KernelSpec]:
             _forward_spec(
                 f"GroupedFwdSerial{label}GenericJ128",
                 f"grouped_fwd_serial_{suffix}_generic_j128",
-                3,
+                ForwardKind.GROUPED_SERIAL,
                 quant_type=quant_type,
                 j=128,
             )
@@ -158,7 +193,7 @@ def _grouped_forward_specs() -> list[KernelSpec]:
             _forward_spec(
                 f"GroupedFwdSerial{label}N512K2048J64",
                 f"grouped_fwd_serial_{suffix}_n512_k2048_j64",
-                3,
+                ForwardKind.GROUPED_SERIAL,
                 quant_type=quant_type,
                 j=64,
                 nrows_weight=512,
@@ -173,7 +208,7 @@ def _grouped_forward_specs() -> list[KernelSpec]:
             _forward_spec(
                 f"GroupedFwdSerial{label}N2048K512J64",
                 f"grouped_fwd_serial_{suffix}_n2048_k512_j64",
-                3,
+                ForwardKind.GROUPED_SERIAL,
                 quant_type=quant_type,
                 j=64,
                 nrows_weight=2048,
@@ -188,7 +223,7 @@ def _grouped_forward_specs() -> list[KernelSpec]:
             _forward_spec(
                 f"GroupedFwdRowTask{label}N512K2048J64",
                 f"grouped_fwd_row_task_{suffix}_n512_k2048_j64",
-                4,
+                ForwardKind.GROUPED_ROW_TASK,
                 quant_type=quant_type,
                 j=64,
                 nrows_weight=512,
@@ -201,8 +236,8 @@ def _grouped_forward_specs() -> list[KernelSpec]:
             _forward_spec(
                 "GroupedFwdSerialIQ2SN2048K512J64J32",
                 "grouped_fwd_serial_iq2_s_n2048_k512_j64_j32",
-                3,
-                quant_type=22,
+                ForwardKind.GROUPED_SERIAL,
+                quant_type=QuantType.IQ2_S,
                 j=64,
                 nrows_weight=2048,
                 blocks_per_weight_row=2,
@@ -212,8 +247,8 @@ def _grouped_forward_specs() -> list[KernelSpec]:
             _forward_spec(
                 "GroupedFwdSerialIQ2XXSN2048K4096J64",
                 "grouped_fwd_serial_iq2_xxs_n2048_k4096_j64",
-                3,
-                quant_type=16,
+                ForwardKind.GROUPED_SERIAL,
+                quant_type=QuantType.IQ2_XXS,
                 j=64,
                 nrows_weight=2048,
                 blocks_per_weight_row=16,
@@ -222,8 +257,8 @@ def _grouped_forward_specs() -> list[KernelSpec]:
             _forward_spec(
                 "GroupedFwdSerialIQ2XXSN2048K4096J80",
                 "grouped_fwd_serial_iq2_xxs_n2048_k4096_j80",
-                3,
-                quant_type=16,
+                ForwardKind.GROUPED_SERIAL,
+                quant_type=QuantType.IQ2_XXS,
                 j=80,
                 nrows_weight=2048,
                 blocks_per_weight_row=16,
@@ -232,8 +267,8 @@ def _grouped_forward_specs() -> list[KernelSpec]:
             _forward_spec(
                 "GroupedFwdSerialQ2KN4096K2048J32",
                 "grouped_fwd_serial_q2_k_n4096_k2048_j32",
-                3,
-                quant_type=10,
+                ForwardKind.GROUPED_SERIAL,
+                quant_type=QuantType.Q2_K,
                 j=32,
                 nrows_weight=4096,
                 blocks_per_weight_row=8,
@@ -243,8 +278,8 @@ def _grouped_forward_specs() -> list[KernelSpec]:
             _forward_spec(
                 "GroupedFwdSerialQ2KN4096K2048J32J16",
                 "grouped_fwd_serial_q2_k_n4096_k2048_j32_j16",
-                3,
-                quant_type=10,
+                ForwardKind.GROUPED_SERIAL,
+                quant_type=QuantType.Q2_K,
                 j=32,
                 nrows_weight=4096,
                 blocks_per_weight_row=8,
@@ -255,8 +290,8 @@ def _grouped_forward_specs() -> list[KernelSpec]:
             _forward_spec(
                 "GroupedFwdSerialQ5KN2048K512J32",
                 "grouped_fwd_serial_q5_k_n2048_k512_j32",
-                3,
-                quant_type=13,
+                ForwardKind.GROUPED_SERIAL,
+                quant_type=QuantType.Q5_K,
                 j=32,
                 nrows_weight=2048,
                 blocks_per_weight_row=2,
@@ -271,7 +306,7 @@ def _grouped_forward_specs() -> list[KernelSpec]:
 def _dense_backward_spec(
     cpp_id: str,
     suffix: str,
-    quant_type: int,
+    quant_type: QuantType,
     n_tiles: int,
     k_iteration: int,
     *,
@@ -317,7 +352,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
 
     def generic(
         label: str,
-        quant_type: int,
+        quant_type: QuantType,
         n_tiles: int,
         group_m: int,
     ) -> None:
@@ -335,10 +370,10 @@ def _dense_backward_specs() -> list[KernelSpec]:
         )
 
     for label, quant_type, variants in (
-        ("Q3_K", 11, ((1, 0), (4, 0), (4, 2), (8, 2), (12, 2), (16, 2))),
-        ("Q4_K", 12, ((1, 0), (4, 0), (8, 2), (12, 2), (16, 2))),
-        ("Q5_K", 13, ((1, 0), (4, 0), (8, 2), (12, 2), (16, 2))),
-        ("IQ2_S", 22, ((1, 0), (4, 0), (4, 2), (12, 2), (16, 2))),
+        ("Q3_K", QuantType.Q3_K, ((1, 0), (4, 0), (4, 2), (8, 2), (12, 2), (16, 2))),
+        ("Q4_K", QuantType.Q4_K, ((1, 0), (4, 0), (8, 2), (12, 2), (16, 2))),
+        ("Q5_K", QuantType.Q5_K, ((1, 0), (4, 0), (8, 2), (12, 2), (16, 2))),
+        ("IQ2_S", QuantType.IQ2_S, ((1, 0), (4, 0), (4, 2), (12, 2), (16, 2))),
     ):
         for n_tiles, group_m in variants:
             generic(label, quant_type, n_tiles, group_m)
@@ -348,7 +383,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
             _dense_backward_spec(
                 "DenseBwdQ3KFullWide",
                 "dense_bwd_q3_k_mt128_nt128_ki32_full_wide",
-                11,
+                QuantType.Q3_K,
                 8,
                 32,
                 group_m=1,
@@ -363,7 +398,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
             _dense_backward_spec(
                 "DenseBwdQ3KFullNarrow",
                 "dense_bwd_q3_k_mt128_nt128_ki32_full_narrow",
-                11,
+                QuantType.Q3_K,
                 8,
                 32,
                 group_m=1,
@@ -377,7 +412,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
             _dense_backward_spec(
                 "DenseBwdQ4KFullK4096",
                 "dense_bwd_q4_k_mt128_nt128_ki32_full_k4096",
-                12,
+                QuantType.Q4_K,
                 8,
                 32,
                 group_m=1,
@@ -392,7 +427,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
             _dense_backward_spec(
                 "DenseBwdQ4KFullK2048",
                 "dense_bwd_q4_k_mt128_nt128_ki32_full_k2048",
-                12,
+                QuantType.Q4_K,
                 8,
                 32,
                 group_m=1,
@@ -407,7 +442,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
             _dense_backward_spec(
                 "DenseBwdQ4KFullK512",
                 "dense_bwd_q4_k_mt128_nt128_ki32_full_k512",
-                12,
+                QuantType.Q4_K,
                 8,
                 32,
                 group_m=1,
@@ -422,7 +457,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
             _dense_backward_spec(
                 "DenseBwdQ5KFullK2048",
                 "dense_bwd_q5_k_mt128_nt128_ki32_full_k2048",
-                13,
+                QuantType.Q5_K,
                 8,
                 32,
                 group_m=1,
@@ -438,7 +473,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
             _dense_backward_spec(
                 "DenseBwdQ5KFullK512",
                 "dense_bwd_q5_k_mt128_nt128_ki32_full_k512",
-                13,
+                QuantType.Q5_K,
                 8,
                 32,
                 group_m=1,
@@ -464,7 +499,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
                     f"DenseBwdQ6KM{rows}{'Full' if full else 'Bounded'}",
                     f"dense_bwd_q6_k_m{rows}_nt{n_tiles * 16}_ki{k_iteration}_"
                     f"{'full' if full else 'bounded'}",
-                    14,
+                    QuantType.Q6_K,
                     n_tiles,
                     k_iteration,
                     group_m=0,
@@ -481,14 +516,14 @@ def _dense_backward_specs() -> list[KernelSpec]:
             _dense_backward_spec(
                 "DenseBwdQ6KNT128KI16G2",
                 "dense_bwd_q6_k_nt128_ki16_g2",
-                14,
+                QuantType.Q6_K,
                 8,
                 16,
             ),
             _dense_backward_spec(
                 "DenseBwdQ6KNT256KI16G2",
                 "dense_bwd_q6_k_nt256_ki16_g2",
-                14,
+                QuantType.Q6_K,
                 16,
                 16,
             ),
@@ -501,8 +536,8 @@ def _dense_backward_specs() -> list[KernelSpec]:
 def _grouped_backward_spec(
     cpp_id: str,
     suffix: str,
-    kind: int,
-    quant_type: int = 0,
+    kind: GroupedBackwardKind,
+    quant_type: int | QuantType = 0,
     enforce_resource_gate: bool = False,
 ) -> KernelSpec:
     return KernelSpec(
@@ -510,7 +545,7 @@ def _grouped_backward_spec(
         suffix,
         GROUPED_BACKWARD_WRAPPER,
         (
-            ("MMQ_BUNDLE_GROUPED_BWD_KIND", kind),
+            (kind.value, 1),
             ("MMQ_BUNDLE_QUANT_TYPE", quant_type),
         ),
         enforce_resource_gate,
@@ -525,7 +560,7 @@ def _grouped_backward_specs() -> list[KernelSpec]:
             _grouped_backward_spec(
                 f"GroupedBwdSingle{label}Generic",
                 f"grouped_bwd_single_{_quant_suffix(quant_name)}_generic",
-                1,
+                GroupedBackwardKind.GENERIC_SINGLE,
                 quant_type,
             )
         )
@@ -535,7 +570,7 @@ def _grouped_backward_specs() -> list[KernelSpec]:
             _grouped_backward_spec(
                 f"GroupedBwdPair{label}Generic",
                 f"grouped_bwd_pair_{_quant_suffix(quant_name)}_generic",
-                2,
+                GroupedBackwardKind.GENERIC_PAIR,
                 quant_type,
             )
         )
@@ -544,108 +579,114 @@ def _grouped_backward_specs() -> list[KernelSpec]:
             _grouped_backward_spec(
                 "GroupedBwdFixedQ80G8K4096",
                 "grouped_bwd_fixed_q8_0_g8_k4096",
-                15,
+                GroupedBackwardKind.FIXED_Q8_0_GENERIC,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdSingleQ2KN4096K2048M64N64",
                 "grouped_bwd_single_q2_k_n4096_k2048_mt64_nt64",
-                16,
+                GroupedBackwardKind.Q2_K_SINGLE_M64_U1,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdSingleQ2KN4096K2048M128N64",
                 "grouped_bwd_single_q2_k_n4096_k2048_mt128_nt64",
-                17,
+                GroupedBackwardKind.Q2_K_SINGLE_M128_U1,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdPairIQ2XXSN2048K4096M64N64",
                 "grouped_bwd_pair_iq2_xxs_n2048_k4096_mt64_nt64",
-                18,
+                GroupedBackwardKind.IQ2_XXS_PAIR_M64,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdSingleQ2KN4096K2048M128N64U2",
                 "grouped_bwd_single_q2_k_n4096_k2048_mt128_nt64_u2",
-                19,
+                GroupedBackwardKind.Q2_K_SINGLE_M128_U2,
+                enforce_resource_gate=True,
+            ),
+            _grouped_backward_spec(
+                "GroupedBwdFixedQ80G8K4096M256N64",
+                "grouped_bwd_fixed_q8_0_g8_k4096_mt256_nt64",
+                GroupedBackwardKind.FIXED_Q8_0_M256,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdSingleQ4KN2048K512M64N64",
                 "grouped_bwd_single_q4_k_n2048_k512_mt64_nt64",
-                3,
+                GroupedBackwardKind.Q4_SINGLE_M64,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdSingleQ4KN2048K512M128N64",
                 "grouped_bwd_single_q4_k_n2048_k512_mt128_nt64",
-                4,
+                GroupedBackwardKind.Q4_SINGLE_M128,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdPairQ3KN512K2048M64N64",
                 "grouped_bwd_pair_q3_k_n512_k2048_mt64_nt64",
-                5,
+                GroupedBackwardKind.Q3_PAIR_M64,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdPairQ3KN512K2048M128N64",
                 "grouped_bwd_pair_q3_k_n512_k2048_mt128_nt64",
-                6,
+                GroupedBackwardKind.Q3_PAIR_M128,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdSingleQ5KN2048K512M64N64",
                 "grouped_bwd_single_q5_k_n2048_k512_mt64_nt64",
-                7,
+                GroupedBackwardKind.Q5_SINGLE_M64,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdSingleIQ2SN2048K512M64N64",
                 "grouped_bwd_single_iq2_s_n2048_k512_mt64_nt64",
-                8,
+                GroupedBackwardKind.IQ2_S_SINGLE_M64,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdSingleIQ2SN2048K512M128N64",
                 "grouped_bwd_single_iq2_s_n2048_k512_mt128_nt64",
-                9,
+                GroupedBackwardKind.IQ2_S_SINGLE_M128,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdPairIQ2SN512K2048M64N64",
                 "grouped_bwd_pair_iq2_s_n512_k2048_mt64_nt64",
-                10,
+                GroupedBackwardKind.IQ2_S_PAIR_M64,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdPairIQ2SN512K2048M128N64",
                 "grouped_bwd_pair_iq2_s_n512_k2048_mt128_nt64",
-                11,
+                GroupedBackwardKind.IQ2_S_PAIR_M128,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdRowTaskQ4KN2048K512M128N128",
                 "grouped_bwd_row_task_q4_k_n2048_k512_mt128_nt128",
-                12,
+                GroupedBackwardKind.Q4_ROW_TASK,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdRowTaskQ5KN2048K512M128N128",
                 "grouped_bwd_row_task_q5_k_n2048_k512_mt128_nt128",
-                13,
+                GroupedBackwardKind.Q5_ROW_TASK,
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
                 "GroupedBwdRowTaskIQ2SN2048K512M128N128",
                 "grouped_bwd_row_task_iq2_s_n2048_k512_mt128_nt128",
-                14,
+                GroupedBackwardKind.IQ2_S_ROW_TASK,
                 enforce_resource_gate=True,
             ),
         )
     )
-    assert len(specs) == 31
+    assert len(specs) == 32
     return specs
 
 
@@ -654,22 +695,22 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
         _forward_spec(
             "QuantizeQ81D4",
             "quantize_bf16_q8_1_d4",
-            1,
-            quant_type=8,
+            ForwardKind.QUANTIZE,
+            quant_type=QuantType.Q8_0,
             enforce_resource_gate=True,
         ),
         _forward_spec(
             "QuantizeQ81DS4",
             "quantize_bf16_q8_1_ds4",
-            1,
-            quant_type=12,
+            ForwardKind.QUANTIZE,
+            quant_type=QuantType.Q4_K,
             enforce_resource_gate=True,
         ),
         _forward_spec(
             "QuantizeQ81D2S6",
             "quantize_bf16_q8_1_d2s6",
-            1,
-            quant_type=10,
+            ForwardKind.QUANTIZE,
+            quant_type=QuantType.Q2_K,
             enforce_resource_gate=True,
         ),
     ]
@@ -679,7 +720,7 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
             _forward_spec(
                 f"DenseFwd{label}J128",
                 f"dense_fwd_{_quant_suffix(quant_name)}_j128",
-                2,
+                ForwardKind.DENSE,
                 quant_type=quant_type,
                 j=128,
             )
@@ -688,8 +729,8 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
         _forward_spec(
             "DenseFwdQ6KJ64",
             "dense_fwd_q6_k_j64",
-            2,
-            quant_type=14,
+            ForwardKind.DENSE,
+            quant_type=QuantType.Q6_K,
             j=64,
             enforce_resource_gate=True,
         )
@@ -698,13 +739,13 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
         _forward_spec(
             "GroupedRowTaskSetup",
             "grouped_row_task_setup",
-            6,
+            ForwardKind.ROW_TASK_SETUP,
         )
     )
     specs.extend(_grouped_forward_specs())
     specs.extend(_dense_backward_specs())
     specs.extend(_grouped_backward_specs())
-    assert len(specs) == 117
+    assert len(specs) == 118
     assert len({spec.cpp_id for spec in specs}) == len(specs)
     assert len({spec.symbol for spec in specs}) == len(specs)
     return tuple(specs)

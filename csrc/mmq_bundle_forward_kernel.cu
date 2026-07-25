@@ -11,11 +11,7 @@
 #ifndef MMQ_BUNDLE_KERNEL_SYMBOL
 #error "MMQ_BUNDLE_KERNEL_SYMBOL must name the exported kernel"
 #endif
-#ifndef MMQ_BUNDLE_FORWARD_KIND
-#error "MMQ_BUNDLE_FORWARD_KIND must select a forward kernel family"
-#endif
-
-#if MMQ_BUNDLE_FORWARD_KIND == 1
+#if defined(MMQ_BUNDLE_FORWARD_QUANTIZE)
 
 #ifndef MMQ_BUNDLE_QUANT_TYPE
 #error "quantize kernels require MMQ_BUNDLE_QUANT_TYPE"
@@ -33,7 +29,7 @@ void MMQ_BUNDLE_KERNEL_SYMBOL(
             input, output, rows, rows_padded, k);
 }
 
-#elif MMQ_BUNDLE_FORWARD_KIND == 2
+#elif defined(MMQ_BUNDLE_FORWARD_DENSE)
 
 #ifndef MMQ_BUNDLE_QUANT_TYPE
 #error "dense forward kernels require MMQ_BUNDLE_QUANT_TYPE"
@@ -62,7 +58,7 @@ void MMQ_BUNDLE_KERNEL_SYMBOL(
             blocks_per_weight_row);
 }
 
-#elif MMQ_BUNDLE_FORWARD_KIND == 3
+#elif defined(MMQ_BUNDLE_FORWARD_GROUPED_SERIAL)
 
 #ifndef MMQ_BUNDLE_QUANT_TYPE
 #error "grouped serial kernels require MMQ_BUNDLE_QUANT_TYPE"
@@ -106,7 +102,7 @@ void MMQ_BUNDLE_KERNEL_SYMBOL(
             bytes_per_expert);
 }
 
-#elif MMQ_BUNDLE_FORWARD_KIND == 4
+#elif defined(MMQ_BUNDLE_FORWARD_GROUPED_ROW_TASK)
 
 #ifndef MMQ_BUNDLE_QUANT_TYPE
 #error "grouped row-task kernels require MMQ_BUNDLE_QUANT_TYPE"
@@ -148,7 +144,7 @@ void MMQ_BUNDLE_KERNEL_SYMBOL(
             bytes_per_expert);
 }
 
-#elif MMQ_BUNDLE_FORWARD_KIND == 5
+#elif defined(MMQ_BUNDLE_FORWARD_FIXED_GROUPED)
 
 #ifndef MMQ_BUNDLE_J
 #error "fixed grouped kernels require MMQ_BUNDLE_J"
@@ -184,7 +180,7 @@ void MMQ_BUNDLE_KERNEL_SYMBOL(
             bytes_per_group);
 }
 
-#elif MMQ_BUNDLE_FORWARD_KIND == 6
+#elif defined(MMQ_BUNDLE_FORWARD_ROW_TASK_SETUP)
 
 extern "C" __launch_bounds__(256, 1) __global__
 void MMQ_BUNDLE_KERNEL_SYMBOL(
@@ -212,5 +208,5 @@ void MMQ_BUNDLE_KERNEL_SYMBOL(
 }
 
 #else
-#error "unsupported MMQ_BUNDLE_FORWARD_KIND"
+#error "a symbolic MMQ bundle forward selector is required"
 #endif
