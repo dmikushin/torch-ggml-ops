@@ -953,6 +953,35 @@ Reject any candidate that introduces private arrays, spills, dynamic stack, or a
 
 DB3 acceptance requires the complete ordinary DeepSeek matrix and a Qwen control. A shared helper change must also show unchanged Qwen normalized ISA or pass the complete Qwen performance matrix.
 
+DB3 result: row-dependent padding retained; other local lowering controls rejected or already emitted by the compiler.
+
+Artifacts:
+
+```text
+/tmp/rocprof-mmq-bwd-db2-qa
+/tmp/rocprof-mmq-bwd-db2-qb
+/tmp/rocprof-mmq-bwd-db2-output
+/tmp/rocprof-mmq-bwd-db3-qa-padding8
+/tmp/mmq_bwd_ds4_p3_qa_prefetch_control_before_25.json
+/tmp/mmq_bwd_ds4_p3_qa_prefetch_candidate_25.json
+/tmp/mmq_bwd_ds4_p3_qa_prefetch_control_after_25.json
+/tmp/mmq_bwd_ds4_p3_padding_selected_control_before_25.json
+/tmp/mmq_bwd_ds4_p3_padding_selected_candidate_25.json
+/tmp/mmq_bwd_ds4_p3_padding_selected_control_after_25.json
+/tmp/mmq_bwd_ds4_p3_final_9.json
+/tmp/mmq_bwd_qwen_post_ds4_p3_control_9.json
+```
+
+The unpadded G2 profile reported `79.17%` LDS bank conflict on Q-A, Q-B, and output-B. Q-A's short B1 body also reported about `585` cycles derived LDS latency and `24.19%` ALU stall from LDS, while the longer Q-B/output-B bodies reported only `0.73%/0.20%` LDS-driven ALU stall and low `11-18%` L2 hit rates. Normalized inspection found that the exact body already carries affine reduction state and emits one `global_load_b128` for each width-16 Q8 payload, so source-level address carries and an explicit fixed vector loader would not add a new lowering mechanism.
+
+Paired LDS-fragment prefetch retained the same 192 VGPRs and 8 KiB LDS but changed Q-A by approximately `-1.26%`, `-0.74%`, and `+0.11%` at B1/B4/B16 in its 25-repeat bracket. It is rejected.
+
+Eight-BF16 row padding changes the K32 LDS stride from 64 to 80 bytes. It retains 192 VGPRs, raises LDS from 8 to 10 KiB, and keeps zero private storage/spills and no dynamic stack. On Q-A B1 it reduced bank conflict from `79.17%` to `58.33%`, derived LDS latency from about `585` to `245` cycles, and LDS-driven ALU stall from `24.19%` to `15.26%`, while occupancy remained approximately `43%`.
+
+The complete 25-repeat bracket retains padding for Q-A and shared gate/up through 8,192 rows, Q-B/output-B/shared-down at 2,048 rows, and KV at all three production row counts. Retained gains are `6.17-31.69%`; KV B16 is the smallest at `2.20%`. Padding is neutral at other points except shared-down B4, where it regresses `2.63%` and remains unpadded. Checkpoint-weighted ordinary latency improves `20.78%` at B1 and `1.02%` at B4, with B16 effectively unchanged.
+
+The final DeepSeek matrix preserves the established Q8_0 correctness envelope. The complete Qwen control preserves its accepted wide-query, narrow-Q3_K, attention-output, and Q6_K behavior; shared-down Q4_K/Q5_K remain the only material deficits. No shared Qwen kernel semantics changed. Width32 remains closed because generated ISA already vector-loads the 16-byte payload and profiling did not identify repeated scale loads as the selected bottleneck.
+
 ### DB4: DeepSeek LM-head row geometry
 
 Tune LM head separately from ordinary M because its public row count is a loss-scheduler chunk. Keep the DB1 exact `(N,K)=(129280,4096)` body and compare row ownership at:
