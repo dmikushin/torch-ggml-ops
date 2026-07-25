@@ -17,6 +17,7 @@ DEFAULT_MODEL = Path(
         os.path.expanduser("~/models/qwen3.6/Qwen3.6-35B-A3B-APEX-I-Mini.gguf"),
     )
 )
+MODEL_FAMILY_CHOICES = ("auto", "qwen", "deepseek")
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,8 @@ class WeightCase:
     priority: str
     description: str
     lm_head: bool = False
+    model_family: str = "qwen"
+    expected_quant_type: str | None = None
 
 
 # One real checkpoint tensor represents each (N, K, quant_type) combination
@@ -119,6 +122,89 @@ CASES = (
     ),
 )
 
+DEEPSEEK_FORWARD_CASES = (
+    WeightCase(
+        "ds4_attn_q_a_q8_0",
+        "blk.0.attn_q_a.weight",
+        1024,
+        4096,
+        43,
+        "primary",
+        "attention query A projection",
+        model_family="deepseek",
+        expected_quant_type="Q8_0",
+    ),
+    WeightCase(
+        "ds4_attn_q_b_q8_0",
+        "blk.0.attn_q_b.weight",
+        32768,
+        1024,
+        43,
+        "primary",
+        "attention query B projection",
+        model_family="deepseek",
+        expected_quant_type="Q8_0",
+    ),
+    WeightCase(
+        "ds4_attn_kv_q8_0",
+        "blk.0.attn_kv.weight",
+        512,
+        4096,
+        43,
+        "primary",
+        "attention key/value projection",
+        model_family="deepseek",
+        expected_quant_type="Q8_0",
+    ),
+    WeightCase(
+        "ds4_attn_output_b_q8_0",
+        "blk.0.attn_output_b.weight",
+        4096,
+        8192,
+        43,
+        "primary",
+        "attention output B projection",
+        model_family="deepseek",
+        expected_quant_type="Q8_0",
+    ),
+    WeightCase(
+        "ds4_shared_gate_up_q8_0",
+        "blk.0.ffn_gate_shexp.weight",
+        2048,
+        4096,
+        86,
+        "primary",
+        "shared-expert gate/up geometry",
+        model_family="deepseek",
+        expected_quant_type="Q8_0",
+    ),
+    WeightCase(
+        "ds4_shared_down_q8_0",
+        "blk.0.ffn_down_shexp.weight",
+        4096,
+        2048,
+        43,
+        "primary",
+        "shared-expert down projection",
+        model_family="deepseek",
+        expected_quant_type="Q8_0",
+    ),
+    WeightCase(
+        "ds4_lm_head_q8_0",
+        "output.weight",
+        129280,
+        4096,
+        1,
+        "primary",
+        "chunked language-model head",
+        lm_head=True,
+        model_family="deepseek",
+        expected_quant_type="Q8_0",
+    ),
+)
+
+FORWARD_CASES = CASES + DEEPSEEK_FORWARD_CASES
+
 
 def parse_int_list(value: str) -> tuple[int, ...]:
     result = tuple(int(item.strip()) for item in value.split(",") if item.strip())
@@ -200,8 +286,22 @@ def load_packed_tensor(tensor: gguf.ReaderTensor) -> torch.Tensor:
     return packed
 
 
-def select_cases(case_names: str, primary_only: bool) -> tuple[WeightCase, ...]:
-    by_name = {case.name: case for case in CASES}
+def resolve_model_family(
+    requested: str,
+    tensor_names: set[str],
+) -> tuple[str, str]:
+    detected = (
+        "deepseek" if "blk.0.attn_output_a.weight" in tensor_names else "qwen"
+    )
+    return (detected if requested == "auto" else requested), detected
+
+
+def _select_cases(
+    case_names: str,
+    primary_only: bool,
+    available_cases: tuple[WeightCase, ...],
+) -> tuple[WeightCase, ...]:
+    by_name = {case.name: case for case in available_cases}
     if case_names:
         names = tuple(name.strip() for name in case_names.split(",") if name.strip())
         unknown = sorted(set(names) - set(by_name))
@@ -211,9 +311,26 @@ def select_cases(case_names: str, primary_only: bool) -> tuple[WeightCase, ...]:
             )
         cases = tuple(by_name[name] for name in names)
     else:
-        cases = CASES
+        cases = available_cases
     if primary_only:
         cases = tuple(case for case in cases if case.priority == "primary")
     if not cases:
         raise ValueError("no benchmark cases selected")
     return cases
+
+
+def select_cases(case_names: str, primary_only: bool) -> tuple[WeightCase, ...]:
+    """Select the established Qwen cases used by dense backward."""
+
+    return _select_cases(case_names, primary_only, CASES)
+
+
+def select_forward_cases(
+    case_names: str,
+    primary_only: bool,
+    model_family: str,
+) -> tuple[WeightCase, ...]:
+    available_cases = tuple(
+        case for case in FORWARD_CASES if case.model_family == model_family
+    )
+    return _select_cases(case_names, primary_only, available_cases)

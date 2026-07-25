@@ -2,9 +2,10 @@
 """Benchmark production dense MMQ forward shapes against BF16 hipBLASLt.
 
 The benchmark reads representative packed tensors directly from the Qwen3.6
-GGUF checkpoint. Ordinary projections are measured at sequence length 2048 and
-batch sizes 1, 4, and 16. The packed LM head is measured at bounded token chunk
-sizes because production training never retains full-sequence logits.
+or DeepSeek-V4-Flash GGUF checkpoint. Ordinary projections are measured at
+sequence length 2048 and batch sizes 1, 4, and 16. The packed LM head is
+measured at bounded token chunk sizes because production training never retains
+full-sequence logits.
 
 MMQ uses BF16 input, an internal Q8_1 activation workspace, packed uint8 GGUF
 weights, and BF16 output. The reference uses the same BF16 input and the same
@@ -22,12 +23,14 @@ import gguf
 import torch
 from mmq_benchmark_common import (
     DEFAULT_MODEL,
+    MODEL_FAMILY_CHOICES,
     cuda_event_times_ms,
     incremental_peak_bytes,
     load_packed_tensor,
     make_bf16_input,
     parse_int_list,
-    select_cases,
+    resolve_model_family,
+    select_forward_cases,
     summarize_timing,
     synchronize,
 )
@@ -41,6 +44,12 @@ DEFAULT_OUTPUT = Path("/tmp/torch_ggml_ops_mmq_fwd_benchmark.json")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--model-family",
+        choices=MODEL_FAMILY_CHOICES,
+        default="auto",
+        help="case family; auto detects DeepSeek from attn_output_a",
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--sequence-length", type=int, default=2048)
     parser.add_argument("--batches", type=parse_int_list, default=(1, 4, 16))
@@ -180,8 +189,11 @@ def main() -> None:
     reader = gguf.GGUFReader(args.model)
     tensors = {tensor.name: tensor for tensor in reader.tensors}
     quant_names = {int(value): value.name for value in gguf.GGMLQuantizationType}
+    model_family, detected_model_family = resolve_model_family(
+        args.model_family, set(tensors)
+    )
 
-    cases = select_cases(args.cases, args.primary_only)
+    cases = select_forward_cases(args.cases, args.primary_only, model_family)
     missing = [case.tensor_name for case in cases if case.tensor_name not in tensors]
     if missing:
         raise RuntimeError(f"checkpoint is missing benchmark tensors: {missing}")
@@ -195,6 +207,9 @@ def main() -> None:
             "hip_version": torch.version.hip,
         },
         "configuration": {
+            "model_family": model_family,
+            "detected_model_family": detected_model_family,
+            "requested_model_family": args.model_family,
             "sequence_length": args.sequence_length,
             "batches": list(args.batches),
             "lm_head_chunks": list(args.lm_head_chunks),
@@ -215,7 +230,11 @@ def main() -> None:
         f"torch={torch.__version__} hip={torch.version.hip}",
         flush=True,
     )
-    print(f"model={args.model}", flush=True)
+    print(
+        f"model={args.model} family={model_family} "
+        f"detected={detected_model_family}",
+        flush=True,
+    )
 
     with torch.inference_mode():
         for case_index, case in enumerate(cases):
@@ -232,6 +251,14 @@ def main() -> None:
 
             quant_type = int(tensor.tensor_type)
             quant_name = quant_names.get(quant_type, str(quant_type))
+            if (
+                case.expected_quant_type is not None
+                and quant_name != case.expected_quant_type
+            ):
+                raise RuntimeError(
+                    f"{case.tensor_name} has quant type {quant_name}, expected "
+                    f"{case.expected_quant_type}"
+                )
             physical_shape = tuple(int(value) for value in tensor.data.shape)
             packed_weight = load_packed_tensor(tensor)
             if packed_weight.dtype != torch.uint8 or not packed_weight.is_contiguous():

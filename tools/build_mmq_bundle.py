@@ -651,6 +651,7 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
                 ForwardKind.DENSE,
                 quant_type=quant_type,
                 j=128,
+                enforce_resource_gate=quant_type == QuantType.Q8_0,
             )
         )
     specs.append(

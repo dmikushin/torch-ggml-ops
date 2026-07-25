@@ -7,11 +7,11 @@ This document covers dense `torch_ggml_ops::mmq` forward on gfx1151.
 Included:
 - BF16 activations.
 - internal Q8_1 activation quantization.
-- current packed GGUF Q3_K, Q4_K, Q5_K, Q6_K, and IQ2_S weights.
-- planned packed GGUF Q8_0 DeepSeek-V4-Flash weights.
+- packed GGUF Q3_K, Q4_K, Q5_K, Q6_K, IQ2_S, and Q8_0 weights.
+- the DeepSeek-V4-Flash persistent ordinary Q8_0 projections.
 - BF16 outputs.
-- the 160 ordinary model projections.
-- the packed Q6_K language-model head.
+- the 160 ordinary Qwen projections and packed Q6_K language-model head.
+- the 301 ordinary DeepSeek Q8_0 projections and packed Q8_0 language-model head.
 - production batch sizes 1, 4, and 16 at sequence length 2048.
 
 Excluded:
@@ -25,21 +25,25 @@ The grouped path shares the rewritten activation quantizer but now has its own i
 
 ## Current status
 
-Dense forward optimization is complete for the current Qwen fused packed representation and all retained source is committed. This completion claim does not include the planned DeepSeek-V4-Flash `Q8_0` workload described below.
+Dense forward optimization is complete for the current Qwen fused packed representation and all retained source is committed. DeepSeek-V4-Flash dense `Q8_0` correctness support and benchmark coverage are implemented, but its production dispatch is not tuned.
 
 Done:
 - replaced the excessive small-workgroup Q8_1 launch with one 512-thread workgroup per real activation row.
 - added compile-time row-tile selection and retained `J=64` only for the 64-row Q6_K fallback.
 - kept the measured ordinary `I=64, J=128`, 128-thread geometry.
 - validated zero private segment for the retained quantizer and dense forward specializations.
-- selected 256 rows as the production LM-head loss chunk at the scheduling layer.
+- selected 256 rows as the production Qwen LM-head loss chunk at the scheduling layer.
+- validated all seven persistent ordinary DeepSeek `Q8_0` geometries against independent GGUF dequantization through the direct packed-weight path.
+- added model-family-aware dense-forward benchmark cases without flattening the fixed eight-group output-A projection into dense semantics.
 
 The source-of-record benchmark remains `/tmp/mmq_fwd_final_full.json`. The production LM-head decision must be evaluated with the complete loss loop: its M=256 forward call is slower than BF16 in isolation, but the 2,048-row packed loss is faster because M=256 sharply reduces call count and uses the optimized backward kernel.
 
-Remaining work for the current Qwen workload is architectural rather than another broad fused-kernel sweep:
+Remaining Qwen work is architectural rather than another broad fused-kernel sweep:
 - reuse Q8_1 activation workspaces across same-input projections.
 - change the Q6_K M=256 representation or accumulator organization if a new dense-forward project is authorized.
 - consider cross-call decoded-weight reuse or a transient project-owned decoded dense stage.
+
+DeepSeek optimization is intentionally deferred. It still requires production M/N/K timing, shape and chunk dispatch, shared gate/up workspace reuse, and complete packed-loss-loop selection for the Q8_0 LM head.
 
 ## Hardware and measurement rules
 
@@ -113,9 +117,9 @@ production chunk M = 256
 
 Comparison chunks are `M = 64, 128, 256`.
 
-## Planned DeepSeek-V4-Flash expansion
+## DeepSeek-V4-Flash expansion
 
-Status: not implemented or tuned. The target remains gfx1151 with sequence length 2,048 and physical batch sizes 1, 4, and 16. Batch coverage is part of the production contract, not a gradient-accumulation substitute.
+Status: correctness implementation and workload coverage are complete; optimization is deferred. The target remains gfx1151 with sequence length 2,048 and physical batch sizes 1, 4, and 16. Batch coverage is part of the production contract, not a gradient-accumulation substitute.
 
 For full-sequence dense projections:
 
@@ -125,7 +129,7 @@ For full-sequence dense projections:
 | 4 | 8,192 |
 | 16 | 32,768 |
 
-Add dense `Q8_0` forward support for every persistent ordinary matrix in DeepSeek-V4-Flash:
+The generic dense `Q8_0` specialization now covers every persistent ordinary matrix in DeepSeek-V4-Flash:
 
 | Family | `(N, K)` | GGUF type | Tensors | Forward execution |
 | --- | ---: | --- | ---: | --- |
@@ -139,13 +143,18 @@ Add dense `Q8_0` forward support for every persistent ordinary matrix in DeepSee
 
 The LM-head chunk candidates are `M = 32, 64, 128, 256, 512`. Tune them by complete packed-loss-loop time and peak allocation separately at physical batch sizes 1, 4, and 16; isolated MMQ throughput is not sufficient.
 
-The forward contract is:
+The implemented correctness contract is:
 - BF16 input and output.
-- Q8_1 dynamic activation quantization unless a direct BF16/Q8_0 path wins the complete operator benchmark.
+- Q8_1 dynamic activation quantization.
 - direct packed `Q8_0` decode with no logical weight materialization.
+- runtime M/N/K coverage through the existing dense specialization.
+- independent GGUF-reference tests for all seven ordinary projection families.
+
+The deferred optimization contract is:
 - one reusable Q8_1 activation workspace for each shared gate/up pair.
 - explicit production lookup entries keyed by quant type, `(M, N, K)` geometry, direction, and batch/chunk bucket.
-- correctness, allocation, and event-timed benchmarks for all three physical batch sizes.
+- allocation and event-timed benchmarks for all three physical batch sizes.
+- complete packed-loss-loop selection for the LM-head chunk.
 
 The complete new quant inventory also contains routed `IQ2_XXS` gate/up weights and routed `Q2_K` down weights. Those types are not dense-MMQ targets; their exact expert shapes and schedules are specified in `docs/grouped_mmq_fwd_optimization.md`. The frozen eight-group output-A projection is also handled by the grouped plan rather than flattened into dense `(8192, 4096)` semantics.
 
