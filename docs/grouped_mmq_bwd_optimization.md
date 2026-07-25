@@ -182,7 +182,7 @@ The Qwen final matrix identifies the work precisely:
 
 - single-down Q4_K: 1/12 wins, median packed/AITER throughput near `0.86x`, 18 layers, arithmetic bodies around 10-11 ms at large routed batches;
 - single-down IQ2_S: 3/12 wins, median near `0.93x`, 20 layers, with the most visible small/nonuniform deficit;
-- single-down Q5_K: only two edge layers, several 1.8-2.7% bundle regressions, and a 256-VGPR row-task kernel; defer unless a shared representation experiment covers it without additional live state;
+- single-down Q5_K: only two edge layers; P6 retains a body-specific swizzle that removes the 256-VGPR row-task pressure and improves every B4/B16 route, while the B1 body remains a representation control;
 - fused Q3_K and IQ2_S pairs: 24/24 wins and checkpoint-weighted advantage; keep as non-regression controls rather than retuning targets.
 
 Do not restart the closed local neighborhoods: Qwen already rejected universal S2, `M=256,N=64` IQ2_S reuse, N-major tasks, fixed 1,024-program persistence, runtime full/tail branching, split task lists, IQ2_S width 8, and broad swizzle/prefetch changes. The same logs also close J128/I128, K64, two-LDS, GSU, split-K, grouped Stream-K, direct-to-VGPR, and compiler-managed local-array prefetch without new profiler evidence.
@@ -206,7 +206,13 @@ If P6 confirms decode cost, move to representations that reduce repeated work ra
 3. **Cross-call active-expert reuse.** The same expert weights recur across forward and backward projections and across tokens. Test reuse at the layer or model-call lifetime, preserving only active-expert sparsity where possible. Measure both a cold call and a steady-state sequence; a cache that wins only after an unbounded warm-up is not a production result.
 4. **Reusable device task/decode metadata.** If route metadata is stable for several projections, persist row tasks and packed tile descriptors on device. Measure the creation cost once and amortized cost across the paired gate/up call. Do not persist a fixed 1,024-program traversal or split full/tail lists merely to avoid a small builder; previous controls rejected those behaviors.
 
-The representation work must cover Qwen Q4_K and IQ2_S first because their call counts and deficits are largest. Run Q2_K and IQ2_XXS through the same design only after their DeepSeek local baseline identifies a material decode deficit. Q8_0 is already compact, so prioritize a tile-friendly lossless layout or reuse rather than a BF16 decode cache.
+P7.1 rejects a transient BF16 stage. `--transient-bf16-control` in `bench/benchmark_grouped_mmq_bwd.py` allocates and writes the active-expert BF16 workspace, then runs the same AITER stage, but deliberately omits packed reads and decode arithmetic. This is an optimistic floor, not a production implementation. For uniform Q4_K and IQ2_S it requires 512 MiB of weight workspace per projection and 528-768 MiB incremental peak allocation including output. The floor loses to packed MMQ at all six B1/B4/B16 points: IQ2_S is 1.15-1.34x slower and Q4_K is 1.08-1.60x slower. A real decoder must add packed reads and extraction, so the transient path is closed. Artifact: `/tmp/grouped_mmq_bwd_qwen_transient_bf16_floor.json`.
+
+P7.2 rejects a hidden persistent BF16 shadow after an explicit memory/latency decision. One 256-expert `2048 x 512` projection is 512 MiB in BF16. The remaining IQ2_S and Q4_K down tensors require 19 GiB across their 20 and 18 layers; shadowing all benchmarked Qwen expert projections requires 60 GiB. This expands IQ2_S by 6.24x and Q4_K by 3.56x over GGUF storage. The ideal already-dequantized AITER upper bound saves only 22.1 ms model-wide at B1 and 43.9 ms at B4 for the two down families, then loses 401.1 ms at B16. Routes touch 192-256 of 256 experts, and each layer weight has one backward call, so an active-expert cache does not materially reduce residency or gain intra-backward reuse.
+
+A compact integer-plus-scale cache remains a separate model-owned representation project, not a hidden operator optimization. The packed GGUF tensor is already the authoritative lossless cache; a second tile-major representation needs an explicit prepare API, storage lifetime, mutation/version invalidation, forward/backward sharing, and model-load memory policy. The current operator receives only a packed tensor and cannot safely infer those ownership rules. Reusing forward decode until backward would retain caches across the full layer stack. Reusable route tasks are also closed: measured setup is approximately 0.004 ms, far below decode arithmetic.
+
+DeepSeek does not justify representation expansion. The final packed IQ2_XXS and Q2_K bodies beat ideal predecoded AITER at every point, and fixed Q8_0 beats BF16 BMM at every batch. Any transient or persistent decoded stage starts from a slower arithmetic upper bound before adding storage.
 
 ### P8: Acceptance, regression, and handoff
 
@@ -218,6 +224,12 @@ Every retained candidate must pass all of these gates:
 - **Performance:** complete public latency including task construction, decode, workspace, and layout conversion; arithmetic-only timing for diagnosis; allocation growth; packed-versus-AITER comparison; and checkpoint-weighted estimates. A candidate must show a repeatable material gain on its target family, with no repeatable regression in the full Qwen controls or DeepSeek matrix.
 - **Reproducibility:** fresh 9-repeat matrix followed by sequential 25-repeat controls for movements above 1%; no concurrent GPU activity; same-build bundle artifacts; all-CPU-core compilation; and source-only packaging checks.
 - **Scope:** preserve the route ABI, no CPU metadata descriptors or `.item()`, no hidden synchronization, no changes under `csrc/vendor/llama_cpp/*`, no direct hipBLASLt linkage, and no permanent full BF16 shadow copy without an explicit memory/latency decision.
+
+P8 completed with the concrete 118-entry bundle. Generated concrete wrappers, typed Python configuration, C++ `constexpr` controls, and explicit template arguments produce HSACOs that are byte-for-byte identical to all 118 symbolic-selector controls; normalized assembly and SGPR/VGPR/LDS/private/spill/stack metadata also match for every entry. Two independent all-core builds pass `--verify-reproducible`. The source sdist contains both generator modules and no HSACOs. Commit `ac60c9f` retains this infrastructure.
+
+The earlier broad Qwen control had five B1 points move by more than 1%. A rebuilt `ff99b64` control proves the selected IQ2_S, Q4_K, and Q5_K M64 artifacts are byte-identical to production. Sequential warmed 25-repeat identical-binary runs still range from -2.21% to +0.61%, confirming timing variance rather than an ISA regression. Artifacts: `/tmp/grouped_mmq_bwd_qwen_short_identical_control_a_25.json` and `/tmp/grouped_mmq_bwd_qwen_short_identical_control_b_25.json`.
+
+Final acceptance artifacts are `/tmp/grouped_mmq_bwd_qwen_final_acceptance.json` and `/tmp/grouped_mmq_bwd_ds4_final_acceptance.json`. Qwen fused Q3_K/IQ2_S pairs win all 24 AITER points by 1.43-2.99x. DeepSeek wins all 27 references: fixed Q8_0 by 1.17-1.23x, routed IQ2_XXS by 1.51-2.22x, and routed Q2_K by 1.07-2.15x. The remaining Qwen single-down deficit is documented as packed-representation decode cost; local geometry, task, LDS, swizzle, prefetch, and transient-dense neighborhoods are closed.
 
 Suggested retention rule: accept a local candidate only when it improves at least one long-running or high-call target by 2% or more in a sequential control, does not regress its family controls by more than 1%, preserves all resource gates, and does not worsen the checkpoint-weighted estimate. A dispatch threshold may trade individual route buckets only when the complete weighted matrix improves and no sparse or boundary contract is lost.
 
@@ -310,9 +322,9 @@ The production sequence length is 2,048 and top-k is 8.
 
 ### DeepSeek-V4-Flash expansion
 
-Status: implemented and correctness-tested; not yet production-dispatched or tuned. DeepSeek introduces two routed expert formats and one semantically distinct fixed-group projection. All three require production configurations for physical batch sizes 1, 4, and 16 at sequence length 2,048.
+Status: implemented, correctness-tested, production-dispatched, and tuned for physical batch sizes 1, 4, and 16. DeepSeek introduces two routed expert formats and one semantically distinct fixed-group projection.
 
-The current tests use real checkpoint tensors, independent Transformers GGUF dequantization, routed single and pair input-gradient references, and fixed-group output-A input-gradient references. They cover the new operators at a small physical sample; production matrices and optimization evidence remain future work.
+Tests use real checkpoint tensors, independent Transformers GGUF dequantization, routed single and pair input-gradient references, and fixed-group output-A input-gradient references. The final 27-point production matrix covers uniform, skewed, sparse, boundary, and fixed-group workloads; retained dispatch and optimization evidence are recorded in P2-P5 and P8.
 
 | Workload | Forward weight per group/expert `(N, K)` | Backward GEMM | GGUF type | Tensors | Operator |
 | --- | ---: | --- | --- | ---: | --- |

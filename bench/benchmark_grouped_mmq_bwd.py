@@ -85,6 +85,14 @@ def parse_args() -> argparse.Namespace:
         help="comma-separated case names; empty selects every production case",
     )
     parser.add_argument("--primary-only", action="store_true")
+    parser.add_argument(
+        "--transient-bf16-control",
+        action="store_true",
+        help=(
+            "time an optimistic transient representation floor: allocate and "
+            "write active-expert BF16 workspace, then run AITER, without decode"
+        ),
+    )
     args = parser.parse_args()
 
     if not args.model.is_file():
@@ -184,6 +192,31 @@ def aiter_grouped_pair(
         second_grad_output, second_selected_logical_weight, group_sizes, config
     )
     return torch.add(first_grad_input, second_grad_input)
+
+
+def transient_bf16_materialization_floor(
+    grad_outputs: tuple[torch.Tensor, ...],
+    selected_logical_weights: tuple[torch.Tensor, ...],
+    group_sizes: torch.Tensor,
+    config: dict[str, int],
+) -> torch.Tensor:
+    materialized = tuple(
+        torch.empty_like(weight).zero_() for weight in selected_logical_weights
+    )
+    if len(materialized) == 1:
+        return aiter_grouped_single(
+            grad_outputs[0], materialized[0], group_sizes, config
+        )
+    if len(materialized) == 2:
+        return aiter_grouped_pair(
+            grad_outputs[0],
+            grad_outputs[1],
+            materialized[0],
+            materialized[1],
+            group_sizes,
+            config,
+        )
+    raise ValueError("transient BF16 control supports one or two projections")
 
 
 def dense_grouped_single_reference(
@@ -562,6 +595,8 @@ def main() -> None:
         tensors,
     )
     cases = select_cases(args.cases, args.primary_only, model_family)
+    if args.transient_bf16_control and any(not case.routed for case in cases):
+        raise ValueError("--transient-bf16-control requires routed cases")
     quant_names = {int(value): value.name for value in gguf.GGMLQuantizationType}
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
 
@@ -616,6 +651,13 @@ def main() -> None:
             "packed_storage_dtype": str(torch.uint8),
             "grad_input_dtype": str(torch.bfloat16),
             "cotangent_quantization": None,
+            "transient_bf16_control": args.transient_bf16_control,
+            "transient_bf16_control_scope": (
+                "active-expert BF16 allocation and stores plus AITER; excludes "
+                "packed reads and decode arithmetic"
+                if args.transient_bf16_control
+                else None
+            ),
         },
         "results": [],
     }
@@ -807,6 +849,31 @@ def main() -> None:
                         args.warmup,
                         args.repeats,
                     )
+                    transient_result = None
+                    if args.transient_bf16_control:
+
+                        def transient_function(
+                            grad_outputs=grad_outputs,
+                            selected_logical=selected_logical,
+                            group_sizes=group_sizes,
+                            aiter_config=aiter_config,
+                        ):
+                            return transient_bf16_materialization_floor(
+                                grad_outputs,
+                                selected_logical,
+                                group_sizes,
+                                aiter_config,
+                            )
+
+                        transient_result = benchmark_function(
+                            transient_function,
+                            rows,
+                            case.expected_out_features,
+                            case.expected_in_features,
+                            case.projections,
+                            args.warmup,
+                            args.repeats,
+                        )
 
                     checked_distribution = truncate_distribution(
                         distribution, args.correctness_rows
@@ -872,10 +939,25 @@ def main() -> None:
                         "host_group_descriptor_build_in_timed_path": False,
                         "current_stream_operator_contract_tested": True,
                     }
+                    if transient_result is not None:
+                        workspace_bytes = sum(
+                            weight.numel() * weight.element_size()
+                            for weight in selected_logical
+                        )
+                        result["transient_bf16_materialization_floor"] = (
+                            transient_result
+                        )
+                        result["transient_bf16_workspace_bytes"] = workspace_bytes
+                        result["packed_to_transient_bf16_floor_latency_ratio"] = (
+                            packed_result["median_ms"]
+                            / transient_result["median_ms"]
+                        )
                     report["results"].append(result)
                     print_result(result)
 
                     del packed_function, aiter_function
+                    if args.transient_bf16_control:
+                        del transient_function
                     del (
                         grad_outputs,
                         correctness_grad_outputs,
