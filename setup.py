@@ -17,10 +17,8 @@ HEADER_DEPENDENCIES = [
     if not path.name.endswith("_hip.cuh")
 ]
 BUNDLE_BUILD_INPUTS = [
-    "csrc/mmq_bundle_forward_kernel.cu",
-    "csrc/mmq_bundle_dense_backward_kernel.cu",
-    "csrc/mmq_bundle_grouped_backward_kernel.cu",
     "tools/build_mmq_bundle.py",
+    "tools/mmq_bundle_wrapper_source.py",
 ]
 
 CUDAExtension = cpp_extension.CUDAExtension

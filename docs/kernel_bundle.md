@@ -60,15 +60,11 @@ Project-owned headers contain the arithmetic and scheduling bodies:
 
 These bodies may use templates and compile-time parameters, but do not own package discovery or host dispatch.
 
-### Canonical device wrappers
+### Generated concrete wrappers
 
-Thin wrappers expose one public `extern "C" __global__` symbol and call one selected device body:
+`tools/mmq_bundle_wrapper_source.py` renders one small `.cu` translation unit per kernel specification. Each unit exposes one literal `extern "C" __global__` symbol, states its launch signature, and calls one selected device body with explicit template arguments.
 
-- `csrc/mmq_bundle_forward_kernel.cu`;
-- `csrc/mmq_bundle_dense_backward_kernel.cu`;
-- `csrc/mmq_bundle_grouped_backward_kernel.cu`.
-
-Separate wrappers are used when kernel families have incompatible argument ABIs or launch-bound contracts. Wrappers may translate generator definitions into template arguments, but must not contain model-level dispatch policy.
+Forward, dense-backward, and grouped-backward entries remain separate when they have incompatible argument ABIs or launch-bound contracts. The generated units contain no family or geometry selector macros and no model-level dispatch policy. They are temporary build inputs; sdists contain the typed renderer and device sources rather than 118 duplicated generated files.
 
 ### Deterministic generator
 
@@ -77,8 +73,8 @@ Separate wrappers are used when kernel families have incompatible argument ABIs 
 - the ordered kernel inventory;
 - public C++ kernel IDs;
 - symbol and filename generation;
-- wrapper selection;
-- compile-time definitions;
+- typed wrapper configuration;
+- concrete wrapper source generation;
 - deterministic compiler invocation;
 - artifact verification;
 - optional resource gates;
@@ -108,8 +104,8 @@ Each generator entry must define enough information to compile and load exactly 
 - stable C++ kernel ID;
 - stable exported symbol;
 - stable artifact filename;
-- canonical wrapper family;
-- compile-time definitions and template values;
+- typed wrapper family and configuration;
+- explicit template values;
 - whether the artifact is subject to the production resource gate.
 
 The generator order must be deterministic and reviewed. The generated host table contains only loading identity, currently symbol and filename. Kernel behavior, launch geometry, and selection thresholds remain reviewed C++ policy rather than runtime artifact metadata.
@@ -165,7 +161,7 @@ The generator performs the following transaction:
    - compiler identity;
    - architecture and compile options;
    - ordered kernel specifications;
-   - canonical wrappers;
+   - the concrete-wrapper renderer;
    - included project-owned device headers.
 3. Compile every entry independently with `hipcc --genco` for the target architecture.
 4. Verify the artifact format, target architecture, and expected exported symbol.
@@ -215,7 +211,7 @@ Generated HSACOs are build outputs:
 
 - `*.hsaco` remains ignored by git;
 - source distributions contain no HSACOs;
-- source distributions include the generator, canonical wrappers, generated host table, and required headers;
+- source distributions include the generator, concrete-wrapper renderer, generated host table, and required headers;
 - local wheel builds run the generator before extension compilation;
 - generated artifacts are copied into the wheel build tree;
 - stale artifacts in the wheel build tree are removed before packaging.
@@ -314,7 +310,7 @@ Launcher overhead may be measured for regression safety, but arithmetic retuning
 A new entry should:
 
 1. Add or reuse a project-owned device body.
-2. Use the narrowest compatible canonical wrapper ABI.
+2. Use the narrowest compatible generated wrapper ABI.
 3. Add one generator specification with a stable generic symbol.
 4. Add reviewed static selection in the owning host dispatcher.
 5. Document behavior, alternatives, and benchmark evidence in the owning optimization log.

@@ -8,8 +8,18 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
-from enum import Enum, IntEnum
 from pathlib import Path
+
+from mmq_bundle_wrapper_source import (
+    DenseBackwardConfig,
+    ForwardConfig,
+    ForwardKind,
+    GroupedBackwardConfig,
+    GroupedBackwardKind,
+    KernelConfig,
+    QuantType,
+    render_wrapper,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 CSRC = ROOT / "csrc"
@@ -17,58 +27,6 @@ PACKAGE_DIR = ROOT / "torch_ggml_ops" / "kernels" / "gfx1151"
 GENERATED_HEADER = CSRC / "generated" / "mmq_bundle_table.cuh"
 ARCH = "gfx1151"
 ABI_PREFIX = "torch_ggml_ops_mmq_gfx1151_v1_"
-
-FORWARD_WRAPPER = "mmq_bundle_forward_kernel.cu"
-DENSE_BACKWARD_WRAPPER = "mmq_bundle_dense_backward_kernel.cu"
-GROUPED_BACKWARD_WRAPPER = "mmq_bundle_grouped_backward_kernel.cu"
-WRAPPERS = (
-    CSRC / FORWARD_WRAPPER,
-    CSRC / DENSE_BACKWARD_WRAPPER,
-    CSRC / GROUPED_BACKWARD_WRAPPER,
-)
-
-class QuantType(IntEnum):
-    Q8_0 = 8
-    Q2_K = 10
-    Q3_K = 11
-    Q4_K = 12
-    Q5_K = 13
-    Q6_K = 14
-    IQ2_XXS = 16
-    IQ2_S = 22
-
-
-class ForwardKind(Enum):
-    QUANTIZE = "MMQ_BUNDLE_FORWARD_QUANTIZE"
-    DENSE = "MMQ_BUNDLE_FORWARD_DENSE"
-    GROUPED_SERIAL = "MMQ_BUNDLE_FORWARD_GROUPED_SERIAL"
-    GROUPED_ROW_TASK = "MMQ_BUNDLE_FORWARD_GROUPED_ROW_TASK"
-    FIXED_GROUPED = "MMQ_BUNDLE_FORWARD_FIXED_GROUPED"
-    ROW_TASK_SETUP = "MMQ_BUNDLE_FORWARD_ROW_TASK_SETUP"
-
-
-class GroupedBackwardKind(Enum):
-    GENERIC_SINGLE = "MMQ_BUNDLE_GROUPED_BWD_GENERIC_SINGLE"
-    GENERIC_PAIR = "MMQ_BUNDLE_GROUPED_BWD_GENERIC_PAIR"
-    Q4_SINGLE_M64 = "MMQ_BUNDLE_GROUPED_BWD_Q4_SINGLE_M64"
-    Q4_SINGLE_M128 = "MMQ_BUNDLE_GROUPED_BWD_Q4_SINGLE_M128"
-    Q3_PAIR_M64 = "MMQ_BUNDLE_GROUPED_BWD_Q3_PAIR_M64"
-    Q3_PAIR_M128 = "MMQ_BUNDLE_GROUPED_BWD_Q3_PAIR_M128"
-    Q5_SINGLE_M64 = "MMQ_BUNDLE_GROUPED_BWD_Q5_SINGLE_M64"
-    IQ2_S_SINGLE_M64 = "MMQ_BUNDLE_GROUPED_BWD_IQ2_S_SINGLE_M64"
-    IQ2_S_SINGLE_M128 = "MMQ_BUNDLE_GROUPED_BWD_IQ2_S_SINGLE_M128"
-    IQ2_S_PAIR_M64 = "MMQ_BUNDLE_GROUPED_BWD_IQ2_S_PAIR_M64"
-    IQ2_S_PAIR_M128 = "MMQ_BUNDLE_GROUPED_BWD_IQ2_S_PAIR_M128"
-    Q4_ROW_TASK = "MMQ_BUNDLE_GROUPED_BWD_Q4_ROW_TASK"
-    Q5_ROW_TASK = "MMQ_BUNDLE_GROUPED_BWD_Q5_ROW_TASK"
-    IQ2_S_ROW_TASK = "MMQ_BUNDLE_GROUPED_BWD_IQ2_S_ROW_TASK"
-    FIXED_Q8_0_GENERIC = "MMQ_BUNDLE_GROUPED_BWD_FIXED_Q8_0_GENERIC"
-    Q2_K_SINGLE_M64_U1 = "MMQ_BUNDLE_GROUPED_BWD_Q2_K_SINGLE_M64_U1"
-    Q2_K_SINGLE_M128_U1 = "MMQ_BUNDLE_GROUPED_BWD_Q2_K_SINGLE_M128_U1"
-    IQ2_XXS_PAIR_M64 = "MMQ_BUNDLE_GROUPED_BWD_IQ2_XXS_PAIR_M64"
-    Q2_K_SINGLE_M128_U2 = "MMQ_BUNDLE_GROUPED_BWD_Q2_K_SINGLE_M128_U2"
-    FIXED_Q8_0_M256 = "MMQ_BUNDLE_GROUPED_BWD_FIXED_Q8_0_M256"
-
 
 QUANT_TYPES = tuple((quant_type.name, quant_type) for quant_type in QuantType)
 BACKWARD_QUANT_TYPES = tuple(
@@ -84,8 +42,7 @@ ROW_TASK_TYPES = tuple(
 class KernelSpec:
     cpp_id: str
     suffix: str
-    wrapper: str
-    defines: tuple[tuple[str, int], ...]
+    config: KernelConfig
     enforce_resource_gate: bool = False
 
     @property
@@ -100,12 +57,6 @@ class KernelSpec:
     def cuid(self) -> str:
         return hashlib.sha256(self.symbol.encode()).hexdigest()[:16]
 
-    def compiler_defines(self) -> list[str]:
-        return [
-            f"-DMMQ_BUNDLE_KERNEL_SYMBOL={self.symbol}",
-            *(f"-D{name}={value}" for name, value in self.defines),
-        ]
-
 
 def _quant_suffix(name: str) -> str:
     return name.lower()
@@ -116,7 +67,7 @@ def _forward_spec(
     suffix: str,
     kind: ForwardKind,
     *,
-    quant_type: int | QuantType = 0,
+    quant_type: QuantType | None = None,
     j: int = 0,
     nrows_weight: int = 0,
     blocks_per_weight_row: int = 0,
@@ -127,28 +78,19 @@ def _forward_spec(
     mixed_q2_k: bool = False,
     enforce_resource_gate: bool = False,
 ) -> KernelSpec:
-    defines = [
-        (kind.value, 1),
-        ("MMQ_BUNDLE_QUANT_TYPE", quant_type),
-        ("MMQ_BUNDLE_J", j),
-        ("MMQ_BUNDLE_NROWS_WEIGHT", nrows_weight),
-        ("MMQ_BUNDLE_BLOCKS_PER_WEIGHT_ROW", blocks_per_weight_row),
-        ("MMQ_BUNDLE_GROUPS", groups),
-        ("MMQ_BUNDLE_FALLBACK", int(fallback)),
-    ]
-    if rolled_q2:
-        defines.append(("MMQ_USE_ROLLED_Q2_K", 1))
-    if mixed_iq2_s:
-        defines.append(("MMQ_USE_MIXED_IQ2_S_TAILS", 1))
-    if mixed_q2_k:
-        defines.append(("MMQ_USE_MIXED_Q2_K_TAILS", 1))
-    return KernelSpec(
-        cpp_id,
-        suffix,
-        FORWARD_WRAPPER,
-        tuple(defines),
-        enforce_resource_gate,
+    config = ForwardConfig(
+        kind=kind,
+        quant_type=quant_type,
+        j=j,
+        nrows_weight=nrows_weight,
+        blocks_per_weight_row=blocks_per_weight_row,
+        groups=groups,
+        fallback=fallback,
+        rolled_q2=rolled_q2,
+        mixed_iq2_s=mixed_iq2_s,
+        mixed_q2_k=mixed_q2_k,
     )
+    return KernelSpec(cpp_id, suffix, config, enforce_resource_gate)
 
 
 def _grouped_forward_specs() -> list[KernelSpec]:
@@ -322,29 +264,23 @@ def _dense_backward_spec(
     pack_q5_quant_bytes: bool = False,
     pack_q6_quant_bytes: bool = False,
 ) -> KernelSpec:
-    defines = (
-        ("MMQ_BUNDLE_QUANT_TYPE", quant_type),
-        ("MMQ_BUNDLE_N_TILES", n_tiles),
-        ("MMQ_BUNDLE_K_ITERATION", k_iteration),
-        ("MMQ_BUNDLE_GROUP_M", group_m),
-        ("MMQ_BUNDLE_M_TILES_PER_WAVE", m_tiles_per_wave),
-        ("MMQ_BUNDLE_DECODER_WIDTH", decoder_width),
-        ("MMQ_BUNDLE_PREFETCH_LOCAL", int(prefetch_local)),
-        ("MMQ_BUNDLE_FULL_TILES", int(full_tiles)),
-        ("MMQ_BUNDLE_PREFETCH_PACKED", int(prefetch_packed)),
-        ("MMQ_BUNDLE_LDS_PADDING", lds_padding),
-        ("MMQ_BUNDLE_VECTOR_LOCAL_LOAD", int(vector_local_load)),
-        ("MMQ_BUNDLE_LDS_SWIZZLE_CHUNK", lds_swizzle_chunk),
-        ("MMQ_BUNDLE_PACK_Q5_QUANT_BYTES", int(pack_q5_quant_bytes)),
-        ("MMQ_BUNDLE_PACK_Q6_QUANT_BYTES", int(pack_q6_quant_bytes)),
+    config = DenseBackwardConfig(
+        quant_type=quant_type,
+        n_tiles=n_tiles,
+        k_iteration=k_iteration,
+        group_m=group_m,
+        m_tiles_per_wave=m_tiles_per_wave,
+        decoder_width=decoder_width,
+        prefetch_local=prefetch_local,
+        full_tiles=full_tiles,
+        prefetch_packed=prefetch_packed,
+        lds_padding=lds_padding,
+        vector_local_load=vector_local_load,
+        lds_swizzle_chunk=lds_swizzle_chunk,
+        pack_q5_quant_bytes=pack_q5_quant_bytes,
+        pack_q6_quant_bytes=pack_q6_quant_bytes,
     )
-    return KernelSpec(
-        cpp_id,
-        suffix,
-        DENSE_BACKWARD_WRAPPER,
-        defines,
-        enforce_resource_gate=True,
-    )
+    return KernelSpec(cpp_id, suffix, config, enforce_resource_gate=True)
 
 
 def _dense_backward_specs() -> list[KernelSpec]:
@@ -537,19 +473,11 @@ def _grouped_backward_spec(
     cpp_id: str,
     suffix: str,
     kind: GroupedBackwardKind,
-    quant_type: int | QuantType = 0,
+    quant_type: QuantType | None = None,
     enforce_resource_gate: bool = False,
 ) -> KernelSpec:
-    return KernelSpec(
-        cpp_id,
-        suffix,
-        GROUPED_BACKWARD_WRAPPER,
-        (
-            (kind.value, 1),
-            ("MMQ_BUNDLE_QUANT_TYPE", quant_type),
-        ),
-        enforce_resource_gate,
-    )
+    config = GroupedBackwardConfig(kind=kind, quant_type=quant_type)
+    return KernelSpec(cpp_id, suffix, config, enforce_resource_gate)
 
 
 def _grouped_backward_specs() -> list[KernelSpec]:
@@ -799,7 +727,8 @@ def _build_input_digest(
         for path in sorted(CSRC.rglob("*.cuh"))
         if "generated" not in path.parts and not path.name.endswith("_hip.cuh")
     ]
-    for path in (Path(__file__), *WRAPPERS, *device_headers):
+    wrapper_renderer = Path(__file__).with_name("mmq_bundle_wrapper_source.py")
+    for path in (Path(__file__), wrapper_renderer, *device_headers):
         digest.update(path.relative_to(ROOT).as_posix().encode())
         digest.update(b"\0")
         digest.update(path.read_bytes())
@@ -903,24 +832,30 @@ def _compile_one(
     env: dict[str, str],
 ) -> tuple[str, bytes]:
     temporary = output_dir / f"{spec.cpp_id}.hsaco"
+    source = output_dir / f".{spec.cpp_id}.cu"
+    source_text = render_wrapper(spec.symbol, spec.config)
+    source.write_text(source_text)
     command = [
         *_common_args(hipcc),
         f"-cuid={spec.cuid}",
-        *spec.compiler_defines(),
-        str(CSRC / spec.wrapper),
+        str(source),
         "-o",
         str(temporary),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, env=env)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"failed to compile {spec.cpp_id}\ncommand: {' '.join(command)}\n"
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-        )
-    data = _verify_artifact(temporary, spec, readelf)
-    temporary.chmod(0o644)
-    temporary.rename(output_dir / spec.filename)
-    return spec.cpp_id, data
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, env=env)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"failed to compile {spec.cpp_id}\ncommand: {' '.join(command)}\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}\n"
+                f"generated source:\n{source_text}"
+            )
+        data = _verify_artifact(temporary, spec, readelf)
+        temporary.chmod(0o644)
+        temporary.rename(output_dir / spec.filename)
+        return spec.cpp_id, data
+    finally:
+        source.unlink(missing_ok=True)
 
 
 def _compile_all(

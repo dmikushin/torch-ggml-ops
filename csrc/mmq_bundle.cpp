@@ -390,21 +390,18 @@ DenseBackwardSelection dense_backward_generic(
         std::int32_t quant_type,
         int n_tiles,
         int group_m) {
-#define MMQ_DENSE_BWD_GENERIC_CASE(TYPE, PREFIX) \
-    case TYPE: \
-        if (group_m == 0) { \
-            if (n_tiles == 1) return {MMQKernelId::DenseBwd##PREFIX##NT16KI16G0, 1, 16, 0, 1}; \
-            if (n_tiles == 4) return {MMQKernelId::DenseBwd##PREFIX##NT64KI16G0, 4, 16, 0, 1}; \
-        } else { \
-            if (n_tiles == 4) return {MMQKernelId::DenseBwd##PREFIX##NT64KI16G2, 4, 16, 2, 1}; \
-            if (n_tiles == 8) return {MMQKernelId::DenseBwd##PREFIX##NT128KI16G2, 8, 16, 2, 1}; \
-            if (n_tiles == 12) return {MMQKernelId::DenseBwd##PREFIX##NT192KI16G2, 12, 16, 2, 1}; \
-            if (n_tiles == 16) return {MMQKernelId::DenseBwd##PREFIX##NT256KI16G2, 16, 16, 2, 1}; \
-        } \
-        break
-
     switch (quant_type) {
-        MMQ_DENSE_BWD_GENERIC_CASE(kQuantQ3_K, Q3K);
+        case kQuantQ3_K:
+            if (group_m == 0) {
+                if (n_tiles == 1) return {MMQKernelId::DenseBwdQ3KNT16KI16G0, 1, 16, 0, 1};
+                if (n_tiles == 4) return {MMQKernelId::DenseBwdQ3KNT64KI16G0, 4, 16, 0, 1};
+            } else {
+                if (n_tiles == 4) return {MMQKernelId::DenseBwdQ3KNT64KI16G2, 4, 16, 2, 1};
+                if (n_tiles == 8) return {MMQKernelId::DenseBwdQ3KNT128KI16G2, 8, 16, 2, 1};
+                if (n_tiles == 12) return {MMQKernelId::DenseBwdQ3KNT192KI16G2, 12, 16, 2, 1};
+                if (n_tiles == 16) return {MMQKernelId::DenseBwdQ3KNT256KI16G2, 16, 16, 2, 1};
+            }
+            break;
         case kQuantIQ2_S:
             if (group_m == 0) {
                 if (n_tiles == 1) return {MMQKernelId::DenseBwdIQ2SNT16KI16G0, 1, 16, 0, 1};
@@ -438,7 +435,6 @@ DenseBackwardSelection dense_backward_generic(
         default:
             break;
     }
-#undef MMQ_DENSE_BWD_GENERIC_CASE
     fail("unsupported dense backward generic specialization");
 }
 

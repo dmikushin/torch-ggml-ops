@@ -7,9 +7,9 @@
 
 // Narrow dense-MMQ configuration for gfx1151/RDNA3.5. These are the inherited
 // llama.cpp settings for J=128 with fallback row bounds enabled.
-#define MMQ_ITER_K 256
-#define MMQ_TILE_NE_K 32
-#define MMQ_TILE_Y_K (MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1)
+static constexpr int MMQ_ITER_K = 256;
+static constexpr int MMQ_TILE_NE_K = 32;
+static constexpr int MMQ_TILE_Y_K = MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1;
 
 static constexpr int MMQ_I = 64;
 static constexpr int MMQ_J = 128;
@@ -112,9 +112,7 @@ enum mmq_q8_1_ds_layout {
 
 #include "vendor/llama_cpp/mmq-load-targets.cuh"
 #include "vendor/llama_cpp/mmq-vec-dot-targets.cuh"
-#ifdef MMQ_USE_ROLLED_Q2_K
 #include "vendor/llama_cpp/mmq-vec-dot-q2-k-rolled.cuh"
-#endif
 
 template <ggml_type type, int J, bool fallback = true>
 static __device__ __forceinline__ void mmq_load_target(
@@ -144,18 +142,20 @@ static __device__ __forceinline__ void mmq_load_target(
     }
 }
 
-template <ggml_type type, int J, bool fallback = true>
+template <ggml_type type, int J, bool fallback = true, bool rolled_q2_k = false>
 static __device__ __forceinline__ void mmq_vec_dot_target(
         const int * x, const int * y, float * sum, int k00) {
     if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ2_XXS) {
         ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<
             type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>(x, y, sum, k00);
     } else if constexpr (type == GGML_TYPE_Q2_K) {
-#ifdef MMQ_USE_ROLLED_Q2_K
-        ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma_rolled<type, J, fallback>(x, y, sum, k00);
-#else
-        ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma<type, J, fallback>(x, y, sum, k00);
-#endif
+        if constexpr (rolled_q2_k) {
+            ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma_rolled<type, J, fallback>(
+                x, y, sum, k00);
+        } else {
+            ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma<type, J, fallback>(
+                x, y, sum, k00);
+        }
     } else if constexpr (type == GGML_TYPE_Q3_K || type == GGML_TYPE_IQ2_S) {
         ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>(x, y, sum, k00);
     } else if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
@@ -479,7 +479,8 @@ template <
     int J,
     int fixed_nrows_weight,
     int fixed_blocks_per_weight_row,
-    bool full_j>
+    bool full_j,
+    bool rolled_q2_k = false>
 static __device__ __forceinline__ void grouped_mmq_row_tile(
         const char * __restrict__ expert_weights,
         const int * __restrict__ activations,
@@ -557,7 +558,8 @@ static __device__ __forceinline__ void grouped_mmq_row_tile(
                 }
             }
             __syncthreads();
-            mmq_vec_dot_target<type, J, !fixed_shape>(tile_x, tile_y, sum, 0);
+            mmq_vec_dot_target<type, J, !fixed_shape, rolled_q2_k>(
+                tile_x, tile_y, sum, 0);
             __syncthreads();
 
 #pragma unroll
@@ -577,7 +579,7 @@ static __device__ __forceinline__ void grouped_mmq_row_tile(
                 }
             }
             __syncthreads();
-            mmq_vec_dot_target<type, J, !fixed_shape>(
+            mmq_vec_dot_target<type, J, !fixed_shape, rolled_q2_k>(
                 tile_x, tile_y, sum, MMQ_TILE_NE_K);
             __syncthreads();
 
@@ -595,7 +597,14 @@ static __device__ __forceinline__ void grouped_mmq_row_tile(
     __syncthreads();
 }
 
-template <ggml_type type, int J, int fixed_nrows_weight, int fixed_blocks_per_weight_row>
+template <
+    ggml_type type,
+    int J,
+    int fixed_nrows_weight,
+    int fixed_blocks_per_weight_row,
+    bool mixed_iq2_s_tails = false,
+    bool mixed_q2_k_tails = false,
+    bool rolled_q2_k = false>
 static __device__ __forceinline__ void grouped_mmq_tail_tile(
         const char * __restrict__ expert_weights,
         const int * __restrict__ activations,
@@ -608,52 +617,62 @@ static __device__ __forceinline__ void grouped_mmq_tail_tile(
         int nrows_weight,
         int nrows_activation,
         int blocks_per_weight_row) {
-#if defined(MMQ_USE_MIXED_IQ2_S_TAILS)
-    if constexpr (type == GGML_TYPE_IQ2_S && J == MMQ_J_SMALL) {
+    if constexpr (
+        mixed_iq2_s_tails && type == GGML_TYPE_IQ2_S && J == MMQ_J_SMALL
+    ) {
         const int tail_rows = row_end - row_start;
         if (tail_rows <= MMQ_J_TINY) {
             grouped_mmq_row_tile<
-                type, MMQ_J_TINY, fixed_nrows_weight, fixed_blocks_per_weight_row, false>(
+                type, MMQ_J_TINY, fixed_nrows_weight, fixed_blocks_per_weight_row,
+                false, rolled_q2_k>(
                     expert_weights, activations, dst, tile_x, tile_y, tile_i,
                     row_start, row_end, nrows_weight, nrows_activation,
                     blocks_per_weight_row);
         } else {
             grouped_mmq_row_tile<
-                type, J, fixed_nrows_weight, fixed_blocks_per_weight_row, false>(
+                type, J, fixed_nrows_weight, fixed_blocks_per_weight_row,
+                false, rolled_q2_k>(
                     expert_weights, activations, dst, tile_x, tile_y, tile_i,
                     row_start, row_end, nrows_weight, nrows_activation,
                     blocks_per_weight_row);
         }
-    } else
-#endif
-#if defined(MMQ_USE_MIXED_Q2_K_TAILS)
-    if constexpr (type == GGML_TYPE_Q2_K && J == MMQ_J_TINY) {
+    } else if constexpr (
+        mixed_q2_k_tails && type == GGML_TYPE_Q2_K && J == MMQ_J_TINY
+    ) {
         const int tail_rows = row_end - row_start;
         if (tail_rows <= MMQ_J_MIN) {
             grouped_mmq_row_tile<
-                type, MMQ_J_MIN, fixed_nrows_weight, fixed_blocks_per_weight_row, false>(
+                type, MMQ_J_MIN, fixed_nrows_weight, fixed_blocks_per_weight_row,
+                false, rolled_q2_k>(
                     expert_weights, activations, dst, tile_x, tile_y, tile_i,
                     row_start, row_end, nrows_weight, nrows_activation,
                     blocks_per_weight_row);
         } else {
             grouped_mmq_row_tile<
-                type, J, fixed_nrows_weight, fixed_blocks_per_weight_row, false>(
+                type, J, fixed_nrows_weight, fixed_blocks_per_weight_row,
+                false, rolled_q2_k>(
                     expert_weights, activations, dst, tile_x, tile_y, tile_i,
                     row_start, row_end, nrows_weight, nrows_activation,
                     blocks_per_weight_row);
         }
-    } else
-#endif
-    {
+    } else {
         grouped_mmq_row_tile<
-            type, J, fixed_nrows_weight, fixed_blocks_per_weight_row, false>(
+            type, J, fixed_nrows_weight, fixed_blocks_per_weight_row,
+            false, rolled_q2_k>(
                 expert_weights, activations, dst, tile_x, tile_y, tile_i,
                 row_start, row_end, nrows_weight, nrows_activation,
                 blocks_per_weight_row);
     }
 }
 
-template <ggml_type type, int J, int fixed_nrows_weight, int fixed_blocks_per_weight_row>
+template <
+    ggml_type type,
+    int J,
+    int fixed_nrows_weight,
+    int fixed_blocks_per_weight_row,
+    bool mixed_iq2_s_tails = false,
+    bool mixed_q2_k_tails = false,
+    bool rolled_q2_k = false>
 static __device__ __forceinline__ void grouped_mmq_bf16_body(
         const char * __restrict__ weights,
         const int * __restrict__ activations,
@@ -688,7 +707,8 @@ static __device__ __forceinline__ void grouped_mmq_bf16_body(
     int row_start = row_begin;
     for (; row_start + J <= row_end; row_start += J) {
         grouped_mmq_row_tile<
-            type, J, fixed_nrows_weight, fixed_blocks_per_weight_row, true>(
+            type, J, fixed_nrows_weight, fixed_blocks_per_weight_row,
+            true, rolled_q2_k>(
                 expert_weights,
                 activations,
                 dst,
@@ -703,7 +723,8 @@ static __device__ __forceinline__ void grouped_mmq_bf16_body(
     }
     if (row_start < row_end) {
         grouped_mmq_tail_tile<
-            type, J, fixed_nrows_weight, fixed_blocks_per_weight_row>(
+            type, J, fixed_nrows_weight, fixed_blocks_per_weight_row,
+            mixed_iq2_s_tails, mixed_q2_k_tails, rolled_q2_k>(
                 expert_weights,
                 activations,
                 dst,
