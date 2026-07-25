@@ -271,6 +271,7 @@ def _dense_backward_spec(
     pack_q6_quant_bytes: bool = False,
     exact_out_features: int = 0,
     exact_in_features: int = 0,
+    active_waves: int = 4,
 ) -> KernelSpec:
     config = DenseBackwardConfig(
         quant_type=quant_type,
@@ -289,6 +290,7 @@ def _dense_backward_spec(
         pack_q6_quant_bytes=pack_q6_quant_bytes,
         exact_out_features=exact_out_features,
         exact_in_features=exact_in_features,
+        active_waves=active_waves,
     )
     return KernelSpec(cpp_id, suffix, config, enforce_resource_gate=True)
 
@@ -377,6 +379,40 @@ def _dense_backward_specs() -> list[KernelSpec]:
                 lds_padding=8,
                 exact_out_features=out_features,
                 exact_in_features=in_features,
+            )
+        )
+    specs.append(
+        _dense_backward_spec(
+            "DenseBwdQ80ExactLMHeadM32Active2",
+            "dense_bwd_q8_0_exact_lm_head_m32_active2",
+            QuantType.Q8_0,
+            4,
+            16,
+            group_m=0,
+            decoder_width=16,
+            exact_out_features=129280,
+            exact_in_features=4096,
+            active_waves=2,
+        )
+    )
+    for geometry, n_tiles, m_tiles_per_wave in (
+        ("G1", 4, 2),
+        ("G2", 8, 2),
+        ("G3", 4, 4),
+    ):
+        specs.append(
+            _dense_backward_spec(
+                f"DenseBwdQ80ExactLMHead{geometry}",
+                f"dense_bwd_q8_0_exact_lm_head_{geometry.lower()}",
+                QuantType.Q8_0,
+                n_tiles,
+                32,
+                group_m=0,
+                m_tiles_per_wave=m_tiles_per_wave,
+                decoder_width=16,
+                full_tiles=True,
+                exact_out_features=129280,
+                exact_in_features=4096,
             )
         )
     for full in (False, True):
@@ -575,7 +611,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
             ),
         )
     )
-    assert len(specs) == 69
+    assert len(specs) == 73
     return specs
 
 
@@ -830,7 +866,7 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
     specs.extend(_grouped_forward_specs())
     specs.extend(_dense_backward_specs())
     specs.extend(_grouped_backward_specs())
-    assert len(specs) == 165
+    assert len(specs) == 169
     assert len({spec.cpp_id for spec in specs}) == len(specs)
     assert len({spec.symbol for spec in specs}) == len(specs)
     return tuple(specs)

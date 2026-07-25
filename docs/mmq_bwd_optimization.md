@@ -998,6 +998,25 @@ Start from the surviving G0/G1/G2/G3 mechanisms rather than opening a new tile f
 
 Measure per-call latency, calls per complete token set, output allocation, and serial scheduler estimates for physical batches 1, 4, and 16. Do not select the production chunk in DB4. Forward-only logs already show every chunk winning in isolation; final selection belongs to DB6's complete forward/cross-entropy/backward loop.
 
+DB4 result: active-two-wave M32, G0 M64, G1 M128, and G3 M256/M512 retained.
+
+Artifacts:
+
+```text
+/tmp/mmq_bwd_ds4_p4_lm_g1_9.json
+/tmp/mmq_bwd_ds4_p4_lm_g2_9.json
+/tmp/mmq_bwd_ds4_p4_lm_g3_9.json
+/tmp/mmq_bwd_ds4_p4_control_before_25.json
+/tmp/mmq_bwd_ds4_p4_selected_25.json
+/tmp/mmq_bwd_ds4_p4_control_after_25.json
+```
+
+The M32 body keeps all four waves available for cooperative decode and barriers but limits cotangent loads, WMMA, and output stores to two active waves. It therefore covers exactly 32 rows without computing hidden padded output rows. Relative to the bounded four-wave control it improves `1.45%` in the 25-repeat bracket. M64 remains on exact G0 and is unchanged.
+
+M128 selects G1 (`128x64/K32`) for a `19.48%` kernel gain. M256 and M512 select G3 (`256x64/K32`) for `51.85%` and `60.64%`; M512 uses two exact M256 workgroups. G2 is rejected for all LM chunks. The selected variants use 91-194 VGPRs, 2-4 KiB LDS, zero private storage/spills, and no dynamic stack.
+
+Selected per-call latency at M32/M64/M128/M256/M512 is `8.297/7.459/7.569/10.386/23.206 ms`. The corresponding B1 serial backward estimates for complete 2,048-token coverage are `531.0/238.7/121.1/83.1/92.8 ms`; incremental output allocation is 256 KiB/512 KiB/1 MiB/2 MiB/4 MiB. M256 is the isolated backward minimum, but no production chunk is selected in DB4.
+
 ### QB0: refresh the Qwen packaged baseline
 
 Before any Qwen retune, rerun the complete current packaged matrix. The old bundle controls showed byte-identical kernels moving by more than 1%, and the current bundle now includes DeepSeek Q8_0 backward. Use warmed standalone artifacts and save a new source-of-record baseline.

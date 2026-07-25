@@ -459,6 +459,7 @@ struct DenseBackwardSelection {
     int k_iteration;
     int group_m;
     int m_tiles_per_wave;
+    int active_waves = kBackwardWaves;
 };
 
 DenseBackwardSelection dense_q80_geometry_selection(
@@ -619,11 +620,31 @@ DenseBackwardSelection dense_backward_selection(
                     MMQKernelId::DenseBwdQ80ExactN4096K2048G2Padding8);
             }
             if (out_features == 129280 && in_features == 4096) {
+                if (rows >= 128) {
+                    const DenseQ80Geometry geometry = rows >= 256
+                        ? DenseQ80Geometry::G3
+                        : DenseQ80Geometry::G1;
+                    return dense_q80_geometry_selection(
+                        rows,
+                        geometry,
+                        MMQKernelId::DenseBwdQ80ExactLMHeadFull,
+                        MMQKernelId::DenseBwdQ80ExactLMHeadG1,
+                        MMQKernelId::DenseBwdQ80ExactLMHeadG2,
+                        MMQKernelId::DenseBwdQ80ExactLMHeadG3,
+                        false,
+                        MMQKernelId::DenseBwdQ80ExactLMHeadG2);
+                }
                 return {MMQKernelId::DenseBwdQ80ExactLMHeadFull, 4, 16, 0, 1};
             }
         }
         if (rows == 32 && out_features == 129280 && in_features == 4096) {
-            return {MMQKernelId::DenseBwdQ80ExactLMHeadBounded, 4, 16, 0, 1};
+            return {
+                MMQKernelId::DenseBwdQ80ExactLMHeadM32Active2,
+                4,
+                16,
+                0,
+                1,
+                2};
         }
         return {MMQKernelId::DenseBwdQ80NT64KI16G0, 4, 16, 0, 1};
     }
@@ -962,7 +983,7 @@ void launch_dense_backward(
         quant_type, rows, out_features, in_features);
     const int n_per_block = selection.n_tiles * kBackwardTile;
     const int m_per_block = selection.m_tiles_per_wave * kBackwardTile *
-        kBackwardWaves;
+        selection.active_waves;
     const int m_blocks = (rows + m_per_block - 1) / m_per_block;
     const int grid_group_m = selection.group_m > 0 &&
         selection.group_m < m_blocks

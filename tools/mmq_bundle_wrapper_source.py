@@ -81,6 +81,7 @@ class DenseBackwardConfig:
     pack_q6_quant_bytes: bool
     exact_out_features: int = 0
     exact_in_features: int = 0
+    active_waves: int = 4
 
 
 @dataclass(frozen=True)
@@ -294,6 +295,7 @@ void {symbol}(
         {config.k_iteration},
         {config.group_m},
         {config.m_tiles_per_wave},
+        {config.active_waves},
         {config.decoder_width},
         {_cpp_bool(config.prefetch_local)},
         {_cpp_bool(config.full_tiles)},
