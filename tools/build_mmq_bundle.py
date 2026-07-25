@@ -78,6 +78,8 @@ def _forward_spec(
     rolled_q2: bool = False,
     mixed_iq2_s: bool = False,
     mixed_q2_k: bool = False,
+    full_i: bool = False,
+    full_j: bool = False,
     enforce_resource_gate: bool = False,
 ) -> KernelSpec:
     config = ForwardConfig(
@@ -91,6 +93,8 @@ def _forward_spec(
         rolled_q2=rolled_q2,
         mixed_iq2_s=mixed_iq2_s,
         mixed_q2_k=mixed_q2_k,
+        full_i=full_i,
+        full_j=full_j,
     )
     return KernelSpec(cpp_id, suffix, config, enforce_resource_gate)
 
@@ -666,6 +670,28 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
             enforce_resource_gate=True,
         )
     )
+    for k, j, full_j in (
+        (1024, 128, True),
+        (2048, 128, True),
+        (4096, 64, False),
+        (4096, 64, True),
+        (4096, 128, True),
+        (8192, 128, True),
+    ):
+        body = "Full" if full_j else "Bounded"
+        specs.append(
+            _forward_spec(
+                f"DenseFwdQ80K{k}J{j}{body}",
+                f"dense_fwd_q8_0_k{k}_j{j}_{body.lower()}",
+                ForwardKind.DENSE,
+                quant_type=QuantType.Q8_0,
+                j=j,
+                blocks_per_weight_row=k // 256,
+                full_i=True,
+                full_j=full_j,
+                enforce_resource_gate=True,
+            )
+        )
     specs.append(
         _forward_spec(
             "GroupedRowTaskSetup",
@@ -676,7 +702,7 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
     specs.extend(_grouped_forward_specs())
     specs.extend(_dense_backward_specs())
     specs.extend(_grouped_backward_specs())
-    assert len(specs) == 118
+    assert len(specs) == 124
     assert len({spec.cpp_id for spec in specs}) == len(specs)
     assert len({spec.symbol for spec in specs}) == len(specs)
     return tuple(specs)

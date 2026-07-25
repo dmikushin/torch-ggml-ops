@@ -59,6 +59,8 @@ class ForwardConfig:
     rolled_q2: bool = False
     mixed_iq2_s: bool = False
     mixed_q2_k: bool = False
+    full_i: bool = False
+    full_j: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,7 +138,12 @@ void {symbol}(
         int nrows_activation,
         int nrows_activation_padded,
         int blocks_per_weight_row) {{
-    dense_mmq_bf16_body<{quant_type}, {config.j}>(
+    dense_mmq_bf16_body<
+        {quant_type},
+        {config.j},
+        {config.blocks_per_weight_row},
+        {_cpp_bool(config.full_i)},
+        {_cpp_bool(config.full_j)}>(
         weights,
         activations,
         dst,

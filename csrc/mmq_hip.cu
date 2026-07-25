@@ -60,7 +60,6 @@ int64_t packed_row_bytes(int64_t quant_type, int64_t in_features) {
 
 constexpr int64_t kQuantWorkspaceBlockBytes = 144;
 constexpr int64_t kQuantWorkspaceBlockValues = 4 * QK8_1;
-constexpr int64_t kForwardRows = 128;
 constexpr int64_t kForwardSmallRows = 64;
 constexpr int64_t kBackwardTaskRows = 128;
 
@@ -603,8 +602,11 @@ Tensor mmq_cuda(
         torch::headeronly::IntHeaderOnlyArrayRef(output_sizes.data(), output_sizes.size()),
         ScalarType::BFloat16);
 
-    const int64_t row_tile = quant_type == GGML_TYPE_Q6_K &&
-        rows <= kForwardSmallRows ? kForwardSmallRows : kForwardRows;
+    const int64_t row_tile = torch_ggml_ops::mmq_bundle::dense_forward_row_tile(
+        static_cast<int32_t>(quant_type),
+        static_cast<int>(rows),
+        static_cast<int>(in_features),
+        static_cast<int>(out_features));
     const int64_t rows_padded = ((rows + row_tile - 1) / row_tile) * row_tile;
     const int64_t workspace_bytes = rows_padded *
         (in_features / kQuantWorkspaceBlockValues) *

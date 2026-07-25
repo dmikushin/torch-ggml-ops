@@ -268,7 +268,12 @@ static __device__ __forceinline__ void quantize_bf16_mmq_q8_1_body(
     }
 }
 
-template <ggml_type type, int J>
+template <
+    ggml_type type,
+    int J,
+    int fixed_blocks_per_weight_row = 0,
+    bool full_i = false,
+    bool full_j = false>
 static __device__ __forceinline__ void dense_mmq_bf16_body(
         const char * __restrict__ weights,
         const int * __restrict__ activations,
@@ -288,11 +293,19 @@ static __device__ __forceinline__ void dense_mmq_bf16_body(
 
     float sum[J * MMQ_I / MMQ_NTHREADS] = {0.0f};
     constexpr int q8_block_ints = sizeof(block_q8_1_mmq) / sizeof(int);
+    const int kernel_blocks_per_weight_row = fixed_blocks_per_weight_row > 0
+        ? fixed_blocks_per_weight_row
+        : blocks_per_weight_row;
 
-    for (int kb = 0; kb < blocks_per_weight_row; ++kb) {
-        const int weight_block_offset = tile_i * MMQ_I * blocks_per_weight_row + kb;
-        mmq_load_target<type, J>(
-            weights, tile_x, weight_block_offset, i_max, blocks_per_weight_row);
+    for (int kb = 0; kb < kernel_blocks_per_weight_row; ++kb) {
+        const int weight_block_offset =
+            tile_i * MMQ_I * kernel_blocks_per_weight_row + kb;
+        mmq_load_target<type, J, !full_i>(
+            weights,
+            tile_x,
+            weight_block_offset,
+            i_max,
+            kernel_blocks_per_weight_row);
 
 #pragma unroll
         for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += MMQ_NTHREADS) {
@@ -317,7 +330,7 @@ static __device__ __forceinline__ void dense_mmq_bf16_body(
         __syncthreads();
     }
 
-    mmq_write_back_bf16<type, J>(
+    mmq_write_back_bf16<type, J, full_i, full_j>(
         sum,
         dst + tile_j * J * nrows_weight + tile_i * MMQ_I,
         nrows_weight,

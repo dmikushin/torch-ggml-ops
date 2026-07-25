@@ -209,9 +209,40 @@ MMQKernelId quantize_kernel(std::int32_t quant_type) {
     return MMQKernelId::QuantizeQ81D4;
 }
 
-MMQKernelId dense_forward_kernel(std::int32_t quant_type, int rows_padded) {
-    if (quant_type == kQuantQ6_K && rows_padded == 64) {
-        return MMQKernelId::DenseFwdQ6KJ64;
+struct DenseForwardSelection {
+    MMQKernelId id;
+    int j;
+};
+
+DenseForwardSelection dense_forward_selection(
+        std::int32_t quant_type,
+        int rows,
+        int in_features,
+        int out_features) {
+    if (quant_type == kQuantQ8_0 && out_features % kForwardTileI == 0) {
+        if (in_features == 1024 && rows % 128 == 0) {
+            return {MMQKernelId::DenseFwdQ80K1024J128Full, 128};
+        }
+        if (in_features == 2048 && rows % 128 == 0) {
+            return {MMQKernelId::DenseFwdQ80K2048J128Full, 128};
+        }
+        if (in_features == 4096) {
+            if (rows == 32) {
+                return {MMQKernelId::DenseFwdQ80K4096J64Bounded, 64};
+            }
+            if (rows == 64) {
+                return {MMQKernelId::DenseFwdQ80K4096J64Full, 64};
+            }
+            if (rows % 128 == 0) {
+                return {MMQKernelId::DenseFwdQ80K4096J128Full, 128};
+            }
+        }
+        if (in_features == 8192 && rows % 128 == 0) {
+            return {MMQKernelId::DenseFwdQ80K8192J128Full, 128};
+        }
+    }
+    if (quant_type == kQuantQ6_K && rows <= 64) {
+        return {MMQKernelId::DenseFwdQ6KJ64, 64};
     }
     constexpr std::array ids{
         MMQKernelId::DenseFwdQ80J128,
@@ -223,11 +254,7 @@ MMQKernelId dense_forward_kernel(std::int32_t quant_type, int rows_padded) {
         MMQKernelId::DenseFwdIQ2XXSJ128,
         MMQKernelId::DenseFwdIQ2SJ128,
     };
-    return ids[forward_quant_index(quant_type)];
-}
-
-int forward_j(MMQKernelId id) {
-    return id == MMQKernelId::DenseFwdQ6KJ64 ? 64 : 128;
+    return {ids[forward_quant_index(quant_type)], 128};
 }
 
 int padded(int value, int alignment) {
@@ -552,6 +579,14 @@ MMQKernelId grouped_backward_generic_kernel(
 
 } // namespace
 
+int dense_forward_row_tile(
+        std::int32_t quant_type,
+        int rows,
+        int in_features,
+        int out_features) {
+    return dense_forward_selection(quant_type, rows, in_features, out_features).j;
+}
+
 void launch_quantize(
         std::int32_t quant_type,
         const void * input,
@@ -581,8 +616,10 @@ void launch_dense_forward(
         int in_features,
         int out_features,
         hipStream_t stream) {
-    const MMQKernelId id = dense_forward_kernel(quant_type, rows_padded);
-    const int j = forward_j(id);
+    const DenseForwardSelection selection = dense_forward_selection(
+        quant_type, rows, in_features, out_features);
+    const MMQKernelId id = selection.id;
+    const int j = selection.j;
     int blocks_per_weight_row = in_features / 256;
     void * arguments[]{
         &packed,

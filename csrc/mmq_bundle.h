@@ -15,6 +15,12 @@ void launch_quantize(
     std::int64_t in_features,
     hipStream_t stream);
 
+int dense_forward_row_tile(
+    std::int32_t quant_type,
+    int rows,
+    int in_features,
+    int out_features);
+
 void launch_dense_forward(
     std::int32_t quant_type,
     const char * packed,
