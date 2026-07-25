@@ -1,8 +1,7 @@
 #pragma once
 
 // Minimal llama.cpp compatibility surface for the gfx1151 dense MMQ operator.
-// Derived from ggml/src/ggml-common.h, ggml/src/ggml-cuda/common.cuh, and ggml/src/ggml-cuda/vendors/hip.h
-// at commit 39d54170de9c963eca32cbe062ee8c7bb7e57cde.
+// Derived from ggml/src/ggml-common.h, ggml/src/ggml-cuda/common.cuh, and ggml/src/ggml-cuda/vendors/hip.h.
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>

@@ -166,11 +166,13 @@ The generator performs the following transaction:
 3. Compile every entry independently with `hipcc --genco -c` for the target architecture.
 4. Verify the artifact format, target architecture, and expected exported symbol.
 5. Read compiler resource metadata and apply the entry's resource gate when requested.
-6. Write artifacts and the generated host table to staging paths.
+6. Write artifacts, the non-source build-input stamp, and any changed generated host table to staging paths.
 7. Replace installed outputs atomically only after every entry succeeds.
 8. Remove stale artifacts that are no longer in the inventory.
 
 The current gfx1151 build uses direct unbundled GPU code-object output, optimization level `-O3`, an explicit C++ language level, a source-prefix map, and a deterministic per-symbol Clang CUID. Changes to these options are build-input changes and invalidate the generated set.
+
+The aggregate digest is stored in the ignored `.mmq-build-input` file beside locally generated HSACOs. It is not emitted into C++ source. The generated host header is rewritten only when its kernel IDs, symbols, or filenames change, so build-policy or kernel-body changes do not make the extension translation units stale.
 
 ## Compile cache
 
@@ -218,10 +220,10 @@ Optimization logs own the reason an entry is gated and the performance evidence 
 
 ## Source-only repository and package policy
 
-Generated HSACOs are build outputs:
+Generated HSACOs and the local build-input stamp are build outputs:
 
-- `*.hsaco` remains ignored by git;
-- source distributions contain no HSACOs;
+- `*.hsaco` and `.mmq-build-input` remain ignored by git;
+- source distributions contain neither HSACOs nor the build-input stamp;
 - source distributions include the generator, concrete-wrapper renderer, generated host table, and required headers;
 - local wheel builds run the generator before extension compilation;
 - generated artifacts are copied into the wheel build tree;

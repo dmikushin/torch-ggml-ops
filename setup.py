@@ -18,7 +18,8 @@ HEADER_DEPENDENCIES = [
     for path in sorted(CSRC.rglob(pattern))
     if not path.name.endswith("_hip.cuh")
 ]
-BUNDLE_BUILD_INPUTS = [
+SDIST_INPUTS = [
+    "csrc/vendor/llama_cpp/PROVENANCE.md",
     "tools/build_mmq_bundle.py",
     "tools/mmq_bundle_wrapper_source.py",
 ]
@@ -74,7 +75,7 @@ class BuildExtension(cpp_extension.BuildExtension):
     def get_source_files(self) -> list[str]:
         # CUDAExtension eagerly rewrites ext.sources to hipify-generated files
         # on ROCm. Source distributions should contain only the canonical input.
-        return [*SOURCES, *HEADER_DEPENDENCIES, *BUNDLE_BUILD_INPUTS]
+        return [*SOURCES, *HEADER_DEPENDENCIES, *SDIST_INPUTS]
 
 
 stable_defines = [
