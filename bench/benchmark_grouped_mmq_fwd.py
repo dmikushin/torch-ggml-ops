@@ -19,12 +19,16 @@ from grouped_mmq_benchmark_common import (
     GroupedMMQCase as GroupedForwardCase,
 )
 from grouped_mmq_benchmark_common import (
+    MODEL_FAMILY_CHOICES,
     RouteDistribution,
     benchmark_function,
+    bf16_fixed_mmq_reference,
     device_metadata,
     distribution_summary,
     error_metrics,
+    fixed_group_distribution,
     parse_name_list,
+    resolve_model_family,
     route_distributions,
     select_cases,
     truncate_distribution,
@@ -57,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-family",
-        choices=("auto", "qwen", "deepseek"),
+        choices=MODEL_FAMILY_CHOICES,
         default="auto",
         help="case family; auto detects DeepSeek from attn_output_a",
     )
@@ -139,14 +143,6 @@ def dense_fixed_mmq_reference(
     )
 
 
-def bf16_fixed_reference(
-    input: torch.Tensor,
-    logical_weight: torch.Tensor,
-) -> torch.Tensor:
-    group_major = torch.bmm(input.permute(1, 0, 2), logical_weight.transpose(1, 2))
-    return group_major.permute(1, 0, 2).contiguous()
-
-
 def correctness_metrics(
     case: GroupedForwardCase,
     input: torch.Tensor,
@@ -165,7 +161,7 @@ def correctness_metrics(
                 quant_type,
                 case.expected_out_features,
             )
-            bf16_reference = bf16_fixed_reference(input, logical_weights[0])
+            bf16_reference = bf16_fixed_mmq_reference(input, logical_weights[0])
         return {
             "rows": input.shape[0],
             "same_q8_dense": error_metrics(actual, dense_reference),
@@ -345,7 +341,7 @@ def benchmark_fixed_case(
             input=input,
             logical_weight=logical_weight,
         ):
-            return bf16_fixed_reference(input, logical_weight)
+            return bf16_fixed_mmq_reference(input, logical_weight)
 
         mmq_result = benchmark_function(
             mmq_function,
@@ -368,11 +364,7 @@ def benchmark_fixed_case(
 
         correctness_rows = min(rows, args.correctness_rows)
         correctness_input = input[:correctness_rows].clone()
-        fixed_distribution = RouteDistribution(
-            "fixed",
-            tuple(range(case.fixed_groups)),
-            (rows,) * case.fixed_groups,
-        )
+        fixed_distribution = fixed_group_distribution(rows, case.fixed_groups)
         correctness = correctness_metrics(
             case,
             correctness_input,
@@ -461,11 +453,9 @@ def main() -> None:
 
     reader = gguf.GGUFReader(args.model)
     tensors = {tensor.name: tensor for tensor in reader.tensors}
-    detected_model_family = (
-        "deepseek" if "blk.0.attn_output_a.weight" in tensors else "qwen"
-    )
-    model_family = (
-        detected_model_family if args.model_family == "auto" else args.model_family
+    model_family, detected_model_family = resolve_model_family(
+        args.model_family,
+        tensors,
     )
     cases = select_cases(args.cases, args.primary_only, model_family)
     quant_names = {int(value): value.name for value in gguf.GGMLQuantizationType}

@@ -49,16 +49,31 @@ The plan below is the next optimization program. Each experiment gets a short lo
 
 ### P0: Lock the measurement and implementation controls
 
+Status: completed for the B1/B4 optimization loop. The generic B16 baseline is intentionally deferred until P3-P5 remove its multi-second serial bodies.
+
 Before changing a kernel, make the DeepSeek benchmark a valid production comparison and capture the current implementation as the control.
 
 1. Extend `bench/benchmark_grouped_mmq_bwd.py` so model-family selection is explicit and the three DeepSeek cases use the correct contracts. The current harness defaults to Qwen and routes every non-pair case through the routed single operator; it cannot yet measure fixed output-A. Add a fixed-group path with token rows `M = batch * 2048`, cotangent shape `[M, 8, 1024]`, result shape `[M, 8, 4096]`, eight independent packed weights, and a BF16 reference with the same public layout. Do not represent fixed output-A as fabricated route metadata.
 2. Keep the routed DeepSeek path at `R = batch * 2048 * 6`, with the existing uniform, skewed, sparse, and boundary distributions. Record inactive experts, group-size histograms, non-multiple-16/64/128 counts, and total row-task counts. The fixed path has no routing distribution.
-3. Compare each packed result with both an independent Transformers GGUF dequantization reference and the dense packed reference. For routed pair backward, retain the one-FP32-accumulator/one-BF16-rounding contract as the primary packed reference; separately report the expected difference from two independently rounded AITER results. For fixed Q8_0, compare the public `[M, 8, K]` layout directly.
+3. Compare Qwen packed results with the existing dense packed reference. Dense backward does not support Q2_K, IQ2_XXS, or Q8_0, so compare the new types with independently dequantized per-expert BF16 matmul and AITER, and compare fixed Q8_0 with BF16 BMM in the public `[M, 8, K]` layout. For routed pair backward, retain the one-FP32-accumulator/one-BF16-rounding contract and separately report the expected difference from two independently rounded BF16 results.
 4. Record complete public-operator latency, arithmetic latency, incremental allocation, and reference latency. Separate the approximately 0.004 ms row-task builder from arithmetic when profiling, but include it in complete operator acceptance. Warm module loading before every timing series.
-5. Use the latest consolidated Qwen result as the Qwen control and create a same-build DeepSeek control, for example `/tmp/grouped_mmq_bwd_ds4_baseline_full.json`. The expected first DeepSeek matrix is 27 points: three fixed Q8_0 points, twelve IQ2_XXS pair points, and twelve Q2_K single points.
+5. Use the latest consolidated Qwen result as the Qwen control and create a same-build DeepSeek control. The first practical DeepSeek matrix has 18 B1/B4 points: two fixed Q8_0 points, eight IQ2_XXS pair points, and eight Q2_K single points. Add the nine B16 points after the retained large-row bodies make them practical.
 6. Run all GPU benchmarks and profilers sequentially with real nonzero tensors. Use the normal `3` warmups and `9` repeats for matrix coverage. Any fresh median movement above 1% gets a sequential 25-repeat A/B control. Compile bundle candidates with all CPU cores by default: `python tools/build_mmq_bundle.py --force --jobs "$(nproc)"`; use one job only for compiler debugging.
 
-P0 is complete only when the current Qwen matrix remains unchanged, the DeepSeek matrix runs end to end, fixed output-A allocation and layout are recorded, and all three new baseline code objects have resource metadata.
+P0 artifacts:
+
+```text
+/tmp/grouped_mmq_bwd_ds4_baseline_b1_b4.json
+/tmp/grouped_mmq_bwd_qwen_pre_ds4_control.json
+/tmp/grouped_mmq_bwd_ds4_fixed_harness_check.json
+/tmp/grouped_mmq_bwd_ds4_routed_harness_check.json
+```
+
+The generic DeepSeek baseline is uniformly slow. Fixed Q8_0 measures `51.038/212.396 ms` at B1/B4 and reaches only `0.140-0.151x` BF16 BMM throughput. IQ2_XXS pair measures `172.158-189.815 ms` at B1 and `1046.712-1075.508 ms` at B4, or `0.155-0.411x` AITER throughput. Q2_K single measures `72.464-94.062 ms` at B1 and `475.348-519.821 ms` at B4, or `0.142-0.372x` AITER throughput. The first attempted B16 IQ2_XXS points exceeded five seconds per packed call, validating the staged B16 policy.
+
+Fixed Q8_0 is within approximately `5.5e-5` NRMSE of BF16 BMM at the 256-row correctness sample and was bitwise equal in the 16-row focused check. Q2_K has zero numerical RMSE against independently dequantized BF16; IQ2_XXS pair remains in the expected approximately `0.00286` one-rounding NRMSE envelope. The same-build Qwen matrix retains 60 points and is the mandatory non-regression control.
+
+Run in-tree benchmarks with `PYTHONPATH=.` so direct `bench/*.py` invocation loads the current checkout rather than a stale installed extension. The forward and backward harnesses now share model-family resolution, fixed-group route summaries, and fixed-layout BF16 references through `bench/grouped_mmq_benchmark_common.py`.
 
 ### P1: Resource and ISA reconnaissance
 

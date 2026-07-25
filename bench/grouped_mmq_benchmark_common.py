@@ -2,12 +2,15 @@
 
 import argparse
 import statistics
+from collections.abc import Container
 from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
 import torch
 from mmq_benchmark_common import cuda_event_times_ms, incremental_peak_bytes
+
+MODEL_FAMILY_CHOICES = ("auto", "qwen", "deepseek")
 
 QUANT_BLOCK_GEOMETRY = {
     "Q8_0": (32, 34),
@@ -162,6 +165,43 @@ class RouteDistribution:
     @property
     def rows(self) -> int:
         return sum(self.group_sizes_cpu)
+
+
+def resolve_model_family(
+    requested: str,
+    tensor_names: Container[str],
+) -> tuple[str, str]:
+    detected = (
+        "deepseek" if "blk.0.attn_output_a.weight" in tensor_names else "qwen"
+    )
+    return (detected if requested == "auto" else requested), detected
+
+
+def fixed_group_distribution(rows: int, groups: int) -> RouteDistribution:
+    return RouteDistribution(
+        "fixed",
+        tuple(range(groups)),
+        (rows,) * groups,
+    )
+
+
+def bf16_fixed_mmq_reference(
+    input: torch.Tensor,
+    logical_weight: torch.Tensor,
+) -> torch.Tensor:
+    group_major = torch.bmm(
+        input.permute(1, 0, 2),
+        logical_weight.transpose(1, 2),
+    )
+    return group_major.permute(1, 0, 2).contiguous()
+
+
+def bf16_fixed_grad_input_reference(
+    grad_output: torch.Tensor,
+    logical_weight: torch.Tensor,
+) -> torch.Tensor:
+    group_major = torch.bmm(grad_output.permute(1, 0, 2), logical_weight)
+    return group_major.permute(1, 0, 2).contiguous()
 
 
 def parse_name_list(value: str) -> tuple[str, ...]:
