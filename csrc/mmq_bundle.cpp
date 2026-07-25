@@ -38,6 +38,19 @@ constexpr int kBackwardWaves = 4;
 constexpr int kBackwardTile = 16;
 constexpr int kQ80BlockValues = 32;
 constexpr int kKQuantBlockValues = 256;
+
+enum class DenseQ80Geometry {
+    G0,
+    G1,
+    G2,
+    G3,
+};
+
+constexpr DenseQ80Geometry kDeepSeekQaGeometry = DenseQ80Geometry::G2;
+constexpr DenseQ80Geometry kDeepSeekQbGeometry = DenseQ80Geometry::G2;
+constexpr DenseQ80Geometry kDeepSeekOutputBGeometry = DenseQ80Geometry::G2;
+constexpr DenseQ80Geometry kDeepSeekSharedGateUpGeometry = DenseQ80Geometry::G2;
+constexpr DenseQ80Geometry kDeepSeekSharedDownGeometry = DenseQ80Geometry::G2;
 constexpr int kGroupedBackwardThreads = 256;
 constexpr int kGroupedBackwardN = 16;
 constexpr int kGroupedBackwardMPerBlock = 128;
@@ -448,6 +461,35 @@ struct DenseBackwardSelection {
     int m_tiles_per_wave;
 };
 
+DenseBackwardSelection dense_q80_geometry_selection(
+        int rows,
+        DenseQ80Geometry geometry,
+        MMQKernelId g0,
+        MMQKernelId g1,
+        MMQKernelId g2,
+        MMQKernelId g3) {
+    switch (geometry) {
+        case DenseQ80Geometry::G1:
+            if (rows % 128 == 0) {
+                return {g1, 4, 32, 0, 2};
+            }
+            break;
+        case DenseQ80Geometry::G2:
+            if (rows % 128 == 0) {
+                return {g2, 8, 32, 0, 2};
+            }
+            break;
+        case DenseQ80Geometry::G3:
+            if (rows % 256 == 0) {
+                return {g3, 4, 32, 0, 4};
+            }
+            break;
+        case DenseQ80Geometry::G0:
+            break;
+    }
+    return {g0, 4, 16, 0, 1};
+}
+
 DenseBackwardSelection dense_backward_generic(
         std::int32_t quant_type,
         int n_tiles,
@@ -509,22 +551,58 @@ DenseBackwardSelection dense_backward_selection(
         const bool full_tiles = rows % 64 == 0;
         if (full_tiles) {
             if (out_features == 1024 && in_features == 4096) {
-                return {MMQKernelId::DenseBwdQ80ExactN1024K4096, 4, 16, 0, 1};
+                return dense_q80_geometry_selection(
+                    rows,
+                    kDeepSeekQaGeometry,
+                    MMQKernelId::DenseBwdQ80ExactN1024K4096,
+                    MMQKernelId::DenseBwdQ80ExactN1024K4096G1,
+                    MMQKernelId::DenseBwdQ80ExactN1024K4096G2,
+                    MMQKernelId::DenseBwdQ80ExactN1024K4096G3);
             }
             if (out_features == 32768 && in_features == 1024) {
-                return {MMQKernelId::DenseBwdQ80ExactN32768K1024, 4, 16, 0, 1};
+                return dense_q80_geometry_selection(
+                    rows,
+                    kDeepSeekQbGeometry,
+                    MMQKernelId::DenseBwdQ80ExactN32768K1024,
+                    MMQKernelId::DenseBwdQ80ExactN32768K1024G1,
+                    MMQKernelId::DenseBwdQ80ExactN32768K1024G2,
+                    MMQKernelId::DenseBwdQ80ExactN32768K1024G3);
             }
             if (out_features == 512 && in_features == 4096) {
-                return {MMQKernelId::DenseBwdQ80ExactN512K4096, 4, 16, 0, 1};
+                return dense_q80_geometry_selection(
+                    rows,
+                    DenseQ80Geometry::G2,
+                    MMQKernelId::DenseBwdQ80ExactN512K4096,
+                    MMQKernelId::DenseBwdQ80ExactN512K4096G1,
+                    MMQKernelId::DenseBwdQ80ExactN512K4096G2,
+                    MMQKernelId::DenseBwdQ80ExactN512K4096G3);
             }
             if (out_features == 4096 && in_features == 8192) {
-                return {MMQKernelId::DenseBwdQ80ExactN4096K8192, 4, 16, 0, 1};
+                return dense_q80_geometry_selection(
+                    rows,
+                    kDeepSeekOutputBGeometry,
+                    MMQKernelId::DenseBwdQ80ExactN4096K8192,
+                    MMQKernelId::DenseBwdQ80ExactN4096K8192G1,
+                    MMQKernelId::DenseBwdQ80ExactN4096K8192G2,
+                    MMQKernelId::DenseBwdQ80ExactN4096K8192G3);
             }
             if (out_features == 2048 && in_features == 4096) {
-                return {MMQKernelId::DenseBwdQ80ExactN2048K4096, 4, 16, 0, 1};
+                return dense_q80_geometry_selection(
+                    rows,
+                    kDeepSeekSharedGateUpGeometry,
+                    MMQKernelId::DenseBwdQ80ExactN2048K4096,
+                    MMQKernelId::DenseBwdQ80ExactN2048K4096G1,
+                    MMQKernelId::DenseBwdQ80ExactN2048K4096G2,
+                    MMQKernelId::DenseBwdQ80ExactN2048K4096G3);
             }
             if (out_features == 4096 && in_features == 2048) {
-                return {MMQKernelId::DenseBwdQ80ExactN4096K2048, 4, 16, 0, 1};
+                return dense_q80_geometry_selection(
+                    rows,
+                    kDeepSeekSharedDownGeometry,
+                    MMQKernelId::DenseBwdQ80ExactN4096K2048,
+                    MMQKernelId::DenseBwdQ80ExactN4096K2048G1,
+                    MMQKernelId::DenseBwdQ80ExactN4096K2048G2,
+                    MMQKernelId::DenseBwdQ80ExactN4096K2048G3);
             }
             if (out_features == 129280 && in_features == 4096) {
                 return {MMQKernelId::DenseBwdQ80ExactLMHeadFull, 4, 16, 0, 1};

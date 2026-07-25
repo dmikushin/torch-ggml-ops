@@ -921,6 +921,24 @@ A geometry branch must use only quant type, exact `(N,K)`, and public row count.
 
 DB2 closes when each geometry is retained or rejected for each legal shape class and the complete chosen ordinary matrix has a sequential 25-repeat bracket against DB1. The current generic wrapper remains the correctness fallback.
 
+DB2 result: G2 retained for all six ordinary geometries; G1 and G3 rejected.
+
+Artifacts:
+
+```text
+/tmp/mmq_bwd_ds4_p2_corrected_g1_9.json
+/tmp/mmq_bwd_ds4_p2_corrected_g3_9.json
+/tmp/mmq_bwd_ds4_p2_g0_after_25.json
+/tmp/mmq_bwd_ds4_p2_corrected_selected_25.json
+/tmp/mmq_bwd_ds4_p2_corrected_g0_after_25.json
+```
+
+The selected G2 body is `128x128/K32`, four waves, width-16 decode, exact full tiles, 192 VGPRs, 13 SGPRs, and 8 KiB LDS. It has zero private storage/spills and no dynamic stack. G1 (`128x64/K32`) uses 118 VGPRs and 4 KiB LDS; G3 (`256x64/K32`) uses 194 VGPRs and 4 KiB LDS. Both are resource-clean but lose to G2 on sustained production rows, and G3 loses on every measured shape/batch.
+
+The sequential 25-repeat G0/G2/G0 bracket improved all 18 ordinary points by `28.44-130.43%`, with a `77.49%` geometric latency gain. Checkpoint-weighted ordinary latency improved by `86.99%`, `96.51%`, and `99.95%` at B1/B4/B16. Selected G2 throughput spans approximately `5.78-20.03` logical TFLOP/s, compared with DB1's approximately `4.47-12.79` TFLOP/s.
+
+An initial screening accidentally transposed G1 and G3 ownership into closed `64x128` and `64x256` shapes. Those measurements were discarded before selection. G1/G3 were rebuilt with the documented M-row-by-dX-column axes and rerun across the complete ordinary matrix. G2 is symmetric and was unaffected. The static selector requires 128-row divisibility for G2 and retains G0 for smaller or unsupported rows.
+
 ### DB3: Q8_0 load, decode, and LDS lowering
 
 Apply this phase only to DB2 winners and only in the order below. Change one semantic mechanism at a time.

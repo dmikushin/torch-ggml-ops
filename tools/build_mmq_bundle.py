@@ -327,6 +327,34 @@ def _dense_backward_specs() -> list[KernelSpec]:
                 exact_in_features=in_features,
             )
         )
+    for label, out_features, in_features in (
+        ("N1024K4096", 1024, 4096),
+        ("N32768K1024", 32768, 1024),
+        ("N512K4096", 512, 4096),
+        ("N4096K8192", 4096, 8192),
+        ("N2048K4096", 2048, 4096),
+        ("N4096K2048", 4096, 2048),
+    ):
+        for geometry, n_tiles, m_tiles_per_wave in (
+            ("G1", 4, 2),
+            ("G2", 8, 2),
+            ("G3", 4, 4),
+        ):
+            specs.append(
+                _dense_backward_spec(
+                    f"DenseBwdQ80Exact{label}{geometry}",
+                    f"dense_bwd_q8_0_exact_{label.lower()}_{geometry.lower()}",
+                    QuantType.Q8_0,
+                    n_tiles,
+                    32,
+                    group_m=0,
+                    m_tiles_per_wave=m_tiles_per_wave,
+                    decoder_width=16,
+                    full_tiles=True,
+                    exact_out_features=out_features,
+                    exact_in_features=in_features,
+                )
+            )
     for full in (False, True):
         specs.append(
             _dense_backward_spec(
@@ -523,7 +551,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
             ),
         )
     )
-    assert len(specs) == 45
+    assert len(specs) == 63
     return specs
 
 
@@ -778,7 +806,7 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
     specs.extend(_grouped_forward_specs())
     specs.extend(_dense_backward_specs())
     specs.extend(_grouped_backward_specs())
-    assert len(specs) == 141
+    assert len(specs) == 159
     assert len({spec.cpp_id for spec in specs}) == len(specs)
     assert len({spec.symbol for spec in specs}) == len(specs)
     return tuple(specs)
