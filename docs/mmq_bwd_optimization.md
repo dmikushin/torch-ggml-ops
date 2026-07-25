@@ -840,7 +840,26 @@ DB0 must report complete packed and BF16 latency, throughput ratio, allocation, 
 
 Profile one representative from the short-reduction, long-reduction, widest-dX, and LM classes only after event timing is stable. Collect one counter at a time because the prior Q6_K multi-counter run faulted. Determine whether the current body is limited first by loader underfill, packed global waits, LDS fragment movement/banks, barrier exposure, WMMA dependencies, or insufficient workgroup reuse. Launcher and module-load time remain outside kernel optimization scope.
 
-DB0 is complete when the full matrix, checkpoint weighting, resources, and four representative profiles are recorded. No candidate is retained from a profile alone.
+DB0 result: complete.
+
+Artifacts:
+
+```text
+/tmp/mmq_bwd_ds4_p0_baseline_9.json
+/tmp/mmq_bwd_qwen_pre_ds4_control_9.json
+```
+
+The generic Q8_0 body is ownership-limited rather than resource-limited. It uses 92 VGPRs, 17 SGPRs, 2 KiB LDS, zero private storage/spills, and no dynamic stack, but sustains only about `3.35-7.29` logical TFLOP/s on ordinary cases. Every ordinary point loses to BF16:
+
+| Physical batch | Checkpoint-weighted packed ms | BF16 ms | Packed/BF16 throughput |
+| ---: | ---: | ---: | ---: |
+| 1 | 3,266.8 | 767.4 | `0.235x` |
+| 4 | 16,920.7 | 3,075.7 | `0.182x` |
+| 16 | 72,146.2 | 12,140.1 | `0.168x` |
+
+Per-family packed/BF16 ratios span `0.15-0.30x`. LM-head per-call ratios are `0.55x` at M32/M64, `0.96x` at M128, `0.47x` at M256, and `0.36x` at M512. The collapse at large rows and the low-resource code object match the grouped-backward diagnosis: narrow 64x64/reduction-16 ownership repeats decode and exposes too little M/N reuse; spills, allocation, and launcher overhead are not the first explanation.
+
+The Qwen control preserves the established qualitative result: wide query and Q6_K beat BF16, narrow Q3_K is at or above parity, and shared-down Q4_K/Q5_K remain the material deficits. Detailed DeepSeek counter collection moves to the first competitive DB2 geometry; profiling a body that is `3-6x` behind the known tiled direction would not select a fine lowering mechanism. No DB0 candidate is retained from profile evidence.
 
 ### DB1: exact Q8_0 shape and bounds specialization
 
@@ -859,6 +878,24 @@ All ordinary M values are production-full rows. LM M32 requires a bounded body i
 Compare exact candidate against generic before/after controls on the complete DeepSeek matrix. Inspect normalized ISA to verify that runtime bounds, division/remainder, and repeated address construction actually disappeared. Do not unroll the complete reduction body: dense forward showed loop control to be negligible beside a large reduction body, while grouped forward retained explicit unrolling only for a literal two-block loop.
 
 Retain exact wrappers per geometry, not globally. A shape may remain on the generic body if exact specialization does not produce a stable gain. DB1 should produce `/tmp/mmq_bwd_ds4_p1_exact_9.json` and 25-repeat brackets for every movement selected for dispatch.
+
+DB1 result: retained for all seven production geometries.
+
+Artifacts:
+
+```text
+/tmp/mmq_bwd_ds4_p1_exact_9.json
+/tmp/mmq_bwd_ds4_p1_generic_before_25.json
+/tmp/mmq_bwd_ds4_p1_exact_25.json
+/tmp/mmq_bwd_ds4_p1_generic_after_25.json
+/tmp/mmq_bwd_qwen_post_ds4_p1_control_9.json
+```
+
+Eight wrappers cover six full ordinary geometries plus full and bounded LM-head rows. The 25-repeat generic/exact/generic bracket improved all 18 ordinary points by `11.32-246.14%`, with a `60.58%` geometric latency gain. Checkpoint-weighted ordinary latency improved by `71.16%`, `44.23%`, and `41.46%` at B1/B4/B16. LM-head gains were `2.76%`, `21.25%`, `33.59%`, `137.00%`, and `132.57%` at M32/M64/M128/M256/M512.
+
+The full wrappers use 91 VGPRs, 14 SGPRs, and 2 KiB LDS; the bounded LM wrapper uses 91 VGPRs and 18 SGPRs. All have zero private storage/spills and no dynamic stack. Production benchmark correctness remained in the established Q8_0 envelope. The generic wrapper remains selected for unsupported and non-production shapes.
+
+The complete Qwen control preserved the existing qualitative dispatch: wide query and all Q6_K chunks beat BF16, narrow Q3_K remains at or above parity, and shared-down Q4_K/Q5_K remain the only material ordinary deficits. Short-point movement is retained for final warmed 25-repeat controls rather than interpreted from the nine-repeat matrix.
 
 ### DB2: bounded ordinary geometry search
 
@@ -935,7 +972,9 @@ Q4_K shared down remains a performance control because the bundle improved it by
 
 Retain each QB1 result independently. A Q3_K win does not authorize a shared template change for Q4_K/Q5_K, and a Q5_K extraction result does not authorize changing shared-down Q5_K. Run the complete Qwen matrix after every retained wrapper or dispatch change and preserve DeepSeek byte/ISA controls.
 
-### QB2: Qwen shared-down representation project
+### QB2: deferred Qwen shared-down representation project
+
+Status: deferred because this pass is limited to optimizations implemented inside this repository. No prepared-weight ownership, lifetime, invalidation, or model-load policy will be added in the current work.
 
 After the one legal Q5_K swizzle control, local shared-down geometry is closed. Q4_K/Q5_K remain approximately `0.78x/0.74x` BF16 across 40 ordinary tensors. The same decode ceiling appears in grouped Q4_K/IQ2_S down, while grouped task setup, spills, broad LDS caching, and local scheduling have already been ruled out.
 
@@ -950,7 +989,9 @@ A production representation must be an explicit model-owned prepared weight, nev
 
 Acceptance requires improvement in dense Q4_K and Q5_K shared-down controls and no regression in the already-fast packed forward path. If a common representation is proposed for grouped work, it must also preserve inactive-expert sparsity and pass all four grouped route distributions. Existing grouped evidence rejects unconditional transient BF16 and persistent BF16 expansion.
 
-### DB5: optional model-owned paired grad-input integration
+### DB5: deferred model-owned paired grad-input integration
+
+Status: deferred because it changes model-level API and autograd integration outside the current repository-local kernel pass.
 
 This is not a local kernel prerequisite and must not delay DB1-DB4. It is a separate model-integration opportunity derived from grouped backward's successful fused-pair design.
 
@@ -1000,7 +1041,7 @@ Execute in this order:
 5. DB4 LM row geometry.
 6. QB0/QB1 bounded Qwen retunes.
 7. DB6 complete-loss selection and release acceptance.
-8. QB2 representation and DB5 pair integration only as separate follow-up projects.
+8. Leave QB2 representation and DB5 pair integration deferred as separate model-level projects.
 
 Stop local DeepSeek work when every DB1-DB4 candidate is rejected or the selected packed matrix reaches a practical local plateau with resource-clean bodies. Do not continue merely because BF16 remains faster at an isolated point; first determine whether the gap is arithmetic, allocation, or representation. Stop Qwen local work after QB1 regardless of outcome. Further Qwen shared-down gains require QB2's explicit representation contract.
 

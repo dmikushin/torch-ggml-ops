@@ -556,6 +556,8 @@ struct backward_shared_b_tile {
 
 template <
     ggml_type type,
+    int EXACT_OUT_FEATURES,
+    int EXACT_IN_FEATURES,
     int N_TILES,
     int K_ITERATION,
     int GROUP_M,
@@ -580,6 +582,15 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
     constexpr int N_PER_BLOCK = N_TILES * BACKWARD_N_PER_TILE;
     constexpr int WEIGHT_BLOCK_VALUES =
         type == GGML_TYPE_Q8_0 ? QK8_0 : QK_K;
+    const int kernel_out_features = EXACT_OUT_FEATURES > 0
+        ? EXACT_OUT_FEATURES
+        : out_features;
+    const int kernel_in_features = EXACT_IN_FEATURES > 0
+        ? EXACT_IN_FEATURES
+        : in_features;
+    const int kernel_blocks_per_weight_row = EXACT_IN_FEATURES > 0
+        ? EXACT_IN_FEATURES / WEIGHT_BLOCK_VALUES
+        : blocks_per_weight_row;
     constexpr int M_PER_WAVE = M_TILES_PER_WAVE * BACKWARD_M_PER_TILE;
     constexpr int M_PER_BLOCK = M_PER_WAVE * BACKWARD_WAVES;
     const int wave = threadIdx.x / BACKWARD_WAVE_SIZE;
@@ -591,13 +602,14 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
     const int wave_row_start = block_row_start + wave * M_PER_WAVE;
     const int input_column_start = blockIdx.y * N_PER_BLOCK;
     const int64_t packed_row_bytes =
-        static_cast<int64_t>(blocks_per_weight_row) * gguf_block_bytes<type>();
+        static_cast<int64_t>(kernel_blocks_per_weight_row) *
+        gguf_block_bytes<type>();
 
     __shared__ backward_shared_b_tile<
         N_PER_BLOCK, K_ITERATION, LDS_PADDING, LDS_SWIZZLE_CHUNK> shared_b;
     f32_accumulator accumulators[M_TILES_PER_WAVE][N_TILES];
 
-    for (int output_start = 0; output_start < out_features;
+    for (int output_start = 0; output_start < kernel_out_features;
          output_start += K_ITERATION) {
         if constexpr (type == GGML_TYPE_Q6_K && N_TILES >= 2) {
             constexpr int groups_per_row = N_PER_BLOCK / 16;
@@ -611,7 +623,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                 const int output_column = output_start + k;
                 const int input_column = input_column_start + local_input_column;
                 if (FULL_TILES ||
-                    (input_column + 15 < in_features && output_column < out_features)
+                    (input_column + 15 < kernel_in_features &&
+                     output_column < kernel_out_features)
                 ) {
                     const char * packed_row = packed_weight +
                         static_cast<int64_t>(output_column) * packed_row_bytes;
@@ -794,8 +807,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                             values[index];
                     }
                 } else if (
-                    input_column + DECODER_WIDTH - 1 < in_features &&
-                    output_column < out_features
+                    input_column + DECODER_WIDTH - 1 < kernel_in_features &&
+                    output_column < kernel_out_features
                 ) {
                     const char * packed_row = packed_weight +
                         static_cast<int64_t>(output_column) * packed_row_bytes;
@@ -833,7 +846,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                 const int local_input_column = 4 * (quad_index % quads_per_row);
                 const int output_column = output_start + k;
                 const int input_column = input_column_start + local_input_column;
-                if (input_column + 3 < in_features && output_column < out_features) {
+                if (input_column + 3 < kernel_in_features &&
+                    output_column < kernel_out_features) {
                     const char * packed_row = packed_weight +
                         static_cast<int64_t>(output_column) * packed_row_bytes;
                     __hip_bfloat16 values[4];
@@ -871,7 +885,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                 const int local_input_column = 2 * (pair_index % pairs_per_row);
                 const int output_column = output_start + k;
                 const int input_column = input_column_start + local_input_column;
-                if (input_column + 1 < in_features && output_column < out_features) {
+                if (input_column + 1 < kernel_in_features &&
+                    output_column < kernel_out_features) {
                     const char * packed_row = packed_weight +
                         static_cast<int64_t>(output_column) * packed_row_bytes;
                     decode_backward_tile_pair<type>(
@@ -895,7 +910,8 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                 const int local_input_column = index % N_PER_BLOCK;
                 const int output_column = output_start + k;
                 const int input_column = input_column_start + local_input_column;
-                if (input_column < in_features && output_column < out_features) {
+                if (input_column < kernel_in_features &&
+                    output_column < kernel_out_features) {
                     const char * packed_row = packed_weight +
                         static_cast<int64_t>(output_column) * packed_row_bytes;
                     shared_b[local_input_column * K_ITERATION + k] =
@@ -925,11 +941,14 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                     const int output_column = output_start + k_tile + k;
                     if constexpr (FULL_TILES) {
                         a[k] = grad_output[
-                            static_cast<int64_t>(a_row) * out_features + output_column];
+                            static_cast<int64_t>(a_row) * kernel_out_features +
+                            output_column];
                     } else {
-                        a[k] = a_row < rows && output_column < out_features
+                        a[k] = a_row < rows &&
+                            output_column < kernel_out_features
                             ? grad_output[
-                                static_cast<int64_t>(a_row) * out_features + output_column]
+                                static_cast<int64_t>(a_row) * kernel_out_features +
+                                output_column]
                             : __float2bfloat16(0.0f);
                     }
                 }
@@ -1051,13 +1070,15 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
                     n_tile * BACKWARD_N_PER_TILE + c_row(lane);
                 if constexpr (FULL_TILES) {
                     grad_input[
-                        static_cast<int64_t>(output_row) * in_features + output_column] =
-                        __float2bfloat16(
+                        static_cast<int64_t>(output_row) * kernel_in_features +
+                        output_column] = __float2bfloat16(
                             accumulators[m_tile][n_tile].values[element]);
-                } else if (output_row < rows && output_column < in_features) {
+                } else if (
+                    output_row < rows && output_column < kernel_in_features
+                ) {
                     grad_input[
-                        static_cast<int64_t>(output_row) * in_features + output_column] =
-                        __float2bfloat16(
+                        static_cast<int64_t>(output_row) * kernel_in_features +
+                        output_column] = __float2bfloat16(
                             accumulators[m_tile][n_tile].values[element]);
                 }
             }

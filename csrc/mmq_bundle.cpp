@@ -506,6 +506,33 @@ DenseBackwardSelection dense_backward_selection(
         int out_features,
         int in_features) {
     if (quant_type == kQuantQ8_0) {
+        const bool full_tiles = rows % 64 == 0;
+        if (full_tiles) {
+            if (out_features == 1024 && in_features == 4096) {
+                return {MMQKernelId::DenseBwdQ80ExactN1024K4096, 4, 16, 0, 1};
+            }
+            if (out_features == 32768 && in_features == 1024) {
+                return {MMQKernelId::DenseBwdQ80ExactN32768K1024, 4, 16, 0, 1};
+            }
+            if (out_features == 512 && in_features == 4096) {
+                return {MMQKernelId::DenseBwdQ80ExactN512K4096, 4, 16, 0, 1};
+            }
+            if (out_features == 4096 && in_features == 8192) {
+                return {MMQKernelId::DenseBwdQ80ExactN4096K8192, 4, 16, 0, 1};
+            }
+            if (out_features == 2048 && in_features == 4096) {
+                return {MMQKernelId::DenseBwdQ80ExactN2048K4096, 4, 16, 0, 1};
+            }
+            if (out_features == 4096 && in_features == 2048) {
+                return {MMQKernelId::DenseBwdQ80ExactN4096K2048, 4, 16, 0, 1};
+            }
+            if (out_features == 129280 && in_features == 4096) {
+                return {MMQKernelId::DenseBwdQ80ExactLMHeadFull, 4, 16, 0, 1};
+            }
+        }
+        if (rows == 32 && out_features == 129280 && in_features == 4096) {
+            return {MMQKernelId::DenseBwdQ80ExactLMHeadBounded, 4, 16, 0, 1};
+        }
         return {MMQKernelId::DenseBwdQ80NT64KI16G0, 4, 16, 0, 1};
     }
     if (quant_type == kQuantQ3_K || quant_type == kQuantQ4_K ||

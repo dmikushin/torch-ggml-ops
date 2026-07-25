@@ -79,6 +79,8 @@ class DenseBackwardConfig:
     lds_swizzle_chunk: int
     pack_q5_quant_bytes: bool
     pack_q6_quant_bytes: bool
+    exact_out_features: int = 0
+    exact_in_features: int = 0
 
 
 @dataclass(frozen=True)
@@ -286,6 +288,8 @@ void {symbol}(
         int blocks_per_weight_row) {{
     torch_ggml_ops::ck::dense_mmq_grad_input_body<
         {_cpp_quant(config.quant_type)},
+        {config.exact_out_features},
+        {config.exact_in_features},
         {config.n_tiles},
         {config.k_iteration},
         {config.group_m},

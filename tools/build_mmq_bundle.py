@@ -269,6 +269,8 @@ def _dense_backward_spec(
     lds_swizzle_chunk: int = 0,
     pack_q5_quant_bytes: bool = False,
     pack_q6_quant_bytes: bool = False,
+    exact_out_features: int = 0,
+    exact_in_features: int = 0,
 ) -> KernelSpec:
     config = DenseBackwardConfig(
         quant_type=quant_type,
@@ -285,6 +287,8 @@ def _dense_backward_spec(
         lds_swizzle_chunk=lds_swizzle_chunk,
         pack_q5_quant_bytes=pack_q5_quant_bytes,
         pack_q6_quant_bytes=pack_q6_quant_bytes,
+        exact_out_features=exact_out_features,
+        exact_in_features=exact_in_features,
     )
     return KernelSpec(cpp_id, suffix, config, enforce_resource_gate=True)
 
@@ -301,6 +305,44 @@ def _dense_backward_specs() -> list[KernelSpec]:
             decoder_width=16,
         )
     ]
+    for label, out_features, in_features in (
+        ("N1024K4096", 1024, 4096),
+        ("N32768K1024", 32768, 1024),
+        ("N512K4096", 512, 4096),
+        ("N4096K8192", 4096, 8192),
+        ("N2048K4096", 2048, 4096),
+        ("N4096K2048", 4096, 2048),
+    ):
+        specs.append(
+            _dense_backward_spec(
+                f"DenseBwdQ80Exact{label}",
+                f"dense_bwd_q8_0_exact_{label.lower()}",
+                QuantType.Q8_0,
+                4,
+                16,
+                group_m=0,
+                decoder_width=16,
+                full_tiles=True,
+                exact_out_features=out_features,
+                exact_in_features=in_features,
+            )
+        )
+    for full in (False, True):
+        specs.append(
+            _dense_backward_spec(
+                f"DenseBwdQ80ExactLMHead{'Full' if full else 'Bounded'}",
+                "dense_bwd_q8_0_exact_lm_head_"
+                f"{'full' if full else 'bounded'}",
+                QuantType.Q8_0,
+                4,
+                16,
+                group_m=0,
+                decoder_width=16,
+                full_tiles=full,
+                exact_out_features=129280,
+                exact_in_features=4096,
+            )
+        )
 
     def generic(
         label: str,
@@ -481,7 +523,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
             ),
         )
     )
-    assert len(specs) == 37
+    assert len(specs) == 45
     return specs
 
 
@@ -736,7 +778,7 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
     specs.extend(_grouped_forward_specs())
     specs.extend(_dense_backward_specs())
     specs.extend(_grouped_backward_specs())
-    assert len(specs) == 133
+    assert len(specs) == 141
     assert len({spec.cpp_id for spec in specs}) == len(specs)
     assert len({spec.symbol for spec in specs}) == len(specs)
     return tuple(specs)
