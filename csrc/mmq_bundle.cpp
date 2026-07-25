@@ -851,7 +851,14 @@ void launch_grouped_backward(
     MMQKernelId id = grouped_backward_generic_kernel(quant_type, false);
     int n_per_block = kGroupedBackwardN;
     int threads = kGroupedBackwardThreads;
-    if (out_features == 2048 && in_features == 512) {
+    if (out_features == 4096 && in_features == 2048 &&
+        quant_type == kQuantQ2_K) {
+        id = rows >= num_groups * 128
+            ? MMQKernelId::GroupedBwdSingleQ2KN4096K2048M128N64
+            : MMQKernelId::GroupedBwdSingleQ2KN4096K2048M64N64;
+        n_per_block = 64;
+        threads = kBackwardThreads;
+    } else if (out_features == 2048 && in_features == 512) {
         if (rows >= num_groups * 128 &&
             (quant_type == kQuantQ4_K || quant_type == kQuantQ5_K ||
              quant_type == kQuantIQ2_S)) {
@@ -947,7 +954,11 @@ void launch_grouped_pair_backward(
     int n_per_block = kGroupedBackwardN;
     int threads = kGroupedBackwardThreads;
     bool specialized = false;
-    if (out_features == 512 && in_features == 2048) {
+    if (out_features == 2048 && in_features == 4096 &&
+        quant_type == kQuantIQ2_XXS) {
+        id = MMQKernelId::GroupedBwdPairIQ2XXSN2048K4096M64N64;
+        specialized = true;
+    } else if (out_features == 512 && in_features == 2048) {
         if (quant_type == kQuantQ3_K) {
             id = rows >= num_groups * 128
                 ? MMQKernelId::GroupedBwdPairQ3KN512K2048M128N64

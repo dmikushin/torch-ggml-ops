@@ -77,6 +77,8 @@ Run in-tree benchmarks with `PYTHONPATH=.` so direct `bench/*.py` invocation loa
 
 ### P1: Resource and ISA reconnaissance
 
+Status: completed.
+
 Compile the current generic DeepSeek entries and inspect their code objects before selecting a production geometry:
 
 - `GroupedBwdPairIQ2XXSGeneric`.
@@ -86,6 +88,8 @@ Compile the current generic DeepSeek entries and inspect their code objects befo
 Capture normalized disassembly, VGPR/SGPR counts, LDS, private bytes, spills, dynamic stack, wave count, and code-object symbols. The generic bodies are correctness fallbacks, not presumed production kernels. Add resource gates to every retained DeepSeek specialization and require zero private bytes, zero VGPR/SGPR spills, zero dynamic stack, and LDS within the 64 KiB workgroup limit. Treat 256 VGPRs as the practical warning boundary because the Qwen Q5_K row-task kernel already sits there.
 
 Use the source-level HIP semantics as the hypothesis, not raw instruction movement: tile ownership, reuse of BF16 cotangent fragments, packed metadata lifetime, decoder sharing, row-task order, and bounds specialization. Normalize disassembly before comparing artifacts. A changed code-object offset, symbol order, or translation-unit layout is not evidence of an optimization.
+
+P1 found no spill-removal opportunity. The generic Q2_K single uses 46 VGPRs, 24 SGPRs, and 512 bytes LDS; the generic IQ2_XXS pair uses 65 VGPRs, 40 SGPRs, and 3,072 bytes LDS; fixed Q8_0 uses 35 VGPRs, 18 SGPRs, and 512 bytes LDS. All three have zero private bytes, zero spills, and no dynamic stack. Their normalized static bodies contain 566, 859, and 489 instructions through the first `s_endpgm`, respectively. The decisive baseline defect is the eight-wave `N=16,K=16` ownership and serial row loop, not resource overflow. This justified spending resources on four-wave `N=64,K=32` cotangent and decode reuse.
 
 ### P2: Tune the fixed eight-group Q8_0 path
 
@@ -102,7 +106,13 @@ Profile the best fixed candidates at all three token counts. A candidate is reta
 
 ### P3: Tune routed IQ2_XXS gate/up backward
 
+Status: P3.1 retained; local decoder/layout controls remain.
+
 DeepSeek gate/up is the highest-priority new routed kernel because it is a fused pair called 43 times and has `R = 12,288/49,152/196,608` rows. Its pair fusion should remain the control: one output allocation, two packed weight decodes, one FP32 accumulator set, and one BF16 rounding.
+
+P3.1 replaced the generic body with an exact `(N,K)=(2048,4096)`, four-wave `M=64,N=64,K=32` pair body. Cooperative width-16 decode shares each IQ2_XXS packed word, two grid lookups, parity-adjusted signs, and scale across sixteen values. An initial decoder took the address of a local packed word and produced an 8-byte private segment; shift/mask grid-index extraction kept the word in registers and restored the zero-private gate. The retained body uses 177 VGPRs, 54 SGPRs, 8,192 bytes LDS, zero private bytes, zero spills, and no dynamic stack. The M128/N64 pair candidate still produced an 8-byte private segment and was rejected before timing.
+
+Artifacts are `/tmp/grouped_mmq_bwd_ds4_tiled_focus.json`, `/tmp/grouped_mmq_bwd_ds4_tiled_b1_b4.json`, and `/tmp/grouped_mmq_bwd_ds4_tiled_b16.json`. P3.1 improved every B1/B4 point by `3.52-7.82x` over the generic baseline. It now measures `43.740-51.001 ms` at B1, `133.859-160.494 ms` at B4, and `550.696-592.742 ms` at B16, winning all twelve points against AITER at `1.18-1.69x`, `1.19-1.29x`, and `1.50-1.59x`, respectively.
 
 Start with shape-specialized bodies rather than changing the generic ABI:
 
@@ -117,7 +127,15 @@ For the pair layout, begin with the retained IQ2_S pair principles: separate wei
 
 ### P4: Tune routed Q2_K down backward
 
+Status: P4.1 retained; decoder unroll, N width, and row-task controls remain.
+
 DeepSeek Q2_K down is the highest-priority new single because it is called 43 times and has the largest routed output shape `(N, K) = (4096, 2048)`. It should be treated as a separate decoder and dispatch family. The forward log's factor-4 Q2 scale/min unrolling is useful evidence for metadata reuse, but it does not prove the backward tile or unroll is optimal.
+
+P4.1 added exact four-wave `N=64,K=32` bodies with M64 below average 128 rows and M128 otherwise. The width-16 decoder shares one Q2_K scale/min group and packed shift across sixteen values. M64 uses 103 VGPRs, 30 SGPRs, and 4,096 bytes LDS; M128 uses 143 VGPRs, 30 SGPRs, and 4,096 bytes LDS. Both have zero private bytes, zero spills, and no dynamic stack.
+
+P4.1 improved every B1/B4 point by `3.00-10.19x` over generic. It now measures `21.841-25.405 ms` at B1, `50.920-53.248 ms` at B4, and `172.840-191.703 ms` at B16. It wins all twelve AITER comparisons at `1.07-1.55x`, `1.35-1.54x`, and `1.98-2.17x`, respectively. Numerical RMSE remains zero against independently dequantized BF16; differing-element counts with zero absolute error are signed-zero differences.
+
+The same-build Qwen control is `/tmp/grouped_mmq_bwd_qwen_post_ds4_tiled_control.json`. Against `/tmp/grouped_mmq_bwd_qwen_pre_ds4_control.json`, packed latency improves by 1.08% geometrically and 0.72% by median point; the largest observed regression is 0.91%. All 60 correctness checks preserve their established envelopes, so P3.1/P4.1 do not regress the existing cases.
 
 Use this bounded sequence:
 
@@ -129,6 +147,8 @@ Use this bounded sequence:
 The first Q2_K dispatch candidates are S1 below average 80 rows, S2 at 80-127, and row tasks at 128+, but this is only an initial bracket. Select thresholds from route-bucket results at 48, 64, 80, 96, 128, 192, 256, and 768 rows, using complete public latency and the four DeepSeek distributions.
 
 ### P5: Select DeepSeek routing and fixed-shape dispatch
+
+Status: the first B16 routed matrix is now practical and complete; threshold selection remains.
 
 After P2-P4, create explicit lookup entries keyed by quant type, pair/single/fixed operator, exact `(M, N, K)` geometry, and route bucket. Dispatch may use host-visible `rows`, `num_groups`, shape, and quant type, but must not inspect device offsets or synchronize metadata to the host.
 
