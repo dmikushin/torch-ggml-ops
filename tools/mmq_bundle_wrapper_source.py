@@ -396,16 +396,16 @@ _SPECIAL_GROUPED_CALLS = {
         "torch_ggml_ops::ck::grouped_mmq_grad_input_iq2_row_task_body",
     GroupedBackwardKind.Q2_K_SINGLE_M64_U1:
         "torch_ggml_ops::ck::grouped_mmq_grad_input_deepseek_body<"
-        "GGML_TYPE_Q2_K, 4096, 2048, 8, 1, 1>",
+        "GGML_TYPE_Q2_K, 4096, 2048, 8, 1, 1, true>",
     GroupedBackwardKind.Q2_K_SINGLE_M128_U1:
         "torch_ggml_ops::ck::grouped_mmq_grad_input_deepseek_body<"
-        "GGML_TYPE_Q2_K, 4096, 2048, 8, 2, 1>",
+        "GGML_TYPE_Q2_K, 4096, 2048, 8, 2, 1, true>",
     GroupedBackwardKind.IQ2_XXS_PAIR_M64:
         "torch_ggml_ops::ck::grouped_mmq_pair_grad_input_deepseek_body<"
-        "GGML_TYPE_IQ2_XXS, 2048, 4096, 16, 1>",
+        "GGML_TYPE_IQ2_XXS, 2048, 4096, 16, 1, true>",
     GroupedBackwardKind.Q2_K_SINGLE_M128_U2:
         "torch_ggml_ops::ck::grouped_mmq_grad_input_deepseek_body<"
-        "GGML_TYPE_Q2_K, 4096, 2048, 8, 2, 2>",
+        "GGML_TYPE_Q2_K, 4096, 2048, 8, 2, 2, true>",
 }
 
 _PAIR_KINDS = {

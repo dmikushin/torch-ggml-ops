@@ -31,7 +31,8 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_q4_tile(
         grouped_backward_q4_shared_tile & shared_b,
         int block_row_start,
         int row_end,
-        int input_column_start) {
+        int input_column_start,
+        bool skip_inactive_m_tiles = false) {
     constexpr int packed_row_bytes =
         GROUPED_BACKWARD_TILED_Q4_BLOCKS_PER_ROW * sizeof(block_q4_K);
     const int wave = threadIdx.x / BACKWARD_WAVE_SIZE;
@@ -90,6 +91,13 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_q4_tile(
             for (int m_tile = 0;
                  m_tile < GROUPED_BACKWARD_TILED_M_TILES_PER_WAVE;
                  ++m_tile) {
+                if constexpr (!FULL_ROWS) {
+                    if (skip_inactive_m_tiles &&
+                        wave_row_start + m_tile * BACKWARD_M_PER_TILE >=
+                            row_end) {
+                        continue;
+                    }
+                }
                 __hip_bfloat16 * a = fragment_data(a_fragments[m_tile]);
                 const int a_row = wave_row_start +
                     m_tile * BACKWARD_M_PER_TILE + c_row(lane);
@@ -129,6 +137,13 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_q4_tile(
                 for (int m_tile = 0;
                      m_tile < GROUPED_BACKWARD_TILED_M_TILES_PER_WAVE;
                      ++m_tile) {
+                    if constexpr (!FULL_ROWS) {
+                        if (skip_inactive_m_tiles &&
+                            wave_row_start + m_tile * BACKWARD_M_PER_TILE >=
+                                row_end) {
+                            continue;
+                        }
+                    }
                     wmma_f32_16x16x16_bf16(
                         accumulators[m_tile][n_tile],
                         a_fragments[m_tile],
@@ -138,6 +153,13 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_q4_tile(
                 for (int m_tile = 0;
                      m_tile < GROUPED_BACKWARD_TILED_M_TILES_PER_WAVE;
                      ++m_tile) {
+                    if constexpr (!FULL_ROWS) {
+                        if (skip_inactive_m_tiles &&
+                            wave_row_start + m_tile * BACKWARD_M_PER_TILE >=
+                                row_end) {
+                            continue;
+                        }
+                    }
                     wmma_f32_16x16x16_bf16(
                         accumulators[m_tile][n_tile + 1],
                         a_fragments[m_tile],
@@ -152,6 +174,12 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_q4_tile(
     for (int m_tile = 0;
          m_tile < GROUPED_BACKWARD_TILED_M_TILES_PER_WAVE;
          ++m_tile) {
+        if constexpr (!FULL_ROWS) {
+            if (skip_inactive_m_tiles &&
+                wave_row_start + m_tile * BACKWARD_M_PER_TILE >= row_end) {
+                continue;
+            }
+        }
 #pragma unroll
         for (int n_tile = 0;
              n_tile < GROUPED_BACKWARD_TILED_N_TILES;
@@ -218,12 +246,19 @@ static __device__ __forceinline__ void grouped_backward_accumulate_projection(
         int wave_row_start,
         int row_end,
         int output_start,
-        int lane) {
+        int lane,
+        bool skip_inactive_m_tiles = false) {
 #pragma unroll
     for (int k_tile = 0; k_tile < GROUPED_BACKWARD_TILED_K; k_tile += 16) {
         bf16_fragment a_fragments[M_TILES_PER_WAVE];
 #pragma unroll
         for (int m_tile = 0; m_tile < M_TILES_PER_WAVE; ++m_tile) {
+            if constexpr (!FULL_ROWS) {
+                if (skip_inactive_m_tiles &&
+                    wave_row_start + m_tile * BACKWARD_M_PER_TILE >= row_end) {
+                    continue;
+                }
+            }
             __hip_bfloat16 * a = fragment_data(a_fragments[m_tile]);
             const int a_row = wave_row_start +
                 m_tile * BACKWARD_M_PER_TILE + c_row(lane);
@@ -256,6 +291,13 @@ static __device__ __forceinline__ void grouped_backward_accumulate_projection(
                 k_tile);
 #pragma unroll
             for (int m_tile = 0; m_tile < M_TILES_PER_WAVE; ++m_tile) {
+                if constexpr (!FULL_ROWS) {
+                    if (skip_inactive_m_tiles &&
+                        wave_row_start + m_tile * BACKWARD_M_PER_TILE >=
+                            row_end) {
+                        continue;
+                    }
+                }
                 wmma_f32_16x16x16_bf16(
                     accumulators[m_tile][n_tile],
                     a_fragments[m_tile],
@@ -263,6 +305,13 @@ static __device__ __forceinline__ void grouped_backward_accumulate_projection(
             }
 #pragma unroll
             for (int m_tile = 0; m_tile < M_TILES_PER_WAVE; ++m_tile) {
+                if constexpr (!FULL_ROWS) {
+                    if (skip_inactive_m_tiles &&
+                        wave_row_start + m_tile * BACKWARD_M_PER_TILE >=
+                            row_end) {
+                        continue;
+                    }
+                }
                 wmma_f32_16x16x16_bf16(
                     accumulators[m_tile][n_tile + 1],
                     a_fragments[m_tile],
@@ -283,9 +332,16 @@ static __device__ __forceinline__ void grouped_backward_store_tile(
         int wave_row_start,
         int row_end,
         int input_column_start,
-        int lane) {
+        int lane,
+        bool skip_inactive_m_tiles = false) {
 #pragma unroll
     for (int m_tile = 0; m_tile < M_TILES_PER_WAVE; ++m_tile) {
+        if constexpr (!FULL_ROWS) {
+            if (skip_inactive_m_tiles &&
+                wave_row_start + m_tile * BACKWARD_M_PER_TILE >= row_end) {
+                continue;
+            }
+        }
 #pragma unroll
         for (int n_tile = 0; n_tile < N_TILES; ++n_tile) {
 #pragma unroll
@@ -582,6 +638,7 @@ template <
     int BLOCKS_PER_WEIGHT_ROW,
     int M_TILES_PER_WAVE,
     int REDUCTION_UNROLL,
+    bool SKIP_INACTIVE_M_TILES,
     bool FULL_ROWS>
 static __device__ __forceinline__ void grouped_mmq_grad_input_deepseek_tile(
         const __hip_bfloat16 * __restrict__ grad_output,
@@ -637,7 +694,8 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_deepseek_tile(
             wave_row_start,
             row_end,
             output_start,
-            lane);
+            lane,
+            SKIP_INACTIVE_M_TILES);
         __syncthreads();
     }
 
@@ -651,7 +709,8 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_deepseek_tile(
         wave_row_start,
         row_end,
         input_column_start,
-        lane);
+        lane,
+        SKIP_INACTIVE_M_TILES);
 }
 
 template <
@@ -660,7 +719,8 @@ template <
     int IN_FEATURES,
     int BLOCKS_PER_WEIGHT_ROW,
     int M_TILES_PER_WAVE,
-    int REDUCTION_UNROLL>
+    int REDUCTION_UNROLL,
+    bool SKIP_INACTIVE_M_TILES>
 static __device__ __forceinline__ void grouped_mmq_grad_input_deepseek_body(
         const __hip_bfloat16 * __restrict__ grad_output,
         const char * __restrict__ packed_weight,
@@ -695,6 +755,7 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_deepseek_body(
             BLOCKS_PER_WEIGHT_ROW,
             M_TILES_PER_WAVE,
             REDUCTION_UNROLL,
+            SKIP_INACTIVE_M_TILES,
             true>(
             grad_output,
             expert_weight,
@@ -712,6 +773,7 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_deepseek_body(
             BLOCKS_PER_WEIGHT_ROW,
             M_TILES_PER_WAVE,
             REDUCTION_UNROLL,
+            SKIP_INACTIVE_M_TILES,
             false>(
             grad_output,
             expert_weight,
@@ -729,6 +791,7 @@ template <
     int IN_FEATURES,
     int BLOCKS_PER_WEIGHT_ROW,
     int M_TILES_PER_WAVE,
+    bool SKIP_INACTIVE_M_TILES,
     bool FULL_ROWS>
 static __device__ __forceinline__ void grouped_mmq_pair_grad_input_deepseek_tile(
         const __hip_bfloat16 * __restrict__ first_grad_output,
@@ -797,7 +860,8 @@ static __device__ __forceinline__ void grouped_mmq_pair_grad_input_deepseek_tile
             wave_row_start,
             row_end,
             output_start,
-            lane);
+            lane,
+            SKIP_INACTIVE_M_TILES);
         grouped_backward_accumulate_projection<
             GROUPED_BACKWARD_SMALL_N_TILES,
             M_TILES_PER_WAVE,
@@ -809,7 +873,8 @@ static __device__ __forceinline__ void grouped_mmq_pair_grad_input_deepseek_tile
             wave_row_start,
             row_end,
             output_start,
-            lane);
+            lane,
+            SKIP_INACTIVE_M_TILES);
         __syncthreads();
     }
 
@@ -823,7 +888,8 @@ static __device__ __forceinline__ void grouped_mmq_pair_grad_input_deepseek_tile
         wave_row_start,
         row_end,
         input_column_start,
-        lane);
+        lane,
+        SKIP_INACTIVE_M_TILES);
 }
 
 template <
@@ -831,7 +897,8 @@ template <
     int OUT_FEATURES,
     int IN_FEATURES,
     int BLOCKS_PER_WEIGHT_ROW,
-    int M_TILES_PER_WAVE>
+    int M_TILES_PER_WAVE,
+    bool SKIP_INACTIVE_M_TILES>
 static __device__ __forceinline__ void grouped_mmq_pair_grad_input_deepseek_body(
         const __hip_bfloat16 * __restrict__ first_grad_output,
         const __hip_bfloat16 * __restrict__ second_grad_output,
@@ -870,6 +937,7 @@ static __device__ __forceinline__ void grouped_mmq_pair_grad_input_deepseek_body
             IN_FEATURES,
             BLOCKS_PER_WEIGHT_ROW,
             M_TILES_PER_WAVE,
+            SKIP_INACTIVE_M_TILES,
             true>(
             first_grad_output,
             second_grad_output,
@@ -889,6 +957,7 @@ static __device__ __forceinline__ void grouped_mmq_pair_grad_input_deepseek_body
             IN_FEATURES,
             BLOCKS_PER_WEIGHT_ROW,
             M_TILES_PER_WAVE,
+            SKIP_INACTIVE_M_TILES,
             false>(
             first_grad_output,
             second_grad_output,
@@ -1320,7 +1389,8 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_q5_tile(
         SharedTile & shared_b,
         int block_row_start,
         int row_end,
-        int input_column_start) {
+        int input_column_start,
+        bool skip_inactive_m_tiles = false) {
     constexpr int packed_row_bytes =
         GROUPED_BACKWARD_TILED_Q5_BLOCKS_PER_ROW * sizeof(block_q5_K);
     constexpr int n_per_block = N_TILES * BACKWARD_N_PER_TILE;
@@ -1423,7 +1493,8 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_q5_tile(
             wave_row_start,
             row_end,
             output_start,
-            lane);
+            lane,
+            skip_inactive_m_tiles);
         __syncthreads();
     }
 
@@ -1437,7 +1508,8 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_q5_tile(
         wave_row_start,
         row_end,
         input_column_start,
-        lane);
+        lane,
+        skip_inactive_m_tiles);
 }
 
 static __device__ __forceinline__ void grouped_mmq_grad_input_q5_small_body(
@@ -1534,7 +1606,8 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_iq2_tile(
         SharedTile & shared_b,
         int block_row_start,
         int row_end,
-        int input_column_start) {
+        int input_column_start,
+        bool skip_inactive_m_tiles = false) {
     constexpr int packed_row_bytes =
         GROUPED_BACKWARD_TILED_IQ2_DOWN_BLOCKS_PER_ROW * sizeof(block_iq2_s);
     constexpr int n_per_block = N_TILES * BACKWARD_N_PER_TILE;
@@ -1585,7 +1658,8 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_iq2_tile(
             wave_row_start,
             row_end,
             output_start,
-            lane);
+            lane,
+            skip_inactive_m_tiles);
         __syncthreads();
     }
 
@@ -1599,7 +1673,8 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_iq2_tile(
         wave_row_start,
         row_end,
         input_column_start,
-        lane);
+        lane,
+        skip_inactive_m_tiles);
 }
 
 template <bool SMALL>
@@ -2049,7 +2124,8 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_q4_row_task_body(
         shared_b,
         row_start,
         row_end,
-        input_column_start);
+        input_column_start,
+        true);
 }
 
 static __device__ __forceinline__ void grouped_mmq_grad_input_q5_row_task_body(
@@ -2082,7 +2158,8 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_q5_row_task_body(
         shared_b,
         row_start,
         row_end,
-        input_column_start);
+        input_column_start,
+        true);
 }
 
 static __device__ __forceinline__ void grouped_mmq_grad_input_iq2_row_task_body(
@@ -2115,7 +2192,8 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_iq2_row_task_body(
         shared_b,
         row_start,
         row_end,
-        input_column_start);
+        input_column_start,
+        false);
 }
 
 } // namespace torch_ggml_ops::ck
