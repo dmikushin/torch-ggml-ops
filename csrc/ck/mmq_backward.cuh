@@ -930,7 +930,7 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
         }
         __syncthreads();
 
-        if (wave < ACTIVE_WAVES) {
+        if (ACTIVE_WAVES == BACKWARD_WAVES || wave < ACTIVE_WAVES) {
 #pragma unroll
           for (int k_tile = 0; k_tile < K_ITERATION; k_tile += 16) {
             bf16_fragment a_fragments[M_TILES_PER_WAVE];
@@ -1047,7 +1047,7 @@ static __device__ __forceinline__ void dense_mmq_grad_input_body(
         __syncthreads();
     }
 
-    if (wave < ACTIVE_WAVES) {
+    if (ACTIVE_WAVES == BACKWARD_WAVES || wave < ACTIVE_WAVES) {
 #pragma unroll
       for (int m_tile = 0; m_tile < M_TILES_PER_WAVE; ++m_tile) {
 #pragma unroll

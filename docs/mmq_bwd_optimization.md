@@ -1011,7 +1011,7 @@ Artifacts:
 /tmp/mmq_bwd_ds4_p4_control_after_25.json
 ```
 
-The M32 body keeps all four waves available for cooperative decode and barriers but limits cotangent loads, WMMA, and output stores to two active waves. It therefore covers exactly 32 rows without computing hidden padded output rows. Relative to the bounded four-wave control it improves `1.45%` in the 25-repeat bracket. M64 remains on exact G0 and is unchanged.
+The M32 body keeps all four waves available for cooperative decode and barriers but limits cotangent loads, WMMA, and output stores to two active waves. It therefore covers exactly 32 rows without computing hidden padded output rows. Relative to the bounded four-wave control it improves `1.45%` in the 25-repeat bracket. M64 remains on exact G0 and is unchanged. The active-wave predicate is compile-time true for ordinary four-wave wrappers; this preserves their pre-DB4 normalized ISA while retaining the runtime two-wave guard only for M32.
 
 M128 selects G1 (`128x64/K32`) for a `19.48%` kernel gain. M256 and M512 select G3 (`256x64/K32`) for `51.85%` and `60.64%`; M512 uses two exact M256 workgroups. G2 is rejected for all LM chunks. The selected variants use 91-194 VGPRs, 2-4 KiB LDS, zero private storage/spills, and no dynamic stack.
 
@@ -1022,6 +1022,18 @@ Selected per-call latency at M32/M64/M128/M256/M512 is `8.297/7.459/7.569/10.386
 Before any Qwen retune, rerun the complete current packaged matrix. The old bundle controls showed byte-identical kernels moving by more than 1%, and the current bundle now includes DeepSeek Q8_0 backward. Use warmed standalone artifacts and save a new source-of-record baseline.
 
 Keep the accepted Qwen geometry and all closed neighborhoods unchanged. Ordinary Qwen's 128x128/K32/GROUP_M1 body, Q6 row geometries, and current dispatch remain controls, not candidates.
+
+QB0 result: refreshed packaged baseline complete.
+
+Artifact:
+
+```text
+/tmp/mmq_bwd_qwen_qb0_folded_25.json
+```
+
+An initial QB0 run retained a runtime `wave < ACTIVE_WAVES` predicate in every four-wave specialization and changed normalized Qwen ISA. Its timing is discarded. Folding the condition to unconditional execution when `ACTIVE_WAVES == 4` restores normalized-ISA identity for wide Q3_K, shared-down Q4_K/Q5_K, and Q6_K M256 relative to the pre-DB4 bundle.
+
+The corrected 25-repeat baseline measures wide Q3_K at `3.437/12.724/50.120 ms`, narrow Q5_K at `0.240/0.776/3.008 ms`, shared-down Q5_K at `0.237/1.469/5.592 ms`, and Q6_K M256 at `12.522 ms`. Wide query, narrow Q3_K, attention output, and all Q6 chunks preserve their accepted behavior. Shared-down Q4_K/Q5_K remain the material ordinary deficits.
 
 ### QB1: bounded Qwen HSACO retuning
 
