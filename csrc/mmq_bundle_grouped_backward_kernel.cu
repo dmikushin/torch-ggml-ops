@@ -232,14 +232,14 @@ void MMQ_BUNDLE_KERNEL_SYMBOL(
 extern "C" __launch_bounds__(torch_ggml_ops::ck::BACKWARD_THREADS, 2) __global__
 void MMQ_BUNDLE_KERNEL_SYMBOL(MMQ_GROUPED_DEEPSEEK_SINGLE_ARGUMENTS) {
     torch_ggml_ops::ck::grouped_mmq_grad_input_deepseek_body<
-        GGML_TYPE_Q2_K, 4096, 2048, 8, 1>(
+        GGML_TYPE_Q2_K, 4096, 2048, 8, 1, 1>(
             MMQ_GROUPED_DEEPSEEK_SINGLE_VALUES);
 }
 #elif MMQ_BUNDLE_GROUPED_BWD_KIND == 17
 extern "C" __launch_bounds__(torch_ggml_ops::ck::BACKWARD_THREADS, 2) __global__
 void MMQ_BUNDLE_KERNEL_SYMBOL(MMQ_GROUPED_DEEPSEEK_SINGLE_ARGUMENTS) {
     torch_ggml_ops::ck::grouped_mmq_grad_input_deepseek_body<
-        GGML_TYPE_Q2_K, 4096, 2048, 8, 2>(
+        GGML_TYPE_Q2_K, 4096, 2048, 8, 2, 1>(
             MMQ_GROUPED_DEEPSEEK_SINGLE_VALUES);
 }
 #elif MMQ_BUNDLE_GROUPED_BWD_KIND == 18
@@ -248,6 +248,13 @@ void MMQ_BUNDLE_KERNEL_SYMBOL(MMQ_GROUPED_DEEPSEEK_PAIR_ARGUMENTS) {
     torch_ggml_ops::ck::grouped_mmq_pair_grad_input_deepseek_body<
         GGML_TYPE_IQ2_XXS, 2048, 4096, 16, 1>(
             MMQ_GROUPED_DEEPSEEK_PAIR_VALUES);
+}
+#elif MMQ_BUNDLE_GROUPED_BWD_KIND == 19
+extern "C" __launch_bounds__(torch_ggml_ops::ck::BACKWARD_THREADS, 2) __global__
+void MMQ_BUNDLE_KERNEL_SYMBOL(MMQ_GROUPED_DEEPSEEK_SINGLE_ARGUMENTS) {
+    torch_ggml_ops::ck::grouped_mmq_grad_input_deepseek_body<
+        GGML_TYPE_Q2_K, 4096, 2048, 8, 2, 2>(
+            MMQ_GROUPED_DEEPSEEK_SINGLE_VALUES);
 }
 #endif
 

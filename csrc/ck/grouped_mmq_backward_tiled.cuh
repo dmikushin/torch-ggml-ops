@@ -310,11 +310,16 @@ static __device__ __forceinline__ void grouped_backward_store_tile(
     }
 }
 
-using grouped_backward_deepseek_shared_tile = backward_shared_b_tile<
+using grouped_backward_deepseek_single_shared_tile = backward_shared_b_tile<
     GROUPED_BACKWARD_SMALL_N,
     GROUPED_BACKWARD_TILED_K,
     0,
     0>;
+using grouped_backward_deepseek_pair_shared_tile = backward_shared_b_tile<
+    GROUPED_BACKWARD_SMALL_N,
+    GROUPED_BACKWARD_TILED_K,
+    0,
+    4>;
 
 template <
     ggml_type type,
@@ -322,12 +327,13 @@ template <
     int IN_FEATURES,
     int BLOCKS_PER_WEIGHT_ROW,
     int M_TILES_PER_WAVE,
+    int REDUCTION_UNROLL,
     bool FULL_ROWS>
 static __device__ __forceinline__ void grouped_mmq_grad_input_deepseek_tile(
         const __hip_bfloat16 * __restrict__ grad_output,
         const char * __restrict__ expert_weight,
         __hip_bfloat16 * __restrict__ grad_input,
-        grouped_backward_deepseek_shared_tile & shared_b,
+        grouped_backward_deepseek_single_shared_tile & shared_b,
         int block_row_start,
         int row_end,
         int input_column_start) {
@@ -342,7 +348,7 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_deepseek_tile(
         [M_TILES_PER_WAVE]
         [GROUPED_BACKWARD_SMALL_N_TILES];
 
-#pragma unroll 1
+#pragma unroll REDUCTION_UNROLL
     for (int output_start = 0;
          output_start < OUT_FEATURES;
          output_start += GROUPED_BACKWARD_TILED_K) {
@@ -399,7 +405,8 @@ template <
     int OUT_FEATURES,
     int IN_FEATURES,
     int BLOCKS_PER_WEIGHT_ROW,
-    int M_TILES_PER_WAVE>
+    int M_TILES_PER_WAVE,
+    int REDUCTION_UNROLL>
 static __device__ __forceinline__ void grouped_mmq_grad_input_deepseek_body(
         const __hip_bfloat16 * __restrict__ grad_output,
         const char * __restrict__ packed_weight,
@@ -422,7 +429,7 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_deepseek_body(
         M_TILES_PER_WAVE * BACKWARD_M_PER_TILE * BACKWARD_WAVES;
     const int input_column_start = blockIdx.x * GROUPED_BACKWARD_SMALL_N;
     const char * expert_weight = packed_weight + expert * bytes_per_expert;
-    __shared__ grouped_backward_deepseek_shared_tile shared_b;
+    __shared__ grouped_backward_deepseek_single_shared_tile shared_b;
 
     int block_row_start = row_begin;
     for (; block_row_start + m_per_block <= row_end;
@@ -433,6 +440,7 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_deepseek_body(
             IN_FEATURES,
             BLOCKS_PER_WEIGHT_ROW,
             M_TILES_PER_WAVE,
+            REDUCTION_UNROLL,
             true>(
             grad_output,
             expert_weight,
@@ -449,6 +457,7 @@ static __device__ __forceinline__ void grouped_mmq_grad_input_deepseek_body(
             IN_FEATURES,
             BLOCKS_PER_WEIGHT_ROW,
             M_TILES_PER_WAVE,
+            REDUCTION_UNROLL,
             false>(
             grad_output,
             expert_weight,
@@ -473,8 +482,8 @@ static __device__ __forceinline__ void grouped_mmq_pair_grad_input_deepseek_tile
         const char * __restrict__ first_expert_weight,
         const char * __restrict__ second_expert_weight,
         __hip_bfloat16 * __restrict__ grad_input,
-        grouped_backward_deepseek_shared_tile & first_shared_b,
-        grouped_backward_deepseek_shared_tile & second_shared_b,
+        grouped_backward_deepseek_pair_shared_tile & first_shared_b,
+        grouped_backward_deepseek_pair_shared_tile & second_shared_b,
         int block_row_start,
         int row_end,
         int input_column_start) {
@@ -596,7 +605,7 @@ static __device__ __forceinline__ void grouped_mmq_pair_grad_input_deepseek_body
         first_packed_weight + expert * bytes_per_expert;
     const char * second_expert_weight =
         second_packed_weight + expert * bytes_per_expert;
-    __shared__ grouped_backward_deepseek_shared_tile shared_b[2];
+    __shared__ grouped_backward_deepseek_pair_shared_tile shared_b[2];
 
     int block_row_start = row_begin;
     for (; block_row_start + m_per_block <= row_end;

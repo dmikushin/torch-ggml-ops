@@ -114,6 +114,10 @@ P3.1 replaced the generic body with an exact `(N,K)=(2048,4096)`, four-wave `M=6
 
 Artifacts are `/tmp/grouped_mmq_bwd_ds4_tiled_focus.json`, `/tmp/grouped_mmq_bwd_ds4_tiled_b1_b4.json`, and `/tmp/grouped_mmq_bwd_ds4_tiled_b16.json`. P3.1 improved every B1/B4 point by `3.52-7.82x` over the generic baseline. It now measures `43.740-51.001 ms` at B1, `133.859-160.494 ms` at B4, and `550.696-592.742 ms` at B16, winning all twelve points against AITER at `1.18-1.69x`, `1.19-1.29x`, and `1.50-1.59x`, respectively.
 
+P3.2 tested width-32 cooperative decode with identical M/N/K ownership. It improved B1 uniform and skewed by 1.36% and 2.53%, but regressed B1 sparse and boundary by 2.84% and 1.08%, and regressed B4 uniform by 1.35%. Uniform, skewed, and boundary all expose the same host-visible average of 48 rows, so there is no legal static threshold for this trade. Width 32 was rejected and width 16 restored. Artifacts: `/tmp/grouped_mmq_bwd_ds4_iq2xxs_width32_focus.json` and `/tmp/grouped_mmq_bwd_ds4_iq2xxs_width32_b1_nonuniform.json`.
+
+P3.3 selected the four-BF16 XOR layout. It improves every full-matrix point over P3.1, measuring `33.255-38.100 ms` at B1, `104.423-121.638 ms` at B4, and `439.088-458.622 ms` at B16. It wins against AITER by `1.57-2.22x`, `1.56-1.67x`, and `1.93-2.02x`. Resources rise from 177 to 208 VGPRs while remaining at 54 SGPRs, 8,192 bytes LDS, zero private bytes, zero spills, and no dynamic stack. Sixteen-BF16 swizzling regressed the focused points by 24-39% relative to four and was rejected. Artifacts: `/tmp/grouped_mmq_bwd_ds4_iq2xxs_swizzle4_focus.json`, `/tmp/grouped_mmq_bwd_ds4_iq2xxs_swizzle4_full.json`, and `/tmp/grouped_mmq_bwd_ds4_iq2xxs_swizzle16_focus.json`.
+
 Start with shape-specialized bodies rather than changing the generic ABI:
 
 - S1: `M=64, N=64, K=32`, 128 threads for mean groups around 48-64.
@@ -136,6 +140,8 @@ P4.1 added exact four-wave `N=64,K=32` bodies with M64 below average 128 rows an
 P4.1 improved every B1/B4 point by `3.00-10.19x` over generic. It now measures `21.841-25.405 ms` at B1, `50.920-53.248 ms` at B4, and `172.840-191.703 ms` at B16. It wins all twelve AITER comparisons at `1.07-1.55x`, `1.35-1.54x`, and `1.98-2.17x`, respectively. Numerical RMSE remains zero against independently dequantized BF16; differing-element counts with zero absolute error are signed-zero differences.
 
 The same-build Qwen control is `/tmp/grouped_mmq_bwd_qwen_post_ds4_tiled_control.json`. Against `/tmp/grouped_mmq_bwd_qwen_pre_ds4_control.json`, packed latency improves by 1.08% geometrically and 0.72% by median point; the largest observed regression is 0.91%. All 60 correctness checks preserve their established envelopes, so P3.1/P4.1 do not regress the existing cases.
+
+P4.2 tested reduction unroll factors 2 and 4. Unroll 2 improved all B4 routes but regressed three B1 routes by 1.0-1.6% and B16 boundary by 2.18%; unroll 4 then lost to unroll 2 by 1.2-4.3% on B4 despite remaining spill-free at 174 VGPRs. The retained static policy uses M64/U1 below `128 * num_groups`, M128/U2 below `512 * num_groups`, and M128/U1 otherwise. A sequential warmed 25-repeat control measured U2 at `50.832/51.487/49.720/51.850 ms` and U1 at `52.297/52.526/50.645/53.145 ms`, confirming 1.83-2.83% U2 gains on uniform/skewed/sparse/boundary B4 routes. The U2 artifact uses 156 VGPRs, 30 SGPRs, 4,096 bytes LDS, zero private bytes, zero spills, and no dynamic stack. Artifacts: `/tmp/grouped_mmq_bwd_ds4_q2k_unroll2_b1_b4.json`, `/tmp/grouped_mmq_bwd_ds4_q2k_split_unroll_full.json`, `/tmp/grouped_mmq_bwd_ds4_q2k_unroll4_b4.json`, `/tmp/grouped_mmq_bwd_ds4_q2k_u2_dispatch_control_25.json`, and `/tmp/grouped_mmq_bwd_ds4_q2k_u1_dispatch_control_25.json`.
 
 Use this bounded sequence:
 

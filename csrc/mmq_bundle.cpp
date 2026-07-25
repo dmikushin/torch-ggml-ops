@@ -853,9 +853,13 @@ void launch_grouped_backward(
     int threads = kGroupedBackwardThreads;
     if (out_features == 4096 && in_features == 2048 &&
         quant_type == kQuantQ2_K) {
-        id = rows >= num_groups * 128
-            ? MMQKernelId::GroupedBwdSingleQ2KN4096K2048M128N64
-            : MMQKernelId::GroupedBwdSingleQ2KN4096K2048M64N64;
+        if (rows < num_groups * 128) {
+            id = MMQKernelId::GroupedBwdSingleQ2KN4096K2048M64N64;
+        } else if (rows < num_groups * 512) {
+            id = MMQKernelId::GroupedBwdSingleQ2KN4096K2048M128N64U2;
+        } else {
+            id = MMQKernelId::GroupedBwdSingleQ2KN4096K2048M128N64;
+        }
         n_per_block = 64;
         threads = kBackwardThreads;
     } else if (out_features == 2048 && in_features == 512) {

@@ -566,6 +566,12 @@ def _grouped_backward_specs() -> list[KernelSpec]:
                 enforce_resource_gate=True,
             ),
             _grouped_backward_spec(
+                "GroupedBwdSingleQ2KN4096K2048M128N64U2",
+                "grouped_bwd_single_q2_k_n4096_k2048_mt128_nt64_u2",
+                19,
+                enforce_resource_gate=True,
+            ),
+            _grouped_backward_spec(
                 "GroupedBwdSingleQ4KN2048K512M64N64",
                 "grouped_bwd_single_q4_k_n2048_k512_mt64_nt64",
                 3,
@@ -639,7 +645,7 @@ def _grouped_backward_specs() -> list[KernelSpec]:
             ),
         )
     )
-    assert len(specs) == 30
+    assert len(specs) == 31
     return specs
 
 
@@ -698,7 +704,7 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
     specs.extend(_grouped_forward_specs())
     specs.extend(_dense_backward_specs())
     specs.extend(_grouped_backward_specs())
-    assert len(specs) == 116
+    assert len(specs) == 117
     assert len({spec.cpp_id for spec in specs}) == len(specs)
     assert len({spec.symbol for spec in specs}) == len(specs)
     return tuple(specs)
