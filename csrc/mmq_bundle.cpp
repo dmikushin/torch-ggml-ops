@@ -241,6 +241,38 @@ DenseForwardSelection dense_forward_selection(
             return {MMQKernelId::DenseFwdQ80K8192J128Full, 128};
         }
     }
+    if (out_features % kForwardTileI == 0) {
+        if (quant_type == kQuantQ3_K && in_features == 2048 &&
+                rows % 128 == 0) {
+            return {MMQKernelId::DenseFwdQ3KK2048J128Full, 128};
+        }
+        if (quant_type == kQuantQ4_K && rows % 128 == 0) {
+            switch (in_features) {
+                case 512:
+                    return {MMQKernelId::DenseFwdQ4KK512J128Full, 128};
+                case 2048:
+                    return {MMQKernelId::DenseFwdQ4KK2048J128Full, 128};
+                case 4096:
+                    return {MMQKernelId::DenseFwdQ4KK4096J128Full, 128};
+            }
+        }
+        if (quant_type == kQuantQ5_K && rows % 128 == 0) {
+            if (in_features == 512) {
+                return {MMQKernelId::DenseFwdQ5KK512J128Full, 128};
+            }
+            if (in_features == 2048) {
+                return {MMQKernelId::DenseFwdQ5KK2048J128Full, 128};
+            }
+        }
+        if (quant_type == kQuantQ6_K && in_features == 2048) {
+            if (rows == 64) {
+                return {MMQKernelId::DenseFwdQ6KK2048J64Full, 64};
+            }
+            if (rows % 128 == 0) {
+                return {MMQKernelId::DenseFwdQ6KK2048J128Full, 128};
+            }
+        }
+    }
     if (quant_type == kQuantQ6_K && rows <= 64) {
         return {MMQKernelId::DenseFwdQ6KJ64, 64};
     }

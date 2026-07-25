@@ -692,6 +692,30 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
                 enforce_resource_gate=True,
             )
         )
+    for quant_type, k, j in (
+        (QuantType.Q3_K, 2048, 128),
+        (QuantType.Q4_K, 512, 128),
+        (QuantType.Q4_K, 2048, 128),
+        (QuantType.Q4_K, 4096, 128),
+        (QuantType.Q5_K, 512, 128),
+        (QuantType.Q5_K, 2048, 128),
+        (QuantType.Q6_K, 2048, 64),
+        (QuantType.Q6_K, 2048, 128),
+    ):
+        label = quant_type.name.replace("_", "")
+        specs.append(
+            _forward_spec(
+                f"DenseFwd{label}K{k}J{j}Full",
+                f"dense_fwd_{_quant_suffix(quant_type.name)}_k{k}_j{j}_full",
+                ForwardKind.DENSE,
+                quant_type=quant_type,
+                j=j,
+                blocks_per_weight_row=k // 256,
+                full_i=True,
+                full_j=True,
+                enforce_resource_gate=True,
+            )
+        )
     specs.append(
         _forward_spec(
             "GroupedRowTaskSetup",
@@ -702,7 +726,7 @@ def kernel_specs() -> tuple[KernelSpec, ...]:
     specs.extend(_grouped_forward_specs())
     specs.extend(_dense_backward_specs())
     specs.extend(_grouped_backward_specs())
-    assert len(specs) == 124
+    assert len(specs) == 132
     assert len({spec.cpp_id for spec in specs}) == len(specs)
     assert len({spec.symbol for spec in specs}) == len(specs)
     return tuple(specs)

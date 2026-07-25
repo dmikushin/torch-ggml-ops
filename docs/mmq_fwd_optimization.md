@@ -395,7 +395,7 @@ Before changing a kernel, record normalized disassembly, VGPR/SGPR counts, stati
 
 P0 stops when repeated controls are stable enough to distinguish a 1% change. If they are not, increase repetitions and bracket each candidate; do not compensate by widening the candidate set.
 
-P0 completed on 2026-07-25. Source artifacts are `/tmp/mmq_fwd_ds4_plan_baseline_9.json`, `/tmp/mmq_fwd_qwen_plan_control_9.json`, and `/tmp/mmq_fwd_p0_components.txt`. The 33-point DeepSeek report established:
+P0 completed. Source artifacts are `/tmp/mmq_fwd_ds4_plan_baseline_9.json`, `/tmp/mmq_fwd_qwen_plan_control_9.json`, and `/tmp/mmq_fwd_p0_components.txt`. The 33-point DeepSeek report established:
 - ordinary Q8_0 sustains about 18.4-23.4 logical TFLOP/s; KV at B16 is the only ordinary point below BF16, at `0.985x`, while Q-B remains close at `1.008-1.045x` for B4/B16.
 - LM-head M=32, M=64, and M=128 take `5.395`, `5.630`, and `5.859 ms`; the nearly flat latency confirms that the generic J128 body over-computes the two smaller chunks.
 - profiler decomposition attributes only `0.3%` of LM-head M32 and `0.4%` of Q-B B1 to Q8_1 quantization, but `26.3%` of KV B16 and `3.2%` of output-B B1.
@@ -431,7 +431,7 @@ The first implementation should make only these semantic changes:
 
 P1 acceptance requires exact parity with the current packed implementation where the accumulation order is unchanged, plus the independent BF16/GGUF-reference envelope already enforced by `tests/test_deepseek_mmq.py`. Retain a specialization only if it improves its intended production class without a greater than 1% regression in another class that shares the wrapper.
 
-P1 completed on 2026-07-25. The first I64/J32/K4096 full body was rejected before installation because it used 48 private bytes and spilled 11 VGPRs. The retained M=32 body is bounded I64/J64; M=64 uses full I64/J64, and every other production shape uses an exact-K full I64/J128 body.
+P1 completed. The first I64/J32/K4096 full body was rejected before installation because it used 48 private bytes and spilled 11 VGPRs. The retained M=32 body is bounded I64/J64; M=64 uses full I64/J64, and every other production shape uses an exact-K full I64/J128 body.
 
 Retained resources are:
 - generic Q8_0 J128: 248 VGPRs and 29 SGPRs.
@@ -464,6 +464,20 @@ Do not repeat grouped Q8_0 scale staging, group-major workspace repacking, or ge
 
 A retained P2 kernel must have zero private storage, zero spills, no dynamic stack, and LDS within the gfx1151 budget. A faster candidate at an occupancy cliff is accepted only after a sequential 25-repeat control across every dispatch class that would use it.
 
+P2 geometry controls were rejected:
+- Dispatching the spill-free J64/K4096 body for Q-A, KV, shared gate/up, and LM-head M128 regressed every point in a sequential 25-repeat J64/J128 comparison. Ordinary points lost `4.03-8.85%`, LM-head M128 lost `14.11%`, and checkpoint-weighted latency lost `8.02-8.65%`. Artifacts are `/tmp/mmq_fwd_ds4_p2_k4096_j64_25.json`, `/tmp/mmq_fwd_ds4_p2_k4096_j128_25.json`, and `/tmp/mmq_fwd_ds4_p2_k4096_j64_control_25.txt`.
+- Exact J64 bodies for K=1,024/2,048/8,192 also regressed every production point. Q-B lost `6.03-8.78%`, output-B lost `3.75-7.12%`, and shared down lost `4.94-5.58%` in the 25-repeat control. Artifacts are `/tmp/mmq_fwd_ds4_p2_other_j64_25.json`, `/tmp/mmq_fwd_ds4_p2_other_j128_25.json`, and `/tmp/mmq_fwd_ds4_p2_other_j64_control_25.txt`.
+
+J128 packed-weight reuse outweighs J64's lower VGPR/LDS footprint for every full production tile. J64 remains retained only where M=32/64 would otherwise be padded; the dense Q8_0 I/J geometry neighborhood is closed.
+
+P2 K-loop inspection also closed generic unrolling without a compile/benchmark sweep. The K=1,024/2,048/4,096/8,192 exact bodies each contain the same 1,453-instruction loop body. K changes address immediates and one outer trip-count compare; each 256-value iteration has only three scalar loop-control instructions around hundreds of load, WMMA, conversion, and FMA instructions. Loop control is not exposed enough to justify duplicated bodies or increased instruction-cache pressure.
+
+P2 activation-half double buffering was rejected. The candidate used a second LDS activation tile to load both Q8_1 halves before compute and reduce four barriers per K iteration to two. It remained spill-free at 214 VGPRs/56,832 LDS bytes for J128 and 130 VGPRs/38,144 LDS bytes for J64, but every 25-repeat point regressed: ordinary shapes lost `6.83-25.80%`, LM M32/M64 lost `4.22%`/`2.03%`, and full LM tiles lost `12.44-13.16%`. Loading both halves up front disrupts the accepted load/compute cadence and the extra LDS does not create occupancy. Artifacts are `/tmp/mmq_fwd_ds4_p2_prefetch_y_25.json`, `/tmp/mmq_fwd_ds4_p2_prefetch_baseline_25.json`, and `/tmp/mmq_fwd_ds4_p2_prefetch_y_control_25.txt`.
+
+P2 LDS profiling and its one allowed layout control are also complete. The accepted stride-76 body measured `7.73%` LDS bank conflict, about `7.5%` ALU stalled by LDS, 128-cycle derived LDS latency, mean active-CU occupancy of about 11.6 waves, and about 66% L2 hit rate. A stride-77 Q8_0 control made row starts coprime with 32 banks and reduced the conflict metric to `5.12%`, but ALU stalled by LDS doubled to about `14.3%`. The 25-repeat matrix regressed every point by `3.83-12.86%`, with an `8.58%` geometric and `7.12-8.62%` checkpoint-weighted loss. Artifacts are `/tmp/mmq_fwd_ds4_p2_stride77_25.json`, `/tmp/mmq_fwd_ds4_p2_stride76_25.json`, and `/tmp/mmq_fwd_ds4_p2_stride77_control_25.txt`. The accepted `+4` Q8 row padding and load/compute cadence remain.
+
+P2 is complete. No local DeepSeek Q8_0 geometry, loop-control, barrier, or profiler-supported LDS experiment remains open.
+
 ### P3: reuse Q8_1 activations explicitly
 
 Same-input activation reuse is the highest-confidence whole-call opportunity. DeepSeek has 43 Q8_0 shared gate/up pairs with one common D4 Q8_1 layout. Audit the model call graph for attention Q-A/KV and any other same-input families before claiming reuse; tensor shapes alone are not proof that activations are identical.
@@ -493,6 +507,24 @@ If exact specialization does not move normalized ISA or latency, stop it. For Q3
 Do not retry global J64, I128, split-K, persistent scheduling, decoded-weight LDS caching, or speculative deep prefetch. Do not treat the approximately 3.2% bundle-only movements in attention-query Q3_K or attention-output Q4_K as optimization evidence; those controls had no HIP-semantic change.
 
 Qwen acceptance is the complete existing forward matrix, not only the two narrow points. Preserve Q6_K M=64/M=128 fallbacks and the current M=256 production loss schedule.
+
+P4 completed on 2026-07-25. Eight retained exact wrappers cover Q3_K/K2048; Q4_K/K512, K2048, and K4096; Q5_K/K512 and K2048; and Q6_K/K2048 at J64/J128. Dispatch requires N divisible by 64 and M divisible by the selected J; generic fallbacks remain for every other shape.
+
+The wrappers have zero private storage, zero spills, and no dynamic stack. Relative to generic bodies, exact resources are:
+- Q3_K J128: 216 to 196 VGPRs.
+- Q4_K J128: 254 to 239 VGPRs.
+- Q5_K J128: 230 to 244 VGPRs; the candidate still wins despite the increase.
+- Q6_K J128/J64: 225/171 to 210/158 VGPRs.
+
+The sequential 25-repeat generic/candidate/generic bracket is recorded in `/tmp/mmq_fwd_qwen_p4_generic_before_25.json`, `/tmp/mmq_fwd_qwen_p4_exact_25.json`, `/tmp/mmq_fwd_qwen_p4_generic_after_25.json`, and `/tmp/mmq_fwd_qwen_p4_exact_bracket_25.txt`. Every point improved against the generic midpoint:
+- Q3_K gained `0.90-5.26%`.
+- Q4_K gained `3.60-31.39%`.
+- Q5_K gained `11.66-32.60%`.
+- Q6_K gained `2.09-2.56%` across M=64/128/256.
+- the full 33-point geometric latency improved by `10.44%`.
+- checkpoint-weighted latency improved by `3.86-5.10%`, depending on batch and LM chunk.
+
+The exact bodies close the previous narrow Q3_K/Q5_K BF16 margins. Q6_K M256 improves from the generic bracket midpoint of `16.981 ms` to `16.568 ms`, but remains below the `13.462 ms` BF16 reference; its remaining limit is representation-level rather than bounds or runtime shape state.
 
 ### P5: representation-level projects
 
