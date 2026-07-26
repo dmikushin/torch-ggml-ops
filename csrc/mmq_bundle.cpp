@@ -554,6 +554,16 @@ DenseBackwardSelection dense_backward_selection(
         const bool full_tiles = rows % 64 == 0;
         if (full_tiles) {
             if (out_features == 1024 && in_features == 4096) {
+                if (rows == 8192 || rows == 32768) {
+                    return {
+                        rows == 8192
+                            ? MMQKernelId::DenseBwdQ80ExactN1024K4096G2GroupM2Padding8
+                            : MMQKernelId::DenseBwdQ80ExactN1024K4096G2GroupM2,
+                        8,
+                        32,
+                        2,
+                        2};
+                }
                 return dense_q80_geometry_selection(
                     rows,
                     kDeepSeekQaGeometry,
@@ -565,6 +575,14 @@ DenseBackwardSelection dense_backward_selection(
                     MMQKernelId::DenseBwdQ80ExactN1024K4096G2Padding8);
             }
             if (out_features == 32768 && in_features == 1024) {
+                if (rows == 2048) {
+                    return {
+                        MMQKernelId::DenseBwdQ80ExactN32768K1024G2GroupM1Padding8,
+                        8,
+                        32,
+                        1,
+                        2};
+                }
                 if (rows > 2048 && rows % 128 == 0) {
                     return {
                         MMQKernelId::DenseBwdQ80ExactN32768K1024G2GroupM2,
@@ -584,6 +602,14 @@ DenseBackwardSelection dense_backward_selection(
                     MMQKernelId::DenseBwdQ80ExactN32768K1024G2Padding8);
             }
             if (out_features == 512 && in_features == 4096) {
+                if (rows == 8192 || rows == 32768) {
+                    return {
+                        MMQKernelId::DenseBwdQ80ExactN512K4096G2GroupM2Padding8,
+                        8,
+                        32,
+                        2,
+                        2};
+                }
                 return dense_q80_geometry_selection(
                     rows,
                     DenseQ80Geometry::G2,
@@ -614,6 +640,16 @@ DenseBackwardSelection dense_backward_selection(
                     MMQKernelId::DenseBwdQ80ExactN4096K8192G2Padding8);
             }
             if (out_features == 2048 && in_features == 4096) {
+                if (rows == 8192 || rows == 32768) {
+                    return {
+                        rows == 8192
+                            ? MMQKernelId::DenseBwdQ80ExactN2048K4096G2GroupM2Padding8
+                            : MMQKernelId::DenseBwdQ80ExactN2048K4096G2GroupM2,
+                        8,
+                        32,
+                        2,
+                        2};
+                }
                 return dense_q80_geometry_selection(
                     rows,
                     kDeepSeekSharedGateUpGeometry,
@@ -625,6 +661,14 @@ DenseBackwardSelection dense_backward_selection(
                     MMQKernelId::DenseBwdQ80ExactN2048K4096G2Padding8);
             }
             if (out_features == 4096 && in_features == 2048) {
+                if (rows == 8192 || rows == 32768) {
+                    return {
+                        MMQKernelId::DenseBwdQ80ExactN4096K2048G2GroupM2,
+                        8,
+                        32,
+                        2,
+                        2};
+                }
                 return dense_q80_geometry_selection(
                     rows,
                     kDeepSeekSharedDownGeometry,

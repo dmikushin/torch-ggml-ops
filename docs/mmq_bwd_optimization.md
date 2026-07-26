@@ -1,200 +1,98 @@
-# Dense MMQ backward optimization status and plan
-
-## Scope
-
-This document covers dense `torch_ggml_ops::mmq_grad_input` backward on gfx1151.
-
-Included:
-- BF16 cotangents.
-- current packed GGUF Q3_K, Q4_K, Q5_K, Q6_K, IQ2_S, and Q8_0 weights.
-- DeepSeek-V4-Flash dense Q8_0 correctness coverage.
-- BF16 input gradients.
-- the 160 ordinary model projections.
-- the packed Q6_K language-model head.
-- production batch sizes 1, 4, and 16 at sequence length 2048.
-
-Excluded:
-- `grouped_mmq` backward and routed-expert scheduling.
-- GatedDeltaNet physical-layout permutations.
-- LoRA GEMMs and residual accumulation.
-- public operator-schema changes.
-- changes to `csrc/vendor/llama_cpp/*`.
-- direct linkage of the fused packed kernel against hipBLASLt.
+# Dense MMQ backward optimization
 
 ## Current status
 
-Qwen repository-local dense backward optimization is complete. DeepSeek has one remaining bounded repository-local phase: finish the grouped-M traversal correction for Q-A, KV, shared gate/up, shared down, and Q-B B1. Current source-of-record matrices are `/tmp/mmq_bwd_qwen_qb1_final_narrow_q5_25.json` and `/tmp/mmq_bwd_ds4_group_m_final_25.json`.
+Dense `torch_ggml_ops::mmq_grad_input` is at its repository-local stopping point on gfx1151 for the existing packed-weight, independent-call API.
 
-Done:
-- all seven DeepSeek dense Q8_0 geometries, covering eight checkpoint tensor families, use exact production-shape dispatch with bounds-safe fallbacks and independent correctness coverage.
-- checkpoint-weighted ordinary DeepSeek packed/BF16 throughput is `0.972x/0.737x/0.658x` at B1/B4/B16 after the retained Q-B/output-B M2 traversal.
-- checkpoint-weighted ordinary Qwen packed/BF16 throughput is `1.120x/1.057x/1.057x` at B1/B4/B16 after the bounded QB1 retune.
-- complete DeepSeek packed loss selects M512: `173.583/705.975 ms` at B1/B4 and a B16 capacity timing of `2775.945 ms`.
-- complete Qwen packed loss keeps M256 at `251.852 ms` and the established 253.57 MiB peak allocation.
-- all 172 bundle kernels pass build-time resource gates; retained production kernels have zero private storage, spills, and dynamic stack.
-- exact full-tile guards, bounds-safe fallbacks, independent references, autograd, bundle freshness, and reproducibility pass current validation.
+The retained implementation provides:
 
-Qwen's authorized local kernel neighborhoods remain closed. DeepSeek DB8 must resolve the remaining all-M traversal cases before the independent-call packed contract can be declared exhausted. If DB8 is neutral or slower, remaining material work moves to DB5 or another explicit model-owned prepared representation/API. Neither may be implemented as a hidden operator cache. QB2 remains a deferred Qwen integration project.
+- Direct BF16-cotangent by packed-GGUF multiplication with FP32 WMMA accumulation and BF16 dX.
+- Static quant, shape, row-count, traversal, and LDS-layout dispatch with bounds-safe fallbacks.
+- Qwen production bodies for Q3_K, Q4_K, Q5_K, and Q6_K.
+- DeepSeek exact Q8_0 bodies for six ordinary geometries and the language-model head.
+- 83 dense-backward specializations in the 179-kernel source-built gfx1151 bundle.
+- Zero private storage, zero VGPR/SGPR spills, and no dynamic stack for every retained dense-backward artifact.
 
-## Hardware and measurement rules
+Repository-local Qwen work closed after QB1. DeepSeek work closed after DB8. No additional geometry, traversal, decoder, prefetch, LDS, active-wave, or arithmetic sweep is authorized under the current API. Further material gains require explicit model-owned prepared weights, paired grad-input, BF16-shadow, or shared-scratch ownership.
 
-Measurements were taken on:
+Source-of-record artifacts:
 
 ```text
-GPU: Radeon 8060S Graphics
-architecture: gfx1151, wave32, 40 CUs
-LDS limit: 64 KiB per workgroup, 128 KiB per WGP
-VGPR capacity: 1536 per SIMD
-PyTorch: 2.12.0+rocm7.15.0a20260701
-HIP: 7.14.60850
+Qwen ordinary matrix:       /tmp/mmq_bwd_qwen_qb1_final_narrow_q5_25.json
+Qwen post-DB8 control:      /tmp/mmq_bwd_qwen_post_db8_control_9.json
+Qwen complete loss:         /tmp/mmq_bwd_qwen_db6_complete_loss_control_25.json
+DeepSeek ordinary matrix:   /tmp/mmq_bwd_ds4_db8_final_25.json
+DeepSeek complete loss B1:  /tmp/mmq_bwd_ds4_db6_complete_loss_b1_25.json
+DeepSeek complete loss B4:  /tmp/mmq_bwd_ds4_db6_complete_loss_b4_25.json
+DeepSeek M512 B16 capacity: /tmp/mmq_bwd_ds4_db6_complete_loss_b16_m512_capacity_3.json
 ```
 
-The reference is `torch.mm` using the same BF16 cotangent and the logical GGUF weight dequantized to BF16. PyTorch normally dispatches these calls to hipBLASLt.
+The `/tmp` paths are measurement provenance, not repository inputs.
 
-The first forward and backward baselines were mistakenly run concurrently and were discarded. Accepted timings come from sequential runs with no concurrent GPU benchmark or profiler.
+## Latest results
 
-On gfx1151, int8 WMMA is approximately as fast as BF16 WMMA. An int8 design must win through representation size, decode removal, LDS/VGPR pressure, or scheduling rather than nominal arithmetic throughput.
+Ratios are packed throughput divided by the BF16 `torch.mm` reference throughput. Values above `1.0x` favor packed MMQ. Ordinary rows use `M = batch * 2048`.
 
-Use real nonzero benchmark data. Zero-valued WMMA operands can produce misleading results.
+### Checkpoint-weighted ordinary backward
 
-## Benchmark harness and artifacts
+| Model | B1 packed/BF16 ms | B1 ratio | B4 packed/BF16 ms | B4 ratio | B16 packed/BF16 ms | B16 ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Qwen | `79.733/89.300` | `1.120x` | `322.527/340.988` | `1.057x` | `1244.217/1315.164` | `1.057x` |
+| DeepSeek | `784.797/783.534` | `0.998x` | `3475.582/3079.686` | `0.886x` | `13914.331/12217.398` | `0.878x` |
 
-The backward benchmark is:
+DB8 reduced DeepSeek packed ordinary latency by `4.51%/18.85%/26.41%` at B1/B4/B16 relative to DB7. The Qwen post-DB8 control measured `1.124x/1.059x/1.079x`, consistent with its 25-repeat source of record.
 
-```bash
-source ~/venv_torch/bin/activate
-PYTHONPATH=. python bench/benchmark_mmq_bwd.py
-```
+### Qwen ordinary projections
 
-Focused LM-head example:
+Each timing and ratio cell is B1/B4/B16.
 
-```bash
-PYTHONPATH=. python bench/benchmark_mmq_bwd.py \
-  --cases lm_head_q6_k --lm-head-chunks 64,128,256 \
-  --warmup 3 --repeats 9
-```
+| Family | Packed ms | Packed/BF16 ratio | Retained mechanism |
+| --- | ---: | ---: | --- |
+| Query Q3_K | `3.412/12.641/49.501` | `1.230x/1.278x/1.241x` | Packed extraction, two-row prefetch, XOR LDS layout |
+| Query Q4_K | `3.376/12.567/48.613` | `1.245x/1.268x/1.264x` | Full 128x128/K32 body |
+| Narrow Q3_K | `0.176/0.721/2.833` | `1.079x/1.059x/1.059x` | Padded vector local loads |
+| Narrow Q4_K | `0.230/0.775/2.988` | `0.824x/0.958x/0.988x` | Full body; B1 remains below BF16 |
+| Narrow Q5_K | `0.208/0.778/3.019` | `0.907x/0.969x/0.985x` | Scalar extraction at 2,048 rows; packed above |
+| Attention output Q4_K | `1.339/5.912/23.803` | `1.110x/1.009x/0.990x` | Padded vector local loads |
+| Shared down Q4_K | `0.261/1.537/5.266` | `1.295x/0.737x/0.802x` | 16-BF16 XOR layout |
+| Shared down Q5_K | `0.239/1.392/5.606` | `1.414x/0.814x/0.756x` | Scalar extraction, four-BF16 XOR layout |
 
-Complete packed-loss example:
+The remaining ordinary Qwen deficits are narrow B1 Q4_K/Q5_K and shared-down B4/B16. Their local geometry, K-depth, extraction, prefetch, and swizzle neighborhoods are closed.
 
-```bash
-PYTHONPATH=. python bench/benchmark_mmq_complete_loss.py \
-  --model ~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf \
-  --model-family deepseek --batches 1 --chunks 32,64,128,256,512 \
-  --loss-module-root /path/to/production/loss/module \
-  --warmup 3 --repeats 25 --output /tmp/mmq_complete_loss.json
-```
+### DeepSeek ordinary projections
 
-Focused DeepSeek correctness baseline:
+| Family | Packed ms B1/B4/B16 | Packed/BF16 ratio | Retained traversal and layout |
+| --- | ---: | ---: | --- |
+| Attention Q-A | `0.827/2.597/13.277` | `0.887x/1.168x/0.908x` | all-M padded; M2 padded; M2 unpadded |
+| Attention Q-B | `7.088/32.056/115.233` | `0.889x/0.787x/0.851x` | M1 padded; M2 unpadded; M2 unpadded |
+| Attention KV | `0.346/1.321/5.221` | `1.146x/1.133x/1.108x` | all-M padded; M2 padded; M2 padded |
+| Attention output B | `5.420/26.521/107.038` | `1.066x/0.845x/0.833x` | all-M padded; M2 unpadded; M2 unpadded |
+| Shared gate/up | `1.513/5.654/27.626` | `0.983x/1.034x/0.866x` | all-M padded; M2 padded; M2 unpadded |
+| Shared down | `1.546/7.024/27.569` | `1.318x/1.106x/1.129x` | all-M padded; M2 unpadded; M2 unpadded |
 
-```bash
-PYTHONPATH=. python bench/benchmark_mmq_bwd.py \
-  --model ~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf \
-  --cases ds4_attn_q_a_q8_0 --sequence-length 64 --batches 1 \
-  --warmup 1 --repeats 1 --correctness-rows 5
-```
+Traversal is exhausted. Remaining Q-A, Q-B, output-B, and shared gate/up deficits are representation or repeated-decode problems, not untested launch-order cases.
 
-Important artifacts:
+### Complete packed-loss schedules
 
-```text
-Sequential baseline:             /tmp/mmq_bwd_baseline_primary_sequential.json
-First redesigned full result:    /tmp/mmq_bwd_final_full_v3.json
-Grouped-M traversal result:      /tmp/mmq_bwd_ordinary_group_2.json
-128x128 ordinary geometry:       /tmp/mmq_bwd_ordinary_final_geometry.json
-Q4_K LDS-padding experiment:     /tmp/mmq_bwd_q4_lds_pad8.json
-Q3_K/Q5_K padding experiment:    /tmp/mmq_bwd_q3_q5_lds_pad8.json
-Final Q6_K small-row geometry:   /tmp/mmq_bwd_lm_final_geometry.json
-Final selected Qwen run:         /tmp/mmq_bwd_final_autonomous.json
-DeepSeek Q8 correctness run:     /tmp/mmq_bwd_ds4_q8_correctness.json
-```
+Production chunk selection includes packed forward, in-place cross-entropy, and packed grad-input. Isolated LM-head kernel time is not the selector.
 
-The `/tmp` paths record measurement provenance and are not repository inputs.
+| Model | Selected chunk | Complete-loop result | Accepted peak or capacity |
+| --- | ---: | --- | --- |
+| Qwen | M256 | `251.852 ms` at B1 | 253.57 MiB incremental peak allocation |
+| DeepSeek | M512 | `173.583/705.975 ms` at B1/B4 | 274.76/322.79 MiB incremental peak allocation |
+| DeepSeek B16 | M512 | `2775.945 ms` capacity timing | 514.91 MiB allocation, 532 MiB reservation |
 
-## Production shapes
+Qwen M64/M128/M256 complete-loop times are `337.030/301.309/251.852 ms`. DeepSeek M512 improves over M256 by `1.28%` at B1 and `1.95%` at B4. Tested schedules produce bit-exact loss and BF16 hidden gradients.
 
-For ordinary projections, `M = batch * 2048`:
+## Production dispatch
 
-| Batch | M |
-| ---: | ---: |
-| 1 | 2,048 |
-| 4 | 8,192 |
-| 16 | 32,768 |
+### Common contract
 
-Representative packed weights:
+`csrc/ck/mmq_backward.cuh` owns the reusable four-wave device body. `tools/build_mmq_bundle.py` generates concrete gfx1151 wrappers, and `csrc/mmq_bundle.cpp` performs static selection from quant type, exact shape, and public row count.
 
-| Family | Forward `(N, K)` | Weight types | Model tensors |
-| --- | ---: | --- | ---: |
-| Query plus query gate | `(8192, 2048)` | Q3_K, Q4_K | 10 |
-| Key/value/shared gate/up | `(512, 2048)` | Q3_K, Q4_K, Q5_K | 100 |
-| Attention output | `(2048, 4096)` | Q4_K | 10 |
-| Shared-expert down | `(2048, 512)` | Q4_K, Q5_K | 40 |
+Backward computes `dY @ W` directly from the forward-layout packed weight. Cotangents are not quantized. The operator does not materialize a dense or transposed logical weight. Unsupported shapes use generic bounds-safe wrappers.
 
-Backward computes the transposed operation `dY @ W` without materializing a transposed dense weight.
-
-The LM head uses:
-
-```text
-N = 248320
-K = 2048
-weight = Q6_K
-production backward chunk M = 256
-```
-
-Benchmarks retain `M = 64, 128, 256`. M=64 and M=128 are lower-memory fallbacks.
-
-## DeepSeek-V4-Flash correctness baseline
-
-Status: implemented and independently correctness-tested, but not geometry-tuned. One static bounds-safe `Q8_0` wrapper uses a 64-column input tile, K iteration 16, grouped-M disabled, and a width-16 cooperative decoder. The target remains gfx1151 with sequence length 2,048 and physical batch sizes 1, 4, and 16. Batch coverage is part of the production contract, not a gradient-accumulation substitute.
-
-For full-sequence dense input gradients:
-
-| Physical batch | M |
-| ---: | ---: |
-| 1 | 2,048 |
-| 4 | 8,192 |
-| 16 | 32,768 |
-
-Packed `Q8_0` input-gradient support covers every persistent ordinary matrix in DeepSeek-V4-Flash. Backward computes `dY @ W` directly from the authoritative forward-layout packed weight:
-
-| Family | Forward weight `(N, K)` | Backward GEMM | Tensors |
-| --- | ---: | --- | ---: |
-| Attention Q-A | `(1024, 4096)` | `(M, 1024) x (1024, 4096)` | 43 |
-| Attention Q-B | `(32768, 1024)` | `(M, 32768) x (32768, 1024)` | 43 |
-| Attention KV | `(512, 4096)` | `(M, 512) x (512, 4096)` | 43 |
-| Attention output B | `(4096, 8192)` | `(M, 4096) x (4096, 8192)` | 43 |
-| Shared gate/up | `(2048, 4096)` | `(M, 2048) x (2048, 4096)` | 86 |
-| Shared down | `(4096, 2048)` | `(M, 4096) x (4096, 2048)` | 43 |
-| LM head | `(129280, 4096)` | `(M, 129280) x (129280, 4096)` | 1 |
-
-For the LM head, `M` is a loss chunk rather than the complete token count. Tune `M = 32, 64, 128, 256, 512` by complete packed-loss-loop time and peak allocation separately at physical batch sizes 1, 4, and 16.
-
-The current backward contract is:
-- BF16 cotangent input and BF16 input-gradient output.
-- direct packed `Q8_0` decode into BF16 WMMA fragments with FP32 accumulation.
-- 32-value Q8_0 block indexing and row strides; K-quants retain 256-value blocks.
-- no cotangent quantization, packed transpose, or logical weight materialization.
-- static quant-type dispatch to one generic Q8_0 body; shape-specific lookup entries are deferred to optimization.
-- independent GGUF-dequantized output/input-gradient correctness for all eight tensor families.
-
-The generic wrapper uses 2,048 bytes LDS, 92 VGPRs, 17 SGPRs, zero private bytes or spills, and no dynamic stack. `/tmp/mmq_bwd_ds4_q8_correctness.json` records a harness-level Q-A check with `NRMSE=2.023e-05`; it is a correctness artifact, not an accepted production performance baseline.
-
-The complete new quant inventory also contains routed `IQ2_XXS` gate/up weights and routed `Q2_K` down weights. Those types are not dense-MMQ targets; their exact transposed operations and route buckets are specified in `docs/grouped_mmq_bwd_optimization.md`. The frozen eight-group `Q8_0` output-A input gradient also belongs to that grouped plan and must not be implemented as an ordinary flattened transpose.
-
-## Current source status
-
-Dense backward has production coverage for current Qwen and DeepSeek shapes. Qwen tuning is complete; DeepSeek DB8 remains planned. The selected implementation uses one reusable body in `csrc/ck/mmq_backward.cuh`, concrete source-built wrappers, and static selection in `csrc/mmq_bundle.cpp`.
-
-The current source includes:
-- exact `128x128/K32` DeepSeek ordinary G2 bodies, with row-selected LDS padding.
-- M2 traversal for long-row DeepSeek Q-B and output-B, and all-M traversal for their B1 points.
-- exact DeepSeek LM-head M32/M64/M128/M256/M512 row geometries.
-- the final Qwen 128x128 ordinary full-tile geometry and Q6_K M64/M128/M256 geometries.
-- exact full-tile guards, shape-specific LDS layouts and extraction, and bounds-safe fallbacks.
-
-The earlier Q6_K N=7 full-tile result was invalid because 112 columns per workgroup do not divide 2,048. It remains only in the experiment log as a warning. Every selected exact production specialization has zero private storage and spills.
-
-## Current kernel design
-
-The templated kernel configuration is:
+Main template state is:
 
 ```text
 <type,
@@ -209,882 +107,483 @@ The templated kernel configuration is:
  LDS_PADDING>
 ```
 
-The kernel:
-- uses four wave32 waves in a 128-thread workgroup.
-- retains multiple 16x16 WMMA accumulators per wave.
-- cooperatively decodes packed weights into BF16 LDS.
-- loads BF16 A fragments directly from the cotangent.
-- shares each decoded B tile across four waves.
-- uses shape- and type-specific decoder width and geometry.
-- avoids cotangent quantization.
-- writes BF16 input gradients directly.
-- has zero private segment in every accepted specialization inspected so far.
+`all-M` denotes the original ungrouped traversal. M1 and M2 denote `GROUP_M=1` and `GROUP_M=2` launch mappings.
 
-## Current dispatch
+### Qwen dispatch
 
-### Full-tile Q3_K, Q4_K, and Q5_K ordinary path
+Ordinary full rows use a measured 128x128/K32 four-wave body with type- and shape-specific extraction, prefetch, and LDS layouts. The important row-specific exception is narrow Q5_K: scalar extraction is selected only at 2,048 rows, while 8,192 and 32,768 rows retain packed extraction.
 
-For rows above 256 with exact production divisibility:
+Q6_K language-model-head rows use:
 
-```text
-four waves
-2 M tiles per wave
-8 N tiles per wave
-logical workgroup tile: 128x128
-K iteration: 32
-GROUP_M: 1
-16-value decoder
-paired LDS-fragment prefetch
-optional packed-byte prefetch
-```
+| Chunk M | Retained body |
+| ---: | --- |
+| 64 | M64/N32/K64 ownership with a 16-BF16 XOR layout |
+| 128 | M128/N64/K32 ownership with an eight-BF16 XOR layout |
+| 256 | Two M128-style workgroups, packed quant extraction, eight-BF16 XOR layout |
 
-Format-specific choices:
+The public complete-loss schedule selects M256. M128 remains the first lower-memory fallback.
 
-| Type/shape | Packed-byte prefetch | LDS padding |
-| --- | --- | ---: |
-| Wide Q3_K query | yes, with packed quant-byte extraction | XOR swizzle, no padding |
-| Narrow Q3_K | no | 8 BF16 values per row |
-| Q4_K query/narrow | yes | XOR swizzle, no padding |
-| Attention-output Q4_K | yes | 8 BF16 values per row |
-| Shared-down Q4_K | yes | 16-BF16-chunk XOR swizzle, no padding |
-| Narrow Q5_K | yes | 8-BF16-chunk XOR swizzle plus packed quant-byte extraction |
-| Shared-down Q5_K | yes | 4-BF16-chunk XOR swizzle, no padding |
+### DeepSeek dispatch
 
-Non-divisible and smaller-row shapes retain bounds-safe measured kernels.
+Ordinary rows use the exact G2 128x128/K32 body with width-16 Q8_0 decode.
 
-### DeepSeek Q8_0 path
+| Shape `(N,K)` | 2,048 rows | 8,192 rows | 32,768 rows |
+| --- | --- | --- | --- |
+| Q-A `(1024,4096)` | all-M padding8 | M2 padding8 | M2 unpadded |
+| Q-B `(32768,1024)` | M1 padding8 | M2 unpadded | M2 unpadded |
+| KV `(512,4096)` | all-M padding8 | M2 padding8 | M2 padding8 |
+| Output-B `(4096,8192)` | all-M padding8 | M2 unpadded | M2 unpadded |
+| Shared gate/up `(2048,4096)` | all-M padding8 | M2 padding8 | M2 unpadded |
+| Shared down `(4096,2048)` | all-M padding8 | M2 unpadded | M2 unpadded |
 
-Ordinary DeepSeek uses exact `128x128/K32` G2 bodies when rows are divisible by 128, with the measured row-dependent padding policy. Q-B `(32768,1024)` and output-B `(4096,8192)` use `GROUP_M=2` above 2,048 rows; their B1 points retain the original all-M ordering and padding. Other ordinary shapes retain the selected all-M G2 launch. LM-head rows use their DB4-specific geometries.
+DeepSeek LM-head rows use active-two-wave M32, G0 M64, G1 M128, and G3 M256/M512. M512 launches two exact M256 workgroups.
 
-### Q6_K small-row path
+### Resources
 
-| Rows | M tiles/wave | N tiles/wave | K iteration | Logical tile |
-| ---: | ---: | ---: | ---: | --- |
-| `<=64` | 1 | 2 | 64 | 64x32 |
-| `<=128` | 2 | 4 | 32 | 128x64 |
-| `<=256` | 2 | 4 | 32 | 128x64 |
-| `<=2048` | 1 | 8 | 16 | 64x128 |
-| larger | 1 | 16 | 16 | 64x256 |
+Representative retained allocations:
 
-The small-row kernels use sixteen-value Q6_K decoding and paired local-fragment prefetch. M=64, M=128, and M=256 use exact full-tile paths on production dimensions. Non-production shapes use the same geometries with bounds checks.
+| Body | VGPR | SGPR | LDS |
+| --- | ---: | ---: | ---: |
+| Qwen Q3_K query | 237 | 27 | 8 KiB |
+| Qwen Q4_K query/narrow | 226 | 17 | 8 KiB |
+| Qwen Q4_K attention output | 222 | 20 | 10 KiB |
+| Qwen Q4_K shared down | 222 | 16 | 8 KiB |
+| Qwen Q5_K narrow scalar B1 | 247 | 17 | 8 KiB |
+| Qwen Q5_K shared down | 253 | 16 | 8 KiB |
+| Qwen Q6_K M64/M128/M256 | 87/138/137 | 15/16/15 | 4 KiB |
+| DeepSeek G2 unpadded | 192 | 14 | 8 KiB |
+| DeepSeek G2 padding8 | 192 | 14 | 10 KiB |
 
-M=64 uses a 16-BF16-chunk XOR LDS swizzle, while M=128 uses an eight-BF16-chunk swizzle. Row-dependent chunk permutation distributes 128-bit fragment loads across bank phases without increasing LDS footprint.
+Every retained dense-backward artifact has zero private bytes, zero VGPR/SGPR spills, and no dynamic stack. The 253-VGPR Qwen shared-down Q5_K body is the practical allocation warning point.
 
-M=256 now reuses the same 128x64 swizzled workgroup tile as M=128. Two M workgroups cover the 256 rows, producing 64 workgroups instead of the previous 32-workgroup 128x128 launch.
+## Remaining work
 
-Its Q6_K decoder additionally combines four low/high byte pairs into one packed six-bit quant word before BF16 conversion. M=64 and M=128 retain scalar extraction because the packed schedule was neutral or slightly slower there.
+No repository-local dense-backward experiment remains pending. The following are separate model-owned projects.
 
-### Other bounds-safe ordinary paths
+| Priority | Project | First target | Required mechanism |
+| ---: | --- | --- | --- |
+| 1 | Prepared Q8_0 payload/scale layout | DeepSeek Q-A and shared gate/up | Lossless 34-byte-per-32-value layout with better cross-lane transaction packing |
+| 2 | Paired grad-input API (DB5) | DeepSeek shared gate/up | Accumulate two dX contributions in FP32 and write BF16 once |
+| 3 | Prepared Q4_K/Q5_K shared-down layout (QB2) | Qwen dense shared down | Tile-major integer-plus-scale representation shared by forward and backward |
+| 4 | Decode-once or BF16-shadow floor | Large repeated projections | Explicit memory/lifetime accounting and complete-backward amortization |
 
-- rows `<=128`: one N tile.
-- rows `<=256`: four N tiles.
-- rows `<=2048`: type- and shape-specific four, eight, or sixteen N tiles.
-- rows `<=8192`: usually twelve N tiles, with sixteen for Q4_K/Q5_K at `in_features == 2048`.
-- larger rows that are not eligible for the full-tile specialization: sixteen N tiles.
+### Prepared Q8_0
 
-## Experiment log
+The leading DeepSeek experiment is a size-neutral `[all qs][all d]` or equivalent tile-major layout with contiguous int8 payloads and FP16 scales. It must keep the packed GGUF tensor as the independent source of truth and define preparation, lifetime, invalidation, device placement, memory, cold cost, and forward/backward sharing.
 
-### Initial backward redesign
+Start with one Q-A and one shared gate/up tensor while keeping G2 geometry and DB8 traversal unchanged. Measure event time, transactions, L2 hit rate, occupancy, resources, preparation cost, amortized complete backward, one-hot decode equality, and packed-forward impact. Hidden pointer, tensor-version, or stream-local caches are prohibited.
 
-The original kernel decoded one packed BF16 value at a time into a small 16x16 tile. It had little M/N reuse and sustained only about 0.05-0.13x BF16 throughput on most production shapes.
+### Paired grad-input
 
-The first accepted redesign introduced:
-- four wave32 waves.
-- LDS-staged decoded weights.
-- multiple WMMA accumulator tiles.
-- pair, quad, and sixteen-value decoders.
-- measured row/type dispatch.
-- Q6_K scale and bit extraction shared across adjacent values.
+DeepSeek shared gate/up are matching `(N,K)=(2048,4096)` projections over the same input and represent 43 pairs. Q-A `(1024,4096)` and KV `(512,4096)` also share an input but have unequal reductions and are lower priority.
 
-Representative improvement from the sequential baseline to `/tmp/mmq_bwd_final_full_v3.json`:
+A pair API must be explicit, model-owned, current-stream correct, autograd-integrated, and memory-accounted. Two independent kernels plus `torch.add` remain the control. Retention requires complete model-level backward timing and a defined one-rounding reference. ds4's paired forward path is ownership evidence, not the required summed backward contract.
 
-| Case | M | Baseline ms | First redesign ms | Speedup |
+### Qwen shared-down representation
+
+Before building a persistent representation, measure an optimistic transient floor: copy an already-decoded BF16 weight, run BF16 GEMM while excluding real decode compute, include allocation/copy in the timing, and report it separately from persistent BF16 GEMM. Close the direction if even this floor cannot beat packed MMQ usefully.
+
+The preferred production direction is compact lossless integer-plus-scale storage. Approximate ordinary storage is about 475 MiB compact versus 760 MiB BF16. Acceptance requires gains for both dense Q4_K and Q5_K shared down, no packed-forward regression, explicit invalidation, and preservation of inactive-expert sparsity plus all four route distributions if grouped kernels share the representation.
+
+### Decode-once or BF16 shadow
+
+Approximate BF16 workspaces are 32 MiB for query, 2 MiB for narrow, 16 MiB for attention output, and 2 MiB for shared down. Any two-stage path must report preparation/copy, cold call, steady state, peak memory, and amortized complete-backward time. It is not an all-in-one packed kernel and must not be implemented as a hidden transient cache.
+
+## Optimization log
+
+Historical timings below explain retained choices and closed neighborhoods. They should not be compared directly with the latest source-of-record matrices across different builds or code-object layouts.
+
+### Phase map
+
+| Phase | Result |
+| --- | --- |
+| Q0-Q3 | Four-wave tiled Qwen body, 128x128/K32 ordinary geometry, bounded packed prefetch, and shape-specific LDS layouts |
+| B0 | Converted dense backward to deterministic source-built gfx1151 HSACOs |
+| QB0 | Re-established a warmed packaged Qwen control after active-wave predicate folding |
+| QB1 | Retained scalar narrow-Q5_K extraction only at B1; rejected other bounded retunes |
+| QB2 | Deferred model-owned Qwen shared-down representation |
+| DB0 | Established the generic DeepSeek ownership/decode bottleneck |
+| DB1 | Retained exact Q8_0 wrappers for all production geometries |
+| DB2 | Retained G2 128x128/K32 for all six ordinary shapes |
+| DB3 | Retained row-dependent padding; rejected other local lowering controls |
+| DB4 | Retained M32/M64/M128/M256/M512-specific LM bodies |
+| DB5 | Deferred model-owned paired grad-input API |
+| DB6 | Selected DeepSeek M512 and retained Qwen M256 complete-loss schedules |
+| DB7 | Retained M2 for long-row Q-B and output-B |
+| DB8 | Retained M2 for the remaining B4/B16 families and M1 for Q-B B1; local search exhausted |
+
+### Q0-Q1: Qwen tiled redesign and ordinary geometry
+
+The original body decoded one packed BF16 value at a time into a 16x16 tile and sustained only about `0.05-0.13x` BF16 throughput. The first retained redesign added four wave32 waves, LDS-staged decoded weights, multiple WMMA accumulator tiles, cooperative pair/quad/width-16 decode, and measured row/type dispatch.
+
+Representative initial gains were:
+
+| Case | Historical baseline | First tiled body | Speedup |
+| --- | ---: | ---: | ---: |
+| Query Q3_K, M32768 | 1,108.314 ms | 162.884 ms | 6.80x |
+| Narrow Q4_K, M32768 | 48.332 ms | 11.130 ms | 4.34x |
+| Attention output Q4_K, M32768 | 487.945 ms | 80.633 ms | 6.05x |
+| LM head Q6_K, M256 | 158.209 ms | 26.130 ms | 6.05x |
+
+An early 64-row geometry preferred `GROUP_M=2`, improving representative M32768 cases by `1.35-1.58x`. That rule did not transfer to the final 128-row tile. The selected ordinary body became 128x128/K32 with width-16 decode and all-M/M1 traversal according to the exact wrapper.
+
+The narrow Q4_K geometry sequence established the durable choices:
+
+- 2x2 ownership was slower than the earlier 1x16 control.
+- Increasing N reuse through 2x4 and 2x6 improved latency.
+- Width-16 decode beat pair and width-8 decode.
+- K32 beat K16 and K64.
+- 2x8 was the best valid N ownership.
+- Exact full-tile specialization, paired LDS-fragment prefetch, and bounded two-row packed-byte prefetch each added gains.
+- 3x6, 4x4, 1x16/K32, broad `GROUP_M=2/4`, complete Q4_K metadata vector loads, custom barriers, and environment-driven dispatch were rejected.
+
+The clean pre-layout narrow Q4_K milestone was about `3.273 ms`, down from `7.053 ms` for the earlier grouped geometry.
+
+### Q2: packed extraction, prefetch, and LDS layout
+
+Q3_K/Q4_K/Q5_K retain explicit scalar or `uint4` packed-byte state. Wide Q3_K packed extraction reduced query latency from 48.694 to 46.980 ms. Keeping the next reduction iteration's packed fragments live across WMMA regressed to 48.606 ms, so prefetch remains bounded to the current decode phase. Narrow Q3_K does not prefetch because its 110-byte block layout made the path slower.
+
+Pre-layout Q4_K profiles reported a repeated `79.2%` LDS-bank-conflict metric. Eight BF16 values of row padding change the K32 LDS stride from 64 to 80 bytes:
+
+| Q4_K M32768 shape | Unpadded | Padded | Decision |
+| --- | ---: | ---: | --- |
+| Query | 54.895 ms | 46.295 ms | retain padding/layout specialization |
+| Narrow | 3.273 ms | 2.907 ms | retain |
+| Attention output | 26.875 ms | 23.177 ms | retain |
+| Shared down | 5.261 ms | 5.389 ms | reject padding |
+
+Q3_K query/narrow also improved with padding. Q5_K padding regressed and was rejected. Later XOR controls showed that layout is body-specific: eight-BF16 granularity is selected for wide Q3_K and Q4_K query/narrow, 16-BF16 for shared-down Q4_K, and four-BF16 for shared-down Q5_K.
+
+Explicit aligned fragment loads improved narrow Q3_K and attention-output Q4_K but regressed query Q4_K, Q5_K, and shared-down bodies by about 2-4%. Production therefore uses typed local-load selection rather than a global vector-load rule. Lower instruction count did not reliably predict lower LDS stalls or event time.
+
+Shared-down controls closed the local neighborhood:
+
+- 4x4 and 1x16 ownership regressed Q4_K/Q5_K to roughly 7.3-9.2 ms.
+- K64 was neutral for Q4_K and regressed Q5_K to 6.565 ms.
+- Disabling local prefetch did not lower the 253-VGPR allocation and was slower.
+- Disabling packed-byte prefetch lowered allocation to 234 VGPRs but regressed to 6.186 ms.
+
+The remaining shared-down limit is repeated decode and insufficient shape-local reuse, not an untested tile or spill-removal opportunity.
+
+### Q3: Q6_K small-row geometry
+
+The final Q6_K bodies are:
+
+| M | Retained geometry and layout | Historical packed/BF16 |
+| ---: | --- | ---: |
+| 64 | M64/N32/K64, 16-BF16 XOR | `5.357/9.863 ms`, `1.84x` |
+| 128 | M128/N64/K32, eight-BF16 XOR | `9.084/14.480 ms`, `1.59x` |
+| 256 | Two M128/N64/K32 workgroups, packed extraction, eight-BF16 XOR | `11.726/19.010 ms`, `1.62x` |
+
+The M64 128-byte decoded-weight row stride mapped row starts to the same bank phase. The 16-BF16 XOR layout roughly halved latency without increasing LDS. M128 benefited from exact loader ownership. M256 was faster as two smaller workgroups than as the original wider N tile because extra workgroup parallelism and lower accumulator pressure outweighed repeated packed decode.
+
+Two apparently fast M256 N=5/N=7 measurements were invalid because the N tile did not divide the logical 2,048-column result; the corrected N=7 body measured 29.628 ms. K16/K64, M128 N3, M64 N3/N4, and four-/16-BF16 alternatives on the selected 128x64 geometry were rejected. Packed extraction remains selected only for M256.
+
+### B0: source-built HSACO conversion
+
+Dense backward moved from embedded extension entry points to independently compiled concrete gfx1151 wrappers. The initial nine-repeat comparison moved `+0.56%` geometrically. A sequential embedded/bundle/embedded 25-repeat bracket measured the bundle at `+1.12%` geometrically and `+0.93%` by estimated model latency, while the embedded controls themselves drifted `+1.04%`.
+
+Q3_K query showed the largest repeatable placement-sensitive movement, about `2.9-7.0%`, even though no dispatch or device-body algorithm changed. This established the rule used by QB0/QB1: warm standalone modules, compare normalized ISA, and do not infer a semantic regression from raw code-object placement. Bundle construction and packaging details are maintained in `docs/kernel_bundle.md`.
+
+### QB0-QB1: packaged Qwen retune
+
+QB0 found that a runtime `wave < ACTIVE_WAVES` predicate had changed normalized Qwen ISA. Folding it away when `ACTIVE_WAVES == 4` restored the intended control.
+
+QB1 tested only four bounded questions: wide-Q3 packed extraction/prefetch/swizzle, narrow-Q5 extraction, Q6 M256 extraction, and shared-down-Q5 swizzle. Results:
+
+- Wide Q3_K kept packed extraction, two-row prefetch, and eight-BF16 XOR. Removing them regressed by `1.06-11.78%` depending on the control.
+- Narrow Q5_K retained scalar extraction only at 2,048 rows, improving `17.41%`; it regressed `2.34%/6.52%` at 8,192/32,768 rows.
+- Q6_K M256 kept packed extraction; scalar extraction regressed `2.14%`.
+- Shared-down Q5_K kept swizzle4 because the isolated swizzle8 gain did not survive the complete matrix.
+
+The retained QB1 matrix improved checkpoint-weighted Qwen latency by `0.94%/0.16%/0.63%` relative to QB0 and closed repository-local Qwen tuning.
+
+### DB0: DeepSeek baseline and diagnosis
+
+The generic Q8_0 body used 64x64/reduction-16 ownership, 92 VGPRs, 17 SGPRs, and 2 KiB LDS with no private storage or spills. It was resource-light but ownership-limited:
+
+| Batch | Historical packed/BF16 weighted ms | Throughput ratio |
+| ---: | ---: | ---: |
+| 1 | `3266.8/767.4` | `0.235x` |
+| 4 | `16920.7/3075.7` | `0.182x` |
+| 16 | `72146.2/12140.1` | `0.168x` |
+
+Per-family ratios were `0.15-0.30x`. The small tile repeated decode, exposed too little M/N reuse, and collapsed as rows grew. Spills, launcher overhead, and allocation were not the first-order explanation.
+
+### DB1: exact Q8_0 shapes
+
+Eight wrappers covered six full ordinary geometries plus full and bounded LM-head rows. Exact specialization removed runtime shape/bounds/address state while preserving the generic fallback.
+
+The generic/exact/generic bracket improved all 18 ordinary points by `11.32-246.14%`, with a `60.58%` geometric gain. Checkpoint-weighted ordinary latency improved `71.16%/44.23%/41.46%` at B1/B4/B16. LM-head gains ranged from `2.76%` at M32 to more than `130%` at M256/M512.
+
+Full wrappers used 91 VGPRs, 14 SGPRs, and 2 KiB LDS. The bounded LM wrapper used 18 SGPRs. All remained resource-clean.
+
+### DB2: ordinary geometry
+
+DB2 compared G0 64x64/K16, G1 128x64/K32, G2 128x128/K32, and G3 256x64/K32. G2 won all six ordinary families.
+
+| Body | VGPR | LDS | Result |
+| --- | ---: | ---: | --- |
+| G0 64x64/K16 | 92 | 2 KiB | control |
+| G1 128x64/K32 | 118 | 4 KiB | slower on every production family |
+| G2 128x128/K32 | 192 | 8 KiB | retained |
+| G3 256x64/K32 | 194 | 4 KiB | slower on every shape/batch |
+
+The G0/G2/G0 bracket improved all 18 points by `28.44-130.43%`, with a `77.49%` geometric latency gain. Checkpoint-weighted latency improved `86.99%/96.51%/99.95%` at B1/B4/B16.
+
+Two audit warnings remain important:
+
+- An early screen transposed G1/G3 axes into invalid 64x128/64x256 interpretations; those results were discarded and rebuilt correctly.
+- The generated candidates actually used all-M traversal despite the plan's intended grouped start. Because every geometry shared the same ordering, the geometry result remains valid; DB7/DB8 later isolated traversal.
+
+### DB3: Q8_0 lowering and LDS padding
+
+Generated ISA already carried affine reduction state and emitted `global_load_b128` for each width-16 Q8 payload. An explicit source vector-loader or address-carry rewrite would not add a new mechanism. Paired LDS-fragment prefetch was neutral/slower (`-1.26%/-0.74%/+0.11%` on Q-A B1/B4/B16) and was rejected.
+
+The unpadded G2 profile reported `79.17%` LDS bank conflict on Q-A, Q-B, and output-B. On Q-A B1, padding8 changed the K32 row stride from 64 to 80 bytes and reduced:
+
+- bank conflict from `79.17%` to `58.33%`;
+- derived LDS latency from about 585 to 245 cycles;
+- ALU stall from LDS from `24.19%` to `15.26%`.
+
+The complete bracket retained padding for Q-A and shared gate/up through 8,192 rows, Q-B/output-B/shared-down at 2,048 rows, and KV at every production row count. Retained gains were `6.17-31.69%`; shared-down B4 rejected padding after a `2.63%` regression. Width32 remained closed because the selected ISA already vector-loads the payload and repeated scale loads were not the measured limit.
+
+### DB4-DB6: LM geometry and complete-loss selection
+
+DB4 retained active-two-wave M32, G0 M64, G1 M128, and G3 M256/M512. M32 keeps all waves for decode/barriers but limits cotangent loads, WMMA, and stores to two waves. M128 improved `19.48%`; M256/M512 improved `51.85%/60.64%`. Selected bodies used 91-194 VGPRs and 2-4 KiB LDS with no private storage or spills.
+
+Historical per-call backward latency was `8.297/7.459/7.569/10.386/23.206 ms` at M32/M64/M128/M256/M512. Isolated backward favored M256, but DB6 selected from the complete loop:
+
+| DeepSeek chunk | B1 complete ms | B1 peak MiB | B4 complete ms | B4 peak MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 721.928 | 32.32 | 2929.059 | 80.35 |
+| 64 | 332.749 | 48.79 | 1350.252 | 96.82 |
+| 128 | 219.147 | 81.57 | 895.870 | 129.60 |
+| 256 | 175.808 | 147.45 | 719.764 | 195.48 |
+| 512 | 173.583 | 274.76 | 705.975 | 322.79 |
+
+M512 was retained. The full five-chunk B16 sweep was intentionally stopped because of cost; a selected-M512 capacity run measured `2775.945 ms`, 514.91 MiB allocation, and 532 MiB reservation. DB5 paired grad-input remained deferred because it requires a model-owned API and autograd integration.
+
+### DB7: Q-B and output-B traversal
+
+DB7 changed only grouped-M launch traversal on the G2 body. M2 was retained for Q-B and output-B above 2,048 rows:
+
+- Q-B B4/B16 fell from `51.419/194.356 ms` to `31.482/116.296 ms`, reductions of `38.77%/40.16%`.
+- Output-B B4/B16 fell from `45.779/187.065 ms` to `26.537/108.106 ms`, reductions of `42.03%/42.21%`.
+
+M4 was slower. M1 and M2 were within `0.75%`; M2 was retained from its stronger direct all-M brackets. Q-B L2 hit rate rose `9.6% -> 13.8%` and occupancy `12.0% -> 21.1%`. Output-B changed `17.8% -> 54.5%` L2 and `12.5% -> 23.2%` occupancy.
+
+DB7 improved weighted throughput to `0.972x/0.737x/0.658x`, but four families and Q-B B1 still had untested traversal, motivating DB8.
+
+### DB8: complete grouped-M traversal
+
+DB8 preserved geometry, padding policy, arithmetic, reduction order, active waves, decoder width, prefetch, buffering, and K depth. It changed only `GROUP_M` and the launch-grid mapping.
+
+All nine M2 targets exceeded the 1% screen threshold:
+
+| Family | Batch | all-M before | M2 | all-M after | M2/control midpoint |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q-A | 4 | 4.468 | 2.554 | 4.649 | `0.560x` |
+| Q-A | 16 | 32.386 | 13.184 | 32.368 | `0.407x` |
+| Q-B | 1 | 8.179 | 7.475 | 7.673 | `0.943x` |
+| KV | 4 | 3.278 | 1.338 | 3.305 | `0.406x` |
+| KV | 16 | 23.194 | 5.253 | 23.211 | `0.226x` |
+| Shared gate/up | 4 | 9.361 | 5.656 | 9.497 | `0.600x` |
+| Shared gate/up | 16 | 54.401 | 27.955 | 54.583 | `0.513x` |
+| Shared down | 4 | 12.718 | 7.070 | 12.272 | `0.566x` |
+| Shared down | 16 | 49.452 | 27.961 | 49.479 | `0.565x` |
+
+M1 was used only as a tie-breaker. Seven non-Q-B points were within 1% of M2; shared gate/up B4 was `1.36%` slower. Q-B B1 was the exception: the M2/M1/M2 bracket was `7.241/6.923/7.509 ms`, so M1 won by `6.1%` against the control midpoint.
+
+Normalized disassembly was `98.16-98.83%` opcode-identical to the all-M controls. Every variant retained 10 `global_load_b128`, 32 `ds_load_b128`, and 32 BF16 WMMA instructions; only two to five mapping-prologue instructions changed.
+
+Matched profiles identified locality as the first-order mechanism:
+
+| Family | L2 hit all-M/winner | Occupancy all-M/winner | ALU stalled by LDS | LDS latency cycles |
 | --- | ---: | ---: | ---: | ---: |
-| Query Q3_K | 32,768 | 1,108.314 | 162.884 | 6.80x |
-| Narrow Q4_K | 32,768 | 48.332 | 11.130 | 4.34x |
-| Attention output Q4_K | 32,768 | 487.945 | 80.633 | 6.05x |
-| Shared down Q4_K | 32,768 | 66.903 | 14.095 | 4.75x |
-| LM head Q6_K | 256 | 158.209 | 26.130 | 6.05x |
+| Q-A B16 | `33.3%/80.7%` | `44.9%/49.6%` | `0.49%/2.12%` | `434/658` |
+| Q-B B1 | `27.3%/57.9%` | `38.8%/38.4%` | `13.27%/19.52%` | `173/184` |
+| KV B16 | `37.4%/76.7%` | `43.5%/49.5%` | `0.39%/1.35%` | `301/248` |
+| Shared gate B16 | `26.6%/73.1%` | `42.7%/49.6%` | `0.39%/1.98%` | `388/635` |
+| Shared down B16 | `18.6%/57.2%` | `46.2%/49.3%` | `0.67%/3.67%` | `356/615` |
 
-The custom sixteen-value Q6_K decoder exactly matched the BF16 reference dequantizer for all 8,192 checked values.
+L2 hit rate rose by 30.6-47.4 percentage points. LDS stalls and latency often increased, but the shorter packed-weight/cotangent reuse window dominated. `MemUnitBusy` could not be collected because rocprofv3 rejects its non-windowable `TA_TA_BUSY` dependency under dispatch-windowed gfx1151 collection.
 
-### Grouped M traversal
+DB8 reduced weighted packed latency by `4.51%/18.85%/26.41%` from DB7 and closed repository-local DeepSeek dense-backward work. Its seven wrappers were appended as bundle IDs 172-178, preserving all established IDs.
 
-The original grid ran all M blocks for one N block before advancing N. A grouped three-dimensional mapping was tested:
+## Closed directions and durable reasoning
 
-```text
-grid = [GROUP_M, n_blocks, ceil(m_blocks / GROUP_M)]
-m_block = blockIdx.z * GROUP_M + blockIdx.x
-n_block = blockIdx.y
-```
+| Direction | Decision and reason |
+| --- | --- |
+| Larger wave counts | Rejected or invalid ownership; four wave32 waves remain the dense foundation |
+| 2x2, 3x6, 4x4, 1x16 ordinary geometry | Lost reuse, parallelism, or cotangent traffic tradeoffs |
+| Broad `GROUP_M=2/4` | Traversal is geometry and shape dependent; retain only exact measured DeepSeek branches |
+| M4 traversal | Slower than M2 in DB7/DB8 screens |
+| Width-8 ordinary decode | Duplicated metadata work and lost to width16 |
+| Width-32 Q8_0 decode | Grouped controls lost 2.4-4.3%; local ISA already uses wide payload loads |
+| Ordinary K64 | Longer decode/live ranges outweighed fewer barriers; retain only Q6 M64's measured body |
+| Cross-iteration packed prefetch | Longer VGPR lifetime regressed Q3_K |
+| Compiler-managed prefetch arrays | Risk unintended LDS/private storage; explicit scalar/vector state is required |
+| Complete metadata vector loads | Did not improve Q4_K and changed scheduling unfavorably |
+| Global LDS padding or swizzle | Layout is quant-, shape-, and geometry-specific; conflict percentage alone is not a selector |
+| Two LDS buffers or decoded-weight LDS cache | Extra LDS/residency cost lost in dense and grouped controls |
+| Custom LDS-only barriers | Neutral or slower; simpler synchronization retained |
+| Shared-down 4x4/1x16/K64 | Direct controls regressed or were neutral; representation is the remaining lever |
+| Q6 invalid N5/N7 tiles | Out-of-bounds full-tile assumptions produced invalid timing; exact divisibility is mandatory |
+| Split-K, GSU, Stream-K, persistent workgroups | No K-split/fixup mechanism or regular-grid deficit justifies them |
+| DirectToLds/DirectToVgpr | These paths do not perform cooperative GGUF reconstruction and sharing |
+| Environment or online autotuning | Production dispatch remains static and explainable |
+| Raw code-object offsets/order | Byte-identical controls drift; only semantic/normalized-ISA changes are evidence |
+| Hidden prepared-weight/activation caches | Lifetime, invalidation, stream, and memory ownership must be model-visible |
 
-`GROUP_M=1,2,4,8,16` and the old all-M ordering were benchmarked sequentially.
+### Portability evidence
 
-For the earlier 64-row workgroup geometry, `GROUP_M=2` was the best compromise:
+| Source | Durable conclusion |
+| --- | --- |
+| llama.cpp PR #21344 | gfx1151 benefits from workload-specific 128-thread ownership; do not import RDNA4 256-thread/eight-wave settings |
+| llama.cpp PR #21527 | Lossless Q8_0 payload/scale separation is the strongest future representation experiment |
+| llama.cpp PR #22051 and PR #21168 | No missing local vector-load mechanism; selected ISA already emits wide global/LDS loads |
+| llama.cpp PR #22298 | Stream-K is inapplicable because this backward has no K split or fixup |
+| Composable Kernel PR #2663 | Prepared quant layouts are credible, but the published architectures and quant families differ |
+| hipBLASLt PR #539 | XCC remapping does not apply to single-XCC gfx1151; locality is already covered by DB7/DB8 |
+| ds4 | Explicit model-owned Q8 preparation and paired projections are useful ownership evidence; its static cache and forward pair are not this backward contract |
 
-| Case, M=32,768 | Before | `GROUP_M=2` | Improvement |
-| --- | ---: | ---: | ---: |
-| Query Q3_K | 162.884 ms | 112.026 ms | 1.45x |
-| Narrow Q4_K | 11.130 ms | 7.051 ms | 1.58x |
-| Attention output Q4_K | 80.633 ms | 55.768 ms | 1.45x |
-| Shared down Q4_K | 14.095 ms | 10.458 ms | 1.35x |
+Architecture transfer rules:
 
-Traversal is geometry-dependent. The later 128-row workgroup tile prefers `GROUP_M=1`.
+- Treat RDNA3/RDNA4 results as mechanism evidence only; do not assume gfx12 scheduler/cache behavior applies to gfx1151.
+- Keep producer-side cooperative GGUF decode. Consumer-side decode repeats metadata work in every M wave.
+- Treat traversal, geometry, K depth, decoder width, and LDS layout as one measured configuration.
+- Prefer controlled ablations and event timing over PC-sampling percentages or instruction count alone.
+- Use a lossless integer-plus-scale representation before considering approximate int8 arithmetic.
 
-### Ordinary 128x128 geometry and decoder sweep
+## Scope and contracts
 
-The accepted full-tile ordinary geometry uses two M tiles and eight N tiles per wave with `K_ITERATION=32`.
+Included:
 
-Narrow Q4_K M=32,768 sequence:
+- BF16 cotangents and BF16 input gradients.
+- Packed GGUF Q3_K, Q4_K, Q5_K, Q6_K, IQ2_S, and Q8_0 compatibility.
+- Qwen's 160 ordinary projections and Q6_K head.
+- DeepSeek's 301 ordinary Q8_0 calls and Q8_0 head.
+- Sequence length 2,048 at physical batches 1, 4, and 16.
+- Direct packed-weight execution with static host-visible dispatch.
 
-| Experiment | Median ms | Outcome |
-| --- | ---: | --- |
-| Earlier grouped 1x16 geometry | 7.053 | reference |
-| 2x2, pair decoder, K=16 | 11.424 | rejected |
-| 2x4, pair decoder, K=16 | 5.845 | improved |
-| 2x6, pair decoder, K=16 | 5.514 | improved |
-| 2x6, `GROUP_M=1` | 5.364 | improved |
-| 2x6, sixteen-value decoder, K=16 | 4.274 | improved |
-| 2x6, sixteen-value decoder, K=64 | 5.120 | rejected |
-| 2x6, sixteen-value decoder, K=32 | 3.855 | improved |
-| 2x4 / 2x5 / 2x7 / 2x8 at K=32 | 4.692 / 4.169 / 3.732 / 3.683 | 2x8 selected |
-| Eight-value decoder | 4.745 | rejected |
-| Paired LDS-fragment prefetch | 3.601 | improved |
-| Exact full-tile specialization | 3.399 | improved |
-| Two-row packed-byte prefetch | 3.293 | improved |
-| Final clean pre-padding dispatch | 3.273 | accepted milestone |
+Excluded:
 
-Additional rejected experiments:
-- 3x6 and 4x4 M/N tiles.
-- a 1x16 K=32 schedule.
-- `GROUP_M=2` and `GROUP_M=4` on the final 128-row geometry.
-- eight-value Q3_K/Q4_K/Q5_K decoding.
-- full vector loading of the Q4_K metadata header.
-- replacing `__syncthreads()` with an LDS-only inline-assembly barrier.
-- runtime environment-driven production dispatch.
+- Grouped/routed expert backward, documented in `docs/grouped_mmq_bwd_optimization.md`.
+- GatedDeltaNet layout permutations.
+- LoRA GEMMs and residual accumulation.
+- Model-scheduler ownership and public operator-schema changes.
+- Changes under `csrc/vendor/llama_cpp`.
+- Direct fused-kernel linkage against hipBLASLt.
 
-The inline-assembly barrier removed `buffer_gl0_inv` but was neutral or slower. It was removed.
-
-### Packed-byte prefetch
-
-Q3_K, Q4_K, and Q5_K gained explicit fixed `uint4` packed-byte prefetch helpers.
-
-Q4_K and Q5_K preload packed data for two output rows before decoding the first. Wide Q3_K uses the analogous path.
-
-Wide Q3_K now combines four low/high byte pairs into one unsigned three-bit quant word before scalar BF16 conversion. This reduced query latency from 48.694 to 46.980 ms without changing correctness.
-
-Holding the next iteration's four `uint4` packed fragments live across WMMA regressed query to 48.606 ms. The longer VGPR live range costs more than cross-iteration global-load overlap saves, so prefetch remains limited to the current decode phase.
-
-Narrow Q3_K does not use packed prefetch. Its misaligned 110-byte block layout made the prefetch slightly slower than the regular sixteen-value decoder.
-
-Fixed scalar/vector prefetch state was retained. Compiler-managed arrays were avoided because FeatherOps experiments showed that intended VGPR arrays can become unexpected LDS allocations.
-
-### LDS padding and bank-layout experiment
-
-Counter profiling of the pre-padding Q4_K kernels reported a repeated 79.2% LDS-bank-conflict stall percentage.
-
-The decoded B layout is logically:
+Hardware and toolchain:
 
 ```text
-shared_b[input_column][k]
+GPU: Radeon 8060S Graphics
+architecture: gfx1151, RDNA3.5, wave32, 40 CUs
+LDS limit: 64 KiB per workgroup, 128 KiB per WGP
+VGPR capacity: 1536 per SIMD
+PyTorch: 2.12.0+rocm7.15.0a20260701
+HIP: 7.14.60850
 ```
 
-Without padding, K=32 gives a 64-byte LDS row stride. On 32 four-byte banks, row starts alternate between only two bank phases.
-
-Eight BF16 values of row padding change the stride to 80 bytes. This preserves 16-byte alignment while distributing row starts over more banks.
-
-Q4_K M=32,768 results:
-
-| Shape | Unpadded | Padded | Speedup |
-| --- | ---: | ---: | ---: |
-| Query | 54.895 ms | 46.295 ms | 1.19x |
-| Narrow | 3.273 ms | 2.907 ms | 1.13x |
-| Attention output | 26.875 ms | 23.177 ms | 1.16x |
-| Shared down | 5.261 ms | 5.389 ms | regression |
-
-Padding is selected for Q4_K only when `in_features >= 2048`.
-
-Q3_K also improved:
-
-| Shape | Unpadded | Padded | Speedup |
-| --- | ---: | ---: | ---: |
-| Query | 53.879 ms | 49.803 ms | 1.08x |
-| Narrow | approximately 3.316 ms | 3.138 ms | 1.06x |
-
-Q5_K did not benefit from padding. Narrow Q5_K regressed from 3.378 to 3.622 ms, so padded Q5_K remains rejected.
-
-A later no-padding XOR swizzle sweep showed that the result is shape-specific. Query Q3_K/Q4_K measured 49.040/47.454 ms, narrow Q4_K/Q5_K measured 2.969/3.114 ms, and those cases improved relative to the immediately preceding selected dispatch.
-
-The eight-BF16-chunk swizzle regressed narrow Q3_K to 3.093 ms, attention-output Q4_K to 22.812 ms, and both shared-down formats to 5.401/5.651 ms. The selected dispatch uses that granularity only for wide Q3_K query, Q4_K query/narrow, and narrow Q5_K. Padded vector loads remain selected for narrow Q3_K and attention-output Q4_K.
-
-A coarser 16-BF16-chunk swizzle regressed the high-frequency Q3_K query from 48.694 to 57.001 ms. A finer four-BF16 swizzle with four 64-bit fragment loads also regressed to 50.873 ms. Its selected eight-BF16 granularity is retained.
-
-The 16-BF16 swizzle also regressed Q4_K query/narrow from 47.083/2.915 ms to 53.638/3.420 ms. A four-BF16 swizzle was closer at 48.051/2.989 ms but still slower. Their selected eight-BF16 granularity is retained.
-
-A follow-up 16-BF16-chunk swizzle improved shared-down Q4_K from 5.316 to 5.166 ms in the initial run and 5.252 ms in the final selected dispatch. It regressed attention-output Q4_K to 26.526 ms, while a four-BF16 swizzle also trailed its padded layout at 22.952 ms.
-
-Shared-down Q5_K and the original Q6_K M=256 geometry were neutral with the coarser swizzle. The 16-BF16 variant is accepted only for shared-down Q4_K and Q6_K M=64.
-
-Before packed Q3_K/Q5_K quant extraction, the selected ordinary run measured 48.694/47.083 ms for Q3_K/Q4_K query, 2.691/2.915/3.065 ms for narrow Q3_K/Q4_K/Q5_K, and 22.402 ms for attention-output Q4_K. The later packed extraction changes reduced Q3_K query to 46.980 ms and narrow Q5_K to 2.868 ms.
-
-### LDS vectorization inspection
-
-The unpadded ordinary Q4_K kernel emits 32 `ds_load_b128` instructions for B fragments.
-
-The padded Q4_K kernel emits:
-
-```text
-16 ds_load_b128
-64 ds_load_u16_d16
-64 ds_load_u16_d16_hi
-```
-
-Padding improves overall speed despite scalarizing half of the fragment loads. The element-wise padded-storage indexing prevents the compiler from recognizing every 32-byte BF16 fragment as two aligned 128-bit loads.
-
-The decoded-weight stores remain scalar 16-bit stores. One decoder thread produces 16 adjacent input columns for one K position, but the selected LDS representation stores K contiguously within each input column.
-
-Those stores are an intentional transpose. Vectorizing them requires a register/lane transpose or a different producer mapping.
-
-Because each value is stored once and then loaded by four waves, restoring fully vectorized fragment loads was the next measured experiment.
-
-An explicit aligned helper restored the padded and unpadded kernels to two `ds_load_b128` operations per 16-BF16 fragment. The result was strongly shape-dependent rather than universally positive.
-
-At M=32,768, narrow Q3_K improved 3.138 to 2.739 ms, attention-output Q4_K improved 23.177 to 22.802 ms, and query Q3_K improved slightly from 49.803 to 49.392 ms. Query Q4_K regressed 46.295 to 48.976 ms, while Q5_K and shared-down shapes also regressed by about 2-4%.
-
-The likely cause is that wider transactions reduce instruction count but change the bank-conflict and wait schedule. The Q6_K M=64/128/256 results were neutral at 10.945/13.449/20.795 ms versus 10.938/13.402/20.834 ms.
-
-A typed selection was added for Q3_K and attention-output Q4_K, but the first scalar fallback still used direct physical indexing. The compiler recognized that fallback as contiguous and continued to emit fully vectorized loads, so Q4_K query remained regressed at 48.805 ms.
-
-The logical-indexed fallback restored the prior mixed padded ISA: Q4_K controls again emit 16 `ds_load_b128` operations plus 128 scalar 16-bit loads, while selected Q3_K and attention-output Q4_K emit 32 `ds_load_b128` operations.
-
-The final selective run measured 49.324 ms for query Q3_K, 2.691 ms for narrow Q3_K, and 22.437 ms for attention-output Q4_K. Q4_K query/narrow measured 48.716/3.071 ms in the same run, so their earlier 46.295/2.907 ms padding result needs a repeated control before attributing the difference to the vector-load implementation.
-
-### Q6_K small-row geometry sweep
-
-The initial M=256 M=2/N=6/K=32 candidate improved 26.082 to 22.958 ms.
-
-The M=256 neighborhood sweep was:
-
-| Configuration | Time ms | Outcome |
-| --- | ---: | --- |
-| M=2/N=5/K=32 | 19.204 | invalid full-tile measurement. N width does not divide 2048 |
-| M=2/N=7/K=32 | 18.861 | invalid full-tile measurement. Corrected bounds-safe time is 29.628 ms |
-| M=2/N=8/K=32 | 20.834 | selected valid exact-tile geometry |
-| M=2/N=7/K=16 | 24.588 | rejected |
-| M=2/N=7/K=64 | 25.631 | rejected |
-| M=2/N=7/K=32, `GROUP_M=1` | 18.827 | neutral |
-
-The original conclusion that N=7 won was invalid because the last N workgroup ran outside the logical 2048-column input gradient. N=8 is the selected valid geometry at 20.834 ms. K=16 still underfills the loader, while K=64 lengthens the decode phase and uses about 14 KiB LDS.
-
-For M=128:
-
-| Configuration | Time ms | Outcome |
-| --- | ---: | --- |
-| Previous M=1/N=2/K=64 | 18.618 | reference |
-| M=2/N=3/K=32 | 19.448 | rejected |
-| M=2/N=3/K=64 | 20.760 | rejected |
-| M=2/N=4/K=32 | 13.443 | selected |
-
-The selected M=128 geometry creates exactly 128 sixteen-value decoder groups per K chunk. Every loader thread receives one group.
-
-For M=64:
-
-| Configuration | Time ms | Outcome |
-| --- | ---: | --- |
-| Previous N=1/K=64 quad decoder | 12.599 | reference |
-| N=2/K=64 sixteen-value decoder | 10.892 | selected |
-| N=4/K=32 | 11.416 | rejected |
-
-The final clean Q6_K benchmark is:
-
-| M | Selected geometry | Packed ms | BF16 ms | Throughput ratio |
-| ---: | --- | ---: | ---: | ---: |
-| 64 | M=1/N=2/K=64 with 16-BF16-chunk XOR LDS swizzle | 5.357 | 9.863 | 1.84x |
-| 128 | M=2/N=4/K=32 with XOR LDS swizzle | 9.084 | 14.480 | 1.59x |
-| 256 | two M blocks of M=2/N=4/K=32, packed quant extraction, XOR swizzle | 11.726 | 19.010 | 1.62x |
-
-The XOR LDS swizzle changed M=64 from the largest Q6_K deficit into the fastest production-relative kernel at 1.84x BF16 throughput. The final 16-BF16-chunk layout measures about 5.36 ms, with unchanged 4 KiB LDS capacity and exact benchmark correctness.
-
-M=128 improved from 13.402 to 9.187 ms and reached 1.57x BF16. Applying the swizzle to the eight-N-tile M=256 geometry regressed, but reusing the four-N-tile swizzled geometry with two M workgroups reduced 20.894 to 12.156 ms and also reached 1.57x BF16.
-
-The smaller N tile doubles workgroup count and reduces accumulator pressure. Its repeated packed decode across two M blocks costs less than the parallelism and LDS-bank gains it enables.
-
-Packed Q6_K quant-byte extraction measured 5.361/9.370/11.754 ms at M=64/128/256 when enabled globally. Shape-specific selection restored the scalar M=64/M=128 times and retained the M=256 gain, with a final 11.758 ms result.
-
-Changing the packed M=256 path from an eight- to 16-BF16 swizzle regressed it to 15.540 ms. A four-BF16 swizzle with four 64-bit fragment loads also regressed to 13.934 ms.
-
-Neither alternative provides the M=64 benefit on the 128x64 geometry. On scalar-extraction M=128, 16- and four-BF16 swizzles regressed from about 9.17 to 13.486 and 12.363 ms.
-
-The eight-BF16 swizzle remains selected for both 128x64 paths.
-
-A post-swizzle M=64 N=3/K=64 candidate regressed from 5.829 to 12.690 ms. Its 48-column tile does not divide 2048, so bounds checks on every workgroup and the irregular final tile overwhelm its extra N reuse.
-
-The exact N=4/K=64 candidate also regressed to 10.258 ms because its 32 workgroups do not cover the 40 CUs and accumulator pressure rises. A finer four-BF16-chunk swizzle regressed the selected N=2 geometry to 7.880 ms because four 64-bit fragment loads cost more than the additional bank distribution saves.
-
-A coarser 16-BF16-chunk swizzle then improved the exact N=2 geometry from 5.829 to 5.365 ms. It remains selected.
-
-## Latest results
-
-### Ordinary M=32,768
-
-The latest accepted measurements combine the 128x128 retile, packed-byte prefetch, full-tile specialization, and selected LDS padding.
-
-| Case | Packed ms | BF16 ms | Throughput ratio | Source |
-| --- | ---: | ---: | ---: | --- |
-| Query Q3_K | 46.992 | 59.372 | 1.26x | packed quant-byte extraction and XOR-swizzled vector loads |
-| Query Q4_K | 46.999 | 59.476 | 1.27x | XOR-swizzled vector local loads |
-| Narrow Q3_K | 2.713 | 2.849 | 1.05x | padded vector local loads |
-| Narrow Q4_K | 2.843 | 2.805 | 0.99x | XOR-swizzled vector local loads |
-| Narrow Q5_K | 2.914 | 2.839 | 0.97x | packed quant-byte extraction and 8-BF16-chunk XOR swizzle |
-| Attention output Q4_K | 22.462 | 22.692 | 1.01x | padded vector local loads |
-| Shared down Q4_K | 5.278 | 4.123 | 0.78x | 16-BF16-chunk XOR-swizzled vector loads |
-| Shared down Q5_K | 5.569 | 4.123 | 0.74x | scalar quant extraction and 4-BF16-chunk XOR swizzle |
-
-The ordinary batch-16 serial estimate is 1.193 seconds across the 160 projections. The corresponding same-run BF16 estimate is 1.267 seconds.
-
-This is an aggregate scheduling estimate, not an end-to-end training measurement. It does not model overlap with other model work.
-
-### Pre-padding full shape matrix
-
-`/tmp/mmq_bwd_ordinary_final_geometry.json` remains the latest complete ordinary 2,048/8,192/32,768 matrix before LDS padding:
-
-| Case | M=2,048 | M=8,192 | M=32,768 | BF16 ratio at M=32,768 |
-| --- | ---: | ---: | ---: | ---: |
-| Query Q3_K | 3.622 ms | 13.792 ms | 53.879 ms | 1.11x |
-| Query Q4_K | 4.836 ms | 14.574 ms | 54.895 ms | 1.08x |
-| Narrow Q4_K | 0.300 ms | 0.907 ms | 3.273 ms | 0.86x |
-| Narrow Q5_K | 0.253 ms | 0.914 ms | 3.378 ms | 0.83x |
-
-The final production M=32,768 row is reported above. A new multi-M matrix would be needed only if smaller-row ordinary dispatch becomes a production target.
-
-### LM-head aggregation implications
-
-At batch 16:
-
-| Chunk M | Calls | Packed serial estimate | BF16 serial estimate |
-| ---: | ---: | ---: | ---: |
-| 64 | 512 | 2,743 ms | 5,050 ms |
-| 128 | 256 | 2,326 ms | 3,707 ms |
-| 256 | 128 | 1,501 ms | 2,433 ms |
-
-M=256 is now the production schedule. It has the lowest batch-16 serial estimate at about 1.50 seconds and requires about 121 MiB of cotangent storage. M=128 and M=64 remain lower-memory fallbacks.
-
-The complete 2,048-row packed-loss loop measured 229.958 ms at M=256 versus 312.690 ms at M=64. Peak allocation above resident inputs increased from 69.03 to 253.57 MiB. The approximately 184.5 MiB increase is accepted.
-
-Approximate BF16 cotangent storage is:
-
-| Chunk M | Storage |
-| ---: | ---: |
-| 64 | 30 MiB |
-| 128 | 61 MiB |
-| 256 | 121 MiB |
-
-Aggregation belongs at the loss/LM-head scheduling layer rather than inside the packed kernel.
-
-## Profiling and resource findings
-
-### Final code-object resources
-
-The final selected production specializations have no private segment or register spills:
-
-| Specialization | VGPRs | SGPRs | LDS |
-| --- | ---: | ---: | ---: |
-| Q3_K query | 237 | 27 | 8 KiB |
-| Q4_K query/narrow | 226 | 17 | 8 KiB |
-| Q4_K attention output | 222 | 20 | 10 KiB |
-| Q4_K shared down | 222 | 16 | 8 KiB |
-| Q5_K narrow | 231 | 16 | 8 KiB |
-| Q5_K shared down | 253 | 16 | 8 KiB |
-| Q6_K M=64 | 87 | 15 | 4 KiB |
-| Q6_K M=128 | 138 | 16 | 4 KiB |
-| Q6_K M=256 | 137 | 15 | 4 KiB |
-
-The 253-VGPR shared-down Q5_K path is the largest remaining allocation. Removing paired fragment prefetch did not reduce that allocation or improve time, so a future gain must shorten decoder or swizzle live ranges rather than toggling the consumer schedule.
-
-### Ordinary Q4_K before padding
-
-Narrow Q4_K at M=32,768 reported:
-
-```text
-192 VGPRs
-128 SGPRs
-8 KiB LDS
-0 scratch
-89.4% L2 hit rate
-79.2% LDS-bank-conflict stall percentage
-about 7,413 VALU instructions per work-item
-```
-
-Attention-output Q4_K reported the same resource counts and 79.2% LDS-bank-conflict percentage. Its L2 hit rate was 85.4% with about 26,517 VALU instructions per work-item.
-
-Shared-down Q4_K also reported the same LDS conflict percentage and VALU count. Its L2 hit rate fell to 67.3%, and it has only four N workgroups per M tile.
-
-The repeated conflict value indicates a structural fragment-access pattern. Shared down additionally suffers weaker packed-weight locality and limited N-direction parallelism.
-
-### Q6_K small rows
-
-M=64 reported:
-
-```text
-88 VGPRs
-128 SGPRs
-4 KiB LDS
-0 scratch
-69.8% L2 hit rate
-85.3% LDS-bank-conflict stall percentage
-about 946,927 VALU instructions per work-item
-```
-
-M=128 reported:
-
-```text
-112 VGPRs
-128 SGPRs
-4 KiB LDS
-0 scratch
-66.6% L2 hit rate
-75.0% LDS-bank-conflict stall percentage
-about 1,979,376 VALU instructions per work-item
-```
-
-M=128 wins despite higher VGPR and VALU counts because it doubles M reuse and exactly matches 128 decoder groups to the loader.
-
-The equivalent multi-counter M=256 profile triggered a profiler-induced HSA memory fault and queue-sync timeouts. The clean benchmark completed correctly immediately beforehand, so no M=256 counters are accepted from that run.
-
-### Earlier PC-sampling evidence
-
-PC sampling of the earlier narrow Q4_K kernel showed non-issued samples dominated by:
-
-| Reason | Share |
-| --- | ---: |
-| ALU dependency | 40.3% |
-| waitcnt / memory dependency | 27.2% |
-| barrier wait | 20.2% |
-| execution-pipe arbitration | 10.7% |
-
-Earlier Q6_K M=256 sampling showed:
-
-| Reason | Share |
-| --- | ---: |
-| ALU dependency | 36.0% |
-| waitcnt / memory dependency | 23.1% |
-| barrier wait | 22.2% |
-| execution-pipe arbitration | 18.5% |
-
-Multi-value decoding removed the hottest scalar bit-extraction bottleneck. The remaining limit shifted toward barriers, LDS-to-fragment movement, and WMMA dependency chains.
-
-PC sampling heavily perturbs short kernels. Treat its percentages qualitatively and prefer controlled ablations for performance decisions.
-
-## Current bottleneck assessment
-
-### Ordinary Q3_K and Q4_K
-
-Wide query is now 1.26x BF16 after packed Q3_K extraction. Narrow Q4_K is at parity, and attention output is within measurement noise.
-
-The remaining Q3_K/Q4_K issue is no longer packed-global bandwidth alone. High L2 hit rates and the successful padding ablation show that LDS bank layout and fragment-load instruction form matter materially.
-
-### Q5_K
-
-Packing four Q5_K low/high byte pairs into one 32-bit quant word reduces repeated per-byte high-bit extraction and remains selected for narrow B4/B16. QB1 found that scalar extraction is better at only 2,048 rows, improving narrow B1 by `17.41%`; it regresses `2.34%/6.52%` at 8,192/32,768 rows. Final narrow latency is `0.208/0.778/3.019 ms`, or `0.91x/0.97x/0.99x` BF16 throughput.
-
-Shared-down Q5_K retains scalar extraction and its four-BF16 swizzle. An isolated eight-BF16 bracket did not survive the complete Qwen matrix. The remaining issue is decode issue pressure and insufficient shape-local reuse, not a resource-gate failure.
-
-### Shared down
-
-Shared-down Q4_K/Q5_K remain around 0.76-0.79x BF16.
-
-They combine:
-- only four N workgroups per M tile.
-- lower L2 hit rate.
-- structural LDS fragment cost.
-- insufficient arithmetic amortization for the added padded footprint.
-
-A shared-down-specific 4x4 per-wave geometry kept 16 accumulator tiles while doubling M reuse of decoded weights. It regressed Q4_K/Q5_K from about 5.25/5.57 ms to 7.338/7.388 ms because doubled cotangent traffic and four live A fragments outweighed reduced decode repetition.
-
-The complementary 1x16 geometry halved cotangent reloads but doubled packed decode across M blocks and lost the N=8 packed-prefetch specialization. It regressed Q4_K/Q5_K further to 9.208/7.322 ms.
-
-Increasing shared-down reduction depth from 32 to 64 measured 5.215 ms for Q4_K, below the meaningful margin over the selected K=32 result, and regressed Q5_K to 6.565 ms. Halving barrier frequency does not offset the longer decode phase and loss of the K=32 packed-prefetch specialization.
-
-A finer four-BF16-chunk XOR swizzle with four 64-bit loads per fragment regressed Q4_K to 5.486 ms. For Q5_K, the initial shared-down result was 5.353 ms, while an immediate repeat measured 5.560 versus 5.642 ms for the eight-BF16 control. Narrow Q5_K measured 3.025 versus 3.043 ms in the same comparison.
-
-The shared-down Q5_K gain is modest but repeatable. Disabling paired local-fragment prefetch measured 5.626 ms versus 5.569 ms selected and left code-object allocation unchanged at 253 VGPRs, so it was rejected.
-
-Disabling two-row packed-byte prefetch lowered allocation to 234 VGPRs but regressed latency to 6.186 ms. The selected prefetch is therefore throughput-positive despite its longer live range.
-
-The narrow four-BF16 difference is below the meaningful selection margin.
-
-Q4_K retains the 16-BF16-chunk/two-128-bit-load swizzle for shared down. Shared-down Q5_K selects the finer swizzle, while narrow Q5_K retains two 128-bit loads.
-
-Local geometry and K-depth tuning have plateaued for shared down. A larger gain likely requires decoded-weight reuse across calls or a changed representation.
-
-### Q6_K small rows
-
-M=64 was limited by its K=64 decoded-weight row stride of 128 bytes, which mapped every row start to the same bank phase. A 16-BF16-chunk XOR swizzle reduced 10.938 ms to about 5.38 ms without increasing LDS footprint and while preserving two 128-bit loads per fragment.
-
-This confirms that the earlier 85.3% conflict percentage represented a first-order bottleneck. The same swizzle is accepted for M=128 at about 9.17 ms. It regressed the original eight-N-tile M=256 geometry, but pairing it with the four-N-tile geometry improved M=256 to 12.156 ms. Packed quant extraction then reduced M=256 further to 11.758 ms.
-
-Bank distribution must be selected with workgroup count, accumulator pressure, and decode repetition rather than by K depth alone.
-
-### DeepSeek Q8_0
-
-DB3 removed the measured short-row LDS bottleneck: Q-A padding reduced bank conflict from `79.17%` to `58.33%`, derived LDS latency from about 585 to 245 cycles, and LDS-driven ALU stalls from `24.19%` to `15.26%`. Short-row ordinary throughput now reaches checkpoint-weighted BF16 parity at B1.
-
-The post-DB6 traversal correction raises long-row checkpoint-weighted packed/BF16 throughput from `0.550x/0.498x` to `0.737x/0.658x` at B4/B16. Q-B and output-B had used the old all-M ordering despite DB2's documented M1 intent. M2 raises effective occupancy from about 12% to 21-23%; L2 hit rate rises from `9.6%` to `13.8%` on Q-B and from `17.8%` to `54.5%` on output-B. The same 128x128/K32 body, instruction mechanism, and resource allocation are retained.
-
-The remaining DeepSeek limit is repeated packed-weight decode and inter-workgroup locality. Q-A, KV, shared gate/up, and shared down still use `GROUP_M=0`, so their severe B4/B16 deficits cannot yet be assigned exclusively to representation cost. DB7 proved that launch order can be first-order without changing the 192-VGPR G2 body. DB8 therefore completes the same bounded M2 comparison on those four families and Q-B B1 while preserving every selected LDS layout.
-
-Geometry, K-depth, prefetch, LDS, wider decode, and arithmetic neighborhoods remain closed. If DB8 is neutral or slower, further material gains require explicit decoded-weight lifetime across calls, a prepared representation, or a model-owned paired grad-input API; operator-internal pointer/version/stream caches remain unacceptable.
-
-## gfx1151 portability review of external kernels
-
-Status: complete. The target is the Radeon 8060S `gfx1151`: RDNA3.5, wave32, and 40 CUs. RDNA3 and RDNA4 changes are evidence only when their mechanism survives this ISA and resource model; gfx12 scheduler or cache behavior is not assumed portable.
-
-The review found one still-open repository-local mechanism and three deferred model-level mechanisms:
-
-1. **Keep DB8 unchanged.** llama.cpp PR #21344 specializes its RDNA4-derived MMQ table for gfx1151 by reducing `256` threads and an I128 tile to `128` threads and I64, while allowing dense J tiles up to 128 and keeping fragmented MoE work at J48 or less. The reported dense Q8 prefill gain comes from workload-specific reuse, while a separate attention case improves after falling from 256 to 192 VGPRs. The local body already uses four waves, K32, exact shape dispatch, and 192 VGPRs. DB2 also measured the lower-pressure G1 body at 118 VGPRs and found it slower than G2 on every production family. This supports DB8's shape-specific traversal, but does not justify reopening G1, ordinary active-wave counts, or an RDNA4 `256`-thread/eight-wave body.
-2. **Defer lossless Q8_0 preparation as the leading representation experiment.** llama.cpp PR #21527 separates each tensor's int8 payloads from its FP16 scales as `[all qs][all d]` without changing tensor capacity. Its Intel result is not a gfx1151 speed estimate, but the coalescing mechanism applies directly to the local 34-byte AoS stride. The local ISA already emits one `global_load_b128` per 16-value payload, so the new question is transaction packing across lanes and separate contiguous scale loads, not wider per-thread loads. This requires an explicit prepared-weight object and is outside DB8.
-3. **Defer paired grad-input and BF16 shadows to model integration.** ds4 prepares selected Q8 tensors during model preload, owns release at model lifetime boundaries, and uses a transposed FP16 copy for attention output-B. It also exposes an explicit two-weight projection that reuses one prequantized input. These are useful ownership and pairing examples, but the current ds4 pair computes two forward outputs rather than one summed backward dX, and its static global cache implementation is not acceptable as an operator-internal cache here.
-4. **Do not port the remaining external mechanisms into DB8.** llama.cpp PR #22051 and PR #21168 formalize vector-width-aware AMD MMA/LDS loads that the selected local Q8 ISA already emits. PR #22298 reduces Stream-K division and fixup overhead, but llama.cpp keeps non-CDNA AMD on conventional tiling and this backward has no K split or fixup. Composable Kernel PR #2663 validates separately stored or preshuffled quant scales, but its example is limited to gfx94/gfx95/gfx12 and FP8/BF8/int4 families rather than gfx1151 GGUF Q8_0 plus BF16 WMMA. hipBLASLt PR #539 remaps grouped GEMM work across XCCs; that multi-XCC mechanism does not describe gfx1151, while its generic locality lesson is already represented by DB7 and DB8 grouped-M traversal.
-
-The resulting order remains: execute DB8 exactly as bounded, then stop repository-local dense backward regardless of outcome. Any later SoA Q8_0 weight, transposed BF16 shadow, paired grad-input, or shared-scratch work must begin as an explicit model-owned API project with lifetime, invalidation, memory, cold-start, steady-state, forward/backward sharing, and autograd contracts. Those projects remain deferred.
-
-## TensileLite and hipBLASLt lessons that remain relevant
-
-TensileLite is a source of measured architectural patterns, not a direct packed-MMQ generator. Dense kernels assume typed affine operands, while MMQ reconstructs GGUF values and metadata inside the reduction loop.
-
-Runtime logging identified two selected gfx1151 BF16 families:
-
-| Reference shapes | Family | Key geometry |
-| --- | --- | --- |
-| Query, shared down, LM head | `MT96x96x32` | `MIWaveTile=3x3`, `MIWaveGroup=2x2`, two LDS buffers |
-| Narrow, attention output | `MT128x32x32` | `MIWaveTile=2x2`, `MIWaveGroup=4x1`, one LDS buffer, 8-element LDS padding |
-
-Both use:
-- four wave32 waves.
-- `DepthU=32`.
-- scheduled global and local prefetch.
-- conventional global-to-VGPR-to-LDS staging.
-- wide local reads.
-- `SourceSwap=true`.
-- no DirectToLds or DirectToVgpr.
-
-Transferred and already validated ideas:
-- four-wave workgroups.
-- multi-M and multi-N WMMA tiles per wave.
-- `K_ITERATION=32` for the accepted ordinary tile.
-- paired local-fragment prefetch.
-- one LDS buffer as the default.
-- eight-element LDS padding where measured.
-- favorable transposed output orientation.
-- fine-grained geometry-specific dispatch.
-
-Still relevant:
-- explicit two-stage packed-byte prefetch into fixed VGPR state.
-- fully vectorized local reads after padding.
-- a second LDS buffer only after the one-buffer load path is efficient.
-- low-level instruction scheduling if HIP cannot retain the desired load/wait/WMMA order.
-
-Not directly transferable:
-- DirectToLds cannot bypass GGUF reconstruction.
-- DirectToVgpr does not distribute one cooperatively decoded tile efficiently to four waves.
-- Stream-K and GlobalSplitU do not remove repeated decode.
-- gfx1151 lacks the gfx1250 WMMA arb-stall control.
-- dense solution databases cannot describe packed decode inside the reduction loop.
-
-## FeatherOps lessons that remain relevant
-
-- Use controlled decode/global/LDS/fragment-load ablations. PC samples alone have repeatedly failed to predict speed.
-- Keep producer-side cooperative GGUF decode. Consumer-side decode would repeat scale and bit extraction in every M wave.
-- Keep packed prefetch state in explicit scalar or `uint4` VGPR values.
-- Treat traversal, geometry, K depth, and decoder width as one measured configuration.
-- Use lossless int8-plus-scale representation before approximate int8 WMMA if a persistent cache becomes acceptable.
-- Verify code-object VGPR, LDS, and private-segment metadata after every layout change.
-
-## Dense backward optimization plan
-
-This plan covers the new DeepSeek dense Q8_0 cases and the remaining bounded Qwen work. It is derived from all four MMQ optimization logs and the standalone-bundle contract. It does not authorize another broad Qwen sweep or direct transfer of a grouped-only scheduler.
-
-### Evidence boundary
-
-| Source log | Evidence to carry into dense backward | Boundary that must remain closed |
-| --- | --- | --- |
-| Dense backward Qwen | Four wave32 waves, width-16 cooperative decode, exact full bodies, K32 ordinary reduction tiles, bounded packed prefetch, and body-specific LDS layouts produced the accepted kernels. | Qwen's measured swizzle, padding, extraction, and tile choices are not automatically Q8_0 choices. |
-| Dense forward | Exact DeepSeek Q8_0 N/K specialization improved the complete matrix by `21.62%`; runtime shape state and padded small-row work were real costs. | Forward J64/J128, stride-76 LDS, Q8_1 quantization, and activation reuse describe the opposite matrix orientation and do not select backward geometry. |
-| Grouped backward | DeepSeek fixed Q8_0 improved `8.09-8.75x` when narrow N16/K16 ownership became four-wave M256/N64/K32 with width-16 decode. M128 lost to M256 by about 4%. | Fixed eight-group layout, route-tail suppression, row tasks, and the exact M256 dispatch are grouped semantics. M256/N64/K32 is one bounded dense candidate, not a preset answer. |
-| Grouped forward | Compile-time exact shapes, full versus bounded bodies, affine pointer traversal, and short decode lifetimes repeatedly mattered. | Serial expert ownership, J32/J64/J80 tails, mixed routed tails, and group-major workspaces do not describe regular dense grids. |
-| Kernel bundle | Each semantic candidate needs a concrete standalone wrapper, warmed production-loader timing, normalized ISA, resource checks, and independent reproducibility. | Symbol order, raw offsets, changed instruction order, and timing movement from byte-identical artifacts are not optimization evidence. |
-
-Common negative evidence is also binding. Do not reopen global two-LDS buffering, split-K, GSU, Stream-K, persistent workgroups, speculative cross-iteration prefetch, compiler-managed local prefetch arrays, broad decoder-width sweeps, or broad swizzle sweeps without a new profile-supported mechanism. Existing dense and grouped controls found these slower, neutral, or resource-invalid.
-
-### Acceptance contract
-
-Every phase uses the following gates:
-
-1. Benchmark warmed packaged HSACOs sequentially with real nonzero tensors, three warmups, and nine repeats for complete matrices.
-2. Run physical batches 1, 4, and 16 for every ordinary family. DeepSeek LM-head coverage uses M32/M64/M128/M256/M512.
-3. Record both unweighted per-point movement and checkpoint-weighted latency using the tensor counts in `Production shapes` and `DeepSeek-V4-Flash correctness baseline`.
-4. Bracket every fresh median movement above 1% with sequential 25-repeat control/candidate/control measurements. Byte-identical controls remain required when no HIP semantic changed.
-5. Normally require at least one repeatable 2% target gain, no repeatable family regression above 1%, and a positive checkpoint-weighted result before adding dispatch.
-6. Require zero private storage, zero VGPR/SGPR spills, and no dynamic stack. Treat allocation near 256 VGPRs as a warning even if spill counts are zero.
-7. Preserve direct packed weights, BF16 cotangents/results, FP32 WMMA accumulation, static host-visible dispatch, and the generic bounds-safe fallback.
-8. Preserve exact current output when reduction order is unchanged. Otherwise rerun independent GGUF-reference error, one-hot decode, direct grad-input, autograd, and row-boundary tests.
-9. Rebuild with all cores, run bundle freshness and independent reproducibility, and rerun the complete Qwen matrix whenever a shared dense-backward body changes.
-
-The DeepSeek phase artifact prefix should be `/tmp/mmq_bwd_ds4_`. Qwen controls keep `/tmp/mmq_bwd_qwen_`. Each retained or rejected phase must add its final matrix, 25-repeat brackets, normalized ISA summary, and resource table to this document.
-
-### DB0: complete baselines and decomposition
-
-First establish a source-of-record matrix from the current 64-row by 64-column, reduction-16 Q8_0 body. The existing `/tmp/mmq_bwd_ds4_q8_correctness.json` is only a short Q-A correctness run and is not a performance baseline.
-
-Run:
+The reference is `torch.mm` with the same BF16 cotangent and the authoritative GGUF weight independently dequantized to BF16. Correctness requirements include independent GGUF references, exact one-hot row decode where applicable, direct grad-input comparison, autograd, exact-tile guards, and row-boundary coverage.
+
+Qwen ordinary workload:
+
+| Family/type | Forward weight `(N,K)` | Checkpoint tensors |
+| --- | ---: | ---: |
+| Query Q3_K / Q4_K | `(8192,2048)` | 9 / 1 |
+| Narrow Q3_K / Q4_K / Q5_K | `(512,2048)` | 9 / 70 / 21 |
+| Attention output Q4_K | `(2048,4096)` | 10 |
+| Shared down Q4_K / Q5_K | `(2048,512)` | 30 / 10 |
+| LM head Q6_K | `(248320,2048)` | 1 |
+
+DeepSeek ordinary workload:
+
+| Family | Forward weight `(N,K)` | Checkpoint tensors |
+| --- | ---: | ---: |
+| Q-A | `(1024,4096)` | 43 |
+| Q-B | `(32768,1024)` | 43 |
+| KV | `(512,4096)` | 43 |
+| Output-B | `(4096,8192)` | 43 |
+| Shared gate/up | `(2048,4096)` | 86 |
+| Shared down | `(4096,2048)` | 43 |
+| LM head | `(129280,4096)` | 1 |
+
+Dispatch may use quant type, exact matrix shape, token count, and public rows. It must not use pointer identity, tensor version, hidden stream state, or online autotuning.
+
+## Measurement and validation
+
+Measurement rules:
+
+- Run GPU benchmarks and profilers sequentially.
+- Use real nonzero tensors and warm packaged modules before timing.
+- Use three warmups and nine repeats for complete matrices.
+- Bracket any fresh median movement above 1% with sequential 25-repeat control/candidate/control runs.
+- Report per-point and checkpoint-weighted movement.
+- Inspect normalized disassembly and VGPR/SGPR/LDS/private/spill/stack metadata.
+- Require zero private storage, zero VGPR/SGPR spills, and no dynamic stack for retained production bodies.
+- Rerun the complete Qwen matrix whenever shared dense-backward source changes.
+
+Benchmark examples:
 
 ```bash
 PYTHONPATH=. python bench/benchmark_mmq_bwd.py \
-  --model ~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf \
-  --model-family deepseek --batches 1,4,16 \
-  --lm-head-chunks 32,64,128,256,512 \
-  --warmup 3 --repeats 9 \
-  --output /tmp/mmq_bwd_ds4_p0_baseline_9.json
+  --model /path/to/model.gguf --model-family qwen-or-deepseek \
+  --batches 1,4,16 --warmup 3 --repeats 9 \
+  --output /tmp/mmq_bwd_report.json
 
-PYTHONPATH=. python bench/benchmark_mmq_bwd.py \
-  --model ~/models/qwen3.6/Qwen3.6-35B-A3B-APEX-I-Mini.gguf \
-  --model-family qwen --batches 1,4,16 \
-  --lm-head-chunks 64,128,256 \
-  --warmup 3 --repeats 9 \
-  --output /tmp/mmq_bwd_qwen_pre_ds4_control_9.json
+PYTHONPATH=. python bench/benchmark_mmq_complete_loss.py \
+  --model /path/to/model.gguf --model-family deepseek \
+  --batches 1 --chunks 32,64,128,256,512 \
+  --loss-module-root /path/to/production/loss/module \
+  --warmup 3 --repeats 25 \
+  --output /tmp/mmq_bwd_complete_loss.json
 ```
 
-DB0 must report complete packed and BF16 latency, throughput ratio, allocation, and checkpoint-weighted estimates for:
+Build and validation:
 
-| DeepSeek family | `(reduction N, dX width K)` | Calls | Diagnostic role |
-| --- | ---: | ---: | --- |
-| Attention Q-A | `(1024, 4096)` | 43 | medium reduction, common K4096 body |
-| Attention Q-B | `(32768, 1024)` | 43 | long reduction and narrow dX grid |
-| Attention KV | `(512, 4096)` | 43 | shortest reduction and lowest arithmetic amortization |
-| Attention output B | `(4096, 8192)` | 43 | widest dX grid and largest ordinary weight |
-| Shared gate/up | `(2048, 4096)` | 86 | highest checkpoint count and future pair-fusion candidate |
-| Shared down | `(4096, 2048)` | 43 | intermediate width and reduction |
-| LM head | `(129280, 4096)` | 1 | long reduction with small, scheduler-owned M |
-
-Profile one representative from the short-reduction, long-reduction, widest-dX, and LM classes only after event timing is stable. Collect one counter at a time because the prior Q6_K multi-counter run faulted. Determine whether the current body is limited first by loader underfill, packed global waits, LDS fragment movement/banks, barrier exposure, WMMA dependencies, or insufficient workgroup reuse. Launcher and module-load time remain outside kernel optimization scope.
-
-DB0 result: complete.
-
-Artifacts:
-
-```text
-/tmp/mmq_bwd_ds4_p0_baseline_9.json
-/tmp/mmq_bwd_qwen_pre_ds4_control_9.json
+```bash
+python tools/build_mmq_bundle.py --force --jobs "$(nproc)"
+PYTHONPATH=. pytest -q
+ruff check .
+python -m compileall -q bench tools torch_ggml_ops tests
+python tools/build_mmq_bundle.py --check
+git diff --check
 ```
 
-The generic Q8_0 body is ownership-limited rather than resource-limited. It uses 92 VGPRs, 17 SGPRs, 2 KiB LDS, zero private storage/spills, and no dynamic stack, but sustains only about `3.35-7.29` logical TFLOP/s on ordinary cases. Every ordinary point loses to BF16:
+Final status:
 
-| Physical batch | Checkpoint-weighted packed ms | BF16 ms | Packed/BF16 throughput |
-| ---: | ---: | ---: | ---: |
-| 1 | 3,266.8 | 767.4 | `0.235x` |
-| 4 | 16,920.7 | 3,075.7 | `0.182x` |
-| 16 | 72,146.2 | 12,140.1 | `0.168x` |
+- `100 passed, 14 warnings` from the complete project suite.
+- Bundle freshness reports 179 current kernels.
+- All 83 dense-backward artifacts pass resource gates.
+- Independent ccache-bypassed reproducibility passes for all 179 artifacts.
+- The installed extension was rebuilt against the final selector.
+- Generated HSACOs remain ignored by Git and excluded from source distributions; local wheels may contain verified artifacts.
 
-Per-family packed/BF16 ratios span `0.15-0.30x`. LM-head per-call ratios are `0.55x` at M32/M64, `0.96x` at M128, `0.47x` at M256, and `0.36x` at M512. The collapse at large rows and the low-resource code object match the grouped-backward diagnosis: narrow 64x64/reduction-16 ownership repeats decode and exposes too little M/N reuse; spills, allocation, and launcher overhead are not the first explanation.
+The DeepSeek tests cover independent one-hot decode, random direct grad-input, autograd for all dense tensor families, and a 65-row launch-grid boundary. Final Qwen LM-head NRMSE remained approximately `4.9e-4` at M64, `4.7e-4` at M128, and `5.2e-4` at M256.
 
-The Qwen control preserves the established qualitative result: wide query and Q6_K beat BF16, narrow Q3_K is at or above parity, and shared-down Q4_K/Q5_K remain the material deficits. Detailed DeepSeek counter collection moves to the first competitive DB2 geometry; profiling a body that is `3-6x` behind the known tiled direction would not select a fine lowering mechanism. No DB0 candidate is retained from profile evidence.
+## Artifact index
 
-### DB1: exact Q8_0 shape and bounds specialization
-
-Follow dense forward's highest-confidence result before changing tile geometry. Add exact wrappers for the six ordinary `(N,K)` geometries and the LM-head geometry while keeping the current logical 64x64/reduction-16 tile unchanged.
-
-Specialize only state that is truly constant for the wrapper:
-
-- reduction length and dX width;
-- Q8_0 blocks per packed row and packed row bytes;
-- exact full input-column and reduction bounds;
-- full versus bounded row ownership;
-- compile-time packed-row and cotangent strides.
-
-All ordinary M values are production-full rows. LM M32 requires a bounded body if the selected row tile exceeds 32; M64 and larger exact multiples may use full bodies. Keep one generic bounded Q8_0 fallback for unsupported shapes.
-
-Compare exact candidate against generic before/after controls on the complete DeepSeek matrix. Inspect normalized ISA to verify that runtime bounds, division/remainder, and repeated address construction actually disappeared. Do not unroll the complete reduction body: dense forward showed loop control to be negligible beside a large reduction body, while grouped forward retained explicit unrolling only for a literal two-block loop.
-
-Retain exact wrappers per geometry, not globally. A shape may remain on the generic body if exact specialization does not produce a stable gain. DB1 should produce `/tmp/mmq_bwd_ds4_p1_exact_9.json` and 25-repeat brackets for every movement selected for dispatch.
-
-DB1 result: retained for all seven production geometries.
-
-Artifacts:
+### Latest acceptance
 
 ```text
-/tmp/mmq_bwd_ds4_p1_exact_9.json
-/tmp/mmq_bwd_ds4_p1_generic_before_25.json
-/tmp/mmq_bwd_ds4_p1_exact_25.json
-/tmp/mmq_bwd_ds4_p1_generic_after_25.json
-/tmp/mmq_bwd_qwen_post_ds4_p1_control_9.json
+/tmp/mmq_bwd_qwen_qb1_final_narrow_q5_25.json
+/tmp/mmq_bwd_qwen_post_db8_control_9.json
+/tmp/mmq_bwd_qwen_db6_complete_loss_control_25.json
+/tmp/mmq_bwd_ds4_db8_final_25.json
+/tmp/mmq_bwd_ds4_db6_complete_loss_b1_25.json
+/tmp/mmq_bwd_ds4_db6_complete_loss_b4_25.json
+/tmp/mmq_bwd_ds4_db6_complete_loss_b16_m512_capacity_3.json
 ```
 
-Eight wrappers cover six full ordinary geometries plus full and bounded LM-head rows. The 25-repeat generic/exact/generic bracket improved all 18 ordinary points by `11.32-246.14%`, with a `60.58%` geometric latency gain. Checkpoint-weighted ordinary latency improved by `71.16%`, `44.23%`, and `41.46%` at B1/B4/B16. LM-head gains were `2.76%`, `21.25%`, `33.59%`, `137.00%`, and `132.57%` at M32/M64/M128/M256/M512.
-
-The full wrappers use 91 VGPRs, 14 SGPRs, and 2 KiB LDS; the bounded LM wrapper uses 91 VGPRs and 18 SGPRs. All have zero private storage/spills and no dynamic stack. Production benchmark correctness remained in the established Q8_0 envelope. The generic wrapper remains selected for unsupported and non-production shapes.
-
-The complete Qwen control preserved the existing qualitative dispatch: wide query and all Q6_K chunks beat BF16, narrow Q3_K remains at or above parity, and shared-down Q4_K/Q5_K remain the only material ordinary deficits. Short-point movement is retained for final warmed 25-repeat controls rather than interpreted from the nine-repeat matrix.
-
-### DB2: bounded ordinary geometry search
-
-Run geometry work only on DB1 exact wrappers. Dense Qwen and grouped DeepSeek evidence justifies four candidates:
-
-| Candidate | Logical workgroup tile `(M rows x dX columns)` | Reduction depth | Reason |
-| --- | ---: | ---: | --- |
-| G0 control | `64x64` | 16 | current correctness baseline, 92 VGPRs and 2 KiB LDS |
-| G1 | `128x64` | 32 | doubles M reuse with moderate accumulator state |
-| G2 | `128x128` | 32 | accepted dense-Qwen ordinary ownership and greater decoded-weight reuse |
-| G3 | `256x64` | 32 | bounded transfer from fixed Q8_0; same broad accumulator count as G2 but different reuse/grid balance |
-
-Use four waves and width-16 Q8_0 decode for all four. G1/G2/G3 start with `GROUP_M=1`, matching the accepted 128-row dense traversal; G0 keeps its current grouped-M-disabled control. G3 is compiled and timed only if it stays below the resource warning boundary with zero private storage and spills. Do not add M512, N192/N256, K64, eight-wave, or GROUP_M2/4 variants in this phase.
-
-Stage the matrix to control compile and benchmark cost:
-
-1. Screen G1/G2/G3 on shared gate/up because it has 86 calls.
-2. Add Q-B and KV to expose long- and short-reduction behavior.
-3. Add output-B to expose the widest dX grid.
-4. Run every surviving candidate on all six ordinary families and all three batches.
-
-A geometry branch must use only quant type, exact `(N,K)`, and public row count. A global Q8_0 winner is not required. Legal shape-specific outcomes include one tile for K1024, one for K4096 short reductions, and another for K8192, provided checkpoint weighting justifies the extra wrappers.
-
-DB2 closes when each geometry is retained or rejected for each legal shape class and the complete chosen ordinary matrix has a sequential 25-repeat bracket against DB1. The current generic wrapper remains the correctness fallback.
-
-DB2 result: G2 retained for all six ordinary geometries; G1 and G3 rejected.
-
-Artifacts:
+### Qwen historical and QB1 controls
 
 ```text
-/tmp/mmq_bwd_ds4_p2_corrected_g1_9.json
-/tmp/mmq_bwd_ds4_p2_corrected_g3_9.json
-/tmp/mmq_bwd_ds4_p2_g0_after_25.json
-/tmp/mmq_bwd_ds4_p2_corrected_selected_25.json
-/tmp/mmq_bwd_ds4_p2_corrected_g0_after_25.json
-```
-
-The selected G2 body is `128x128/K32`, four waves, width-16 decode, exact full tiles, 192 VGPRs, 13 SGPRs, and 8 KiB LDS. It has zero private storage/spills and no dynamic stack. G1 (`128x64/K32`) uses 118 VGPRs and 4 KiB LDS; G3 (`256x64/K32`) uses 194 VGPRs and 4 KiB LDS. Both are resource-clean but lose to G2 on sustained production rows, and G3 loses on every measured shape/batch.
-
-The sequential 25-repeat G0/G2/G0 bracket improved all 18 ordinary points by `28.44-130.43%`, with a `77.49%` geometric latency gain. Checkpoint-weighted ordinary latency improved by `86.99%`, `96.51%`, and `99.95%` at B1/B4/B16. Selected G2 throughput spans approximately `5.78-20.03` logical TFLOP/s, compared with DB1's approximately `4.47-12.79` TFLOP/s.
-
-An initial screening accidentally transposed G1 and G3 ownership into closed `64x128` and `64x256` shapes. Those measurements were discarded before selection. G1/G3 were rebuilt with the documented M-row-by-dX-column axes and rerun across the complete ordinary matrix. G2 is symmetric and was unaffected. The static selector requires 128-row divisibility for G2 and retains G0 for smaller or unsupported rows.
-
-A post-DB6 source audit found a second, independent discrepancy: although the DB2 plan said G1/G2/G3 would start at `GROUP_M=1`, all exact Q8_0 geometry wrappers were generated with `GROUP_M=0`. All DB2 candidates shared that ordering, so the geometry comparison remains valid, but DB2 did not compare grouped traversal. The later M2 phase records and corrects that omission.
-
-### DB3: Q8_0 load, decode, and LDS lowering
-
-Apply this phase only to DB2 winners and only in the order below. Change one semantic mechanism at a time.
-
-1. **Affine reduction traversal.** Carry packed-row and cotangent pointers between reduction chunks where exact shapes make the increment constant. Grouped forward retained this lowering for long exact loops.
-2. **Decode-phase packed loads.** Compare scalar Q8_0 loads with an unaligned-safe fixed vector load for the 16 q values owned by each width-16 decoder group. Keep the scale and packed state in named scalar/vector registers. Do not use compiler-managed arrays or implicitly widen ownership to 32 values.
-3. **Paired LDS-fragment prefetch.** Test the already-successful dense-Qwen consumer schedule only after the Q8 loader is resource-clean. Do not keep the next reduction iteration's packed fragments live across WMMA.
-4. **LDS layout.** Start unswizzled because grouped fixed Q8_0 rejected swizzle4 and width32. Test padding or one XOR granularity only if the selected dense body reports material bank or fragment-load stalls. Forward stride-76/77 results are evidence that lower conflict counters can still mean worse latency, so event timing decides.
-5. **Width32 decode.** Reopen only if profiling shows repeated Q8_0 scale/block loads dominate and the explicit 32-value packed loader cannot address them. Grouped fixed Q8_0 already lost `2.4-4.3%` with width32, so width16 remains the default.
-
-Reject any candidate that introduces private arrays, spills, dynamic stack, or a longer live range near the 256-VGPR boundary. Two-buffer LDS, complete decoded-weight LDS caches, cross-iteration packed prefetch, custom barriers, and address-only broad swizzle sweeps stay closed.
-
-DB3 acceptance requires the complete ordinary DeepSeek matrix and a Qwen control. A shared helper change must also show unchanged Qwen normalized ISA or pass the complete Qwen performance matrix.
-
-DB3 result: row-dependent padding retained; other local lowering controls rejected or already emitted by the compiler.
-
-Artifacts:
-
-```text
-/tmp/rocprof-mmq-bwd-db2-qa
-/tmp/rocprof-mmq-bwd-db2-qb
-/tmp/rocprof-mmq-bwd-db2-output
-/tmp/rocprof-mmq-bwd-db3-qa-padding8
-/tmp/mmq_bwd_ds4_p3_qa_prefetch_control_before_25.json
-/tmp/mmq_bwd_ds4_p3_qa_prefetch_candidate_25.json
-/tmp/mmq_bwd_ds4_p3_qa_prefetch_control_after_25.json
-/tmp/mmq_bwd_ds4_p3_padding_selected_control_before_25.json
-/tmp/mmq_bwd_ds4_p3_padding_selected_candidate_25.json
-/tmp/mmq_bwd_ds4_p3_padding_selected_control_after_25.json
-/tmp/mmq_bwd_ds4_p3_final_9.json
-/tmp/mmq_bwd_qwen_post_ds4_p3_control_9.json
-```
-
-The unpadded G2 profile reported `79.17%` LDS bank conflict on Q-A, Q-B, and output-B. Q-A's short B1 body also reported about `585` cycles derived LDS latency and `24.19%` ALU stall from LDS, while the longer Q-B/output-B bodies reported only `0.73%/0.20%` LDS-driven ALU stall and low `11-18%` L2 hit rates. Normalized inspection found that the exact body already carries affine reduction state and emits one `global_load_b128` for each width-16 Q8 payload, so source-level address carries and an explicit fixed vector loader would not add a new lowering mechanism.
-
-Paired LDS-fragment prefetch retained the same 192 VGPRs and 8 KiB LDS but changed Q-A by approximately `-1.26%`, `-0.74%`, and `+0.11%` at B1/B4/B16 in its 25-repeat bracket. It is rejected.
-
-Eight-BF16 row padding changes the K32 LDS stride from 64 to 80 bytes. It retains 192 VGPRs, raises LDS from 8 to 10 KiB, and keeps zero private storage/spills and no dynamic stack. On Q-A B1 it reduced bank conflict from `79.17%` to `58.33%`, derived LDS latency from about `585` to `245` cycles, and LDS-driven ALU stall from `24.19%` to `15.26%`, while occupancy remained approximately `43%`.
-
-The complete 25-repeat bracket retains padding for Q-A and shared gate/up through 8,192 rows, Q-B/output-B/shared-down at 2,048 rows, and KV at all three production row counts. Retained gains are `6.17-31.69%`; KV B16 is the smallest at `2.20%`. Padding is neutral at other points except shared-down B4, where it regresses `2.63%` and remains unpadded. Checkpoint-weighted ordinary latency improves `20.78%` at B1 and `1.02%` at B4, with B16 effectively unchanged.
-
-The final DeepSeek matrix preserves the established Q8_0 correctness envelope. The complete Qwen control preserves its accepted wide-query, narrow-Q3_K, attention-output, and Q6_K behavior; shared-down Q4_K/Q5_K remain the only material deficits. No shared Qwen kernel semantics changed. Width32 remains closed because generated ISA already vector-loads the 16-byte payload and profiling did not identify repeated scale loads as the selected bottleneck.
-
-### DB4: DeepSeek LM-head row geometry
-
-Tune LM head separately from ordinary M because its public row count is a loss-scheduler chunk. Keep the DB1 exact `(N,K)=(129280,4096)` body and compare row ownership at:
-
-| Chunk M | Required coverage |
-| ---: | --- |
-| 32 | bounded M32 body; never compute a hidden padded 64-row result as production work |
-| 64 | exact M64 body |
-| 128 | exact M128 body |
-| 256 | exact M256 body or two exact M128 workgroups |
-| 512 | exact M256 workgroups unless a resource-clean M512 body has a new reuse argument |
-
-Start from the surviving G0/G1/G2/G3 mechanisms rather than opening a new tile family. The grouped fixed Q8_0 M256 result makes M256 worth testing, but its eight-group layout does not justify M256 by itself. M512 remains closed unless event timing shows repeated decode is dominant and a compiled body stays comfortably below the VGPR warning boundary.
-
-Measure per-call latency, calls per complete token set, output allocation, and serial scheduler estimates for physical batches 1, 4, and 16. Do not select the production chunk in DB4. Forward-only logs already show every chunk winning in isolation; final selection belongs to DB6's complete forward/cross-entropy/backward loop.
-
-DB4 result: active-two-wave M32, G0 M64, G1 M128, and G3 M256/M512 retained.
-
-Artifacts:
-
-```text
-/tmp/mmq_bwd_ds4_p4_lm_g1_9.json
-/tmp/mmq_bwd_ds4_p4_lm_g2_9.json
-/tmp/mmq_bwd_ds4_p4_lm_g3_9.json
-/tmp/mmq_bwd_ds4_p4_control_before_25.json
-/tmp/mmq_bwd_ds4_p4_selected_25.json
-/tmp/mmq_bwd_ds4_p4_control_after_25.json
-```
-
-The M32 body keeps all four waves available for cooperative decode and barriers but limits cotangent loads, WMMA, and output stores to two active waves. It therefore covers exactly 32 rows without computing hidden padded output rows. Relative to the bounded four-wave control it improves `1.45%` in the 25-repeat bracket. M64 remains on exact G0 and is unchanged. The active-wave predicate is compile-time true for ordinary four-wave wrappers; this preserves their pre-DB4 normalized ISA while retaining the runtime two-wave guard only for M32.
-
-M128 selects G1 (`128x64/K32`) for a `19.48%` kernel gain. M256 and M512 select G3 (`256x64/K32`) for `51.85%` and `60.64%`; M512 uses two exact M256 workgroups. G2 is rejected for all LM chunks. The selected variants use 91-194 VGPRs, 2-4 KiB LDS, zero private storage/spills, and no dynamic stack.
-
-Selected per-call latency at M32/M64/M128/M256/M512 is `8.297/7.459/7.569/10.386/23.206 ms`. The corresponding B1 serial backward estimates for complete 2,048-token coverage are `531.0/238.7/121.1/83.1/92.8 ms`; incremental output allocation is 256 KiB/512 KiB/1 MiB/2 MiB/4 MiB. M256 is the isolated backward minimum, but no production chunk is selected in DB4.
-
-### QB0: refresh the Qwen packaged baseline
-
-Before any Qwen retune, rerun the complete current packaged matrix. The old bundle controls showed byte-identical kernels moving by more than 1%, and the current bundle now includes DeepSeek Q8_0 backward. Use warmed standalone artifacts and save a new source-of-record baseline.
-
-Keep the accepted Qwen geometry and all closed neighborhoods unchanged. Ordinary Qwen's 128x128/K32/GROUP_M1 body, Q6 row geometries, and current dispatch remain controls, not candidates.
-
-QB0 result: refreshed packaged baseline complete.
-
-Artifact:
-
-```text
+/tmp/mmq_bwd_baseline_primary_sequential.json
+/tmp/mmq_bwd_final_full_v3.json
 /tmp/mmq_bwd_qwen_qb0_folded_25.json
-```
-
-An initial QB0 run retained a runtime `wave < ACTIVE_WAVES` predicate in every four-wave specialization and changed normalized Qwen ISA. Its timing is discarded. Folding the condition to unconditional execution when `ACTIVE_WAVES == 4` restores normalized-ISA identity for wide Q3_K, shared-down Q4_K/Q5_K, and Q6_K M256 relative to the pre-DB4 bundle.
-
-The corrected 25-repeat baseline measures wide Q3_K at `3.437/12.724/50.120 ms`, narrow Q5_K at `0.240/0.776/3.008 ms`, shared-down Q5_K at `0.237/1.469/5.592 ms`, and Q6_K M256 at `12.522 ms`. Wide query, narrow Q3_K, attention output, and all Q6 chunks preserve their accepted behavior. Shared-down Q4_K/Q5_K remain the material ordinary deficits.
-
-### QB1: bounded Qwen HSACO retuning
-
-Only the following four local experiments remain authorized:
-
-| Priority | Case | Reason | Single bounded experiment |
-| --- | --- | --- | --- |
-| High | `DenseBwdQ3KFullWide` query Q3_K | Repeatable bundle regressions of about `7.0%`, `4.0%`, and `2.9%`; ten checkpoint tensors and a roughly 47 ms B16 body | At most three isolated controls covering packed quant extraction, two-row packed-byte prefetch, and the selected eight-BF16 XOR layout. Keep geometry, K32, and reduction order fixed. |
-| Medium | Narrow Q5_K full body | B1 regressed about `5.7%`; packed extraction historically gained a similar amount | Packed versus scalar Q5 extraction with identical prefetch and LDS layout. |
-| Medium | Q6_K M256 | Repeatable approximately `2.33%` movement on the production loss-chunk kernel | Packed versus scalar Q6 extraction only. Keep N4/K32, two M workgroups, and the eight-BF16 swizzle. |
-| High local control, then representation | Shared-down Q5_K | Q5_K has a repeatable approximately `4.1%` B4 bundle regression and an earlier modest swizzle margin | One four- versus eight-BF16 swizzle bracket with identical scalar extraction and prefetch. |
-
-Q4_K shared down remains a performance control because the bundle improved it by about `4.8%`; do not reopen its geometry, K depth, padding, or swizzle. Narrow and attention-output Q4_K remain controls unless the refreshed checkpoint-weighted matrix identifies a consistent family deficit rather than isolated `2-3%` movement.
-
-Retain each QB1 result independently. A Q3_K win does not authorize a shared template change for Q4_K/Q5_K, and a Q5_K extraction result does not authorize changing shared-down Q5_K. Run the complete Qwen matrix after every retained wrapper or dispatch change and preserve DeepSeek byte/ISA controls.
-
-QB1 result: one row-specific Q5_K extraction control retained; Q3_K, Q6_K, and shared-down swizzle controls rejected.
-
-Artifacts:
-
-```text
 /tmp/mmq_bwd_qwen_qb1_q3_selected_before_25.json
 /tmp/mmq_bwd_qwen_qb1_q3_scalar_25.json
 /tmp/mmq_bwd_qwen_qb1_q3_no_prefetch_25.json
@@ -1100,119 +599,46 @@ Artifacts:
 /tmp/mmq_bwd_qwen_qb1_q5_shared_swizzle8_25.json
 /tmp/mmq_bwd_qwen_qb1_q5_shared_swizzle4_after_25.json
 /tmp/mmq_bwd_qwen_qb1_final_25.json
-/tmp/mmq_bwd_qwen_qb1_final_narrow_q5_25.json
 /tmp/mmq_bwd_ds4_qb1_control_9.json
 ```
 
-Wide Q3_K keeps its packed quant extraction, two-row packed prefetch, and eight-BF16 XOR layout. Scalar extraction regresses `1.06-3.97%`; removing packed prefetch regresses `10.57-11.78%`; removing the swizzle regresses `4.15-10.01%`. All three candidates are removed.
+### DeepSeek DB0-DB4 controls
 
-Narrow Q5_K selects scalar extraction only at 2,048 rows, where it improves `17.41%`. It regresses `2.34%/6.52%` at 8,192/32,768 rows, which retain packed extraction. The retained scalar wrapper uses 247 VGPRs, 17 SGPRs, 8 KiB LDS, zero private storage/spills, and no dynamic stack.
+```text
+/tmp/mmq_bwd_ds4_q8_correctness.json
+/tmp/mmq_bwd_ds4_p0_baseline_9.json
+/tmp/mmq_bwd_qwen_pre_ds4_control_9.json
+/tmp/mmq_bwd_ds4_p1_exact_9.json
+/tmp/mmq_bwd_ds4_p1_generic_before_25.json
+/tmp/mmq_bwd_ds4_p1_exact_25.json
+/tmp/mmq_bwd_ds4_p1_generic_after_25.json
+/tmp/mmq_bwd_qwen_post_ds4_p1_control_9.json
+/tmp/mmq_bwd_ds4_p2_corrected_g1_9.json
+/tmp/mmq_bwd_ds4_p2_corrected_g3_9.json
+/tmp/mmq_bwd_ds4_p2_g0_after_25.json
+/tmp/mmq_bwd_ds4_p2_corrected_selected_25.json
+/tmp/mmq_bwd_ds4_p2_corrected_g0_after_25.json
+/tmp/mmq_bwd_ds4_p3_qa_prefetch_control_before_25.json
+/tmp/mmq_bwd_ds4_p3_qa_prefetch_candidate_25.json
+/tmp/mmq_bwd_ds4_p3_qa_prefetch_control_after_25.json
+/tmp/mmq_bwd_ds4_p3_padding_selected_control_before_25.json
+/tmp/mmq_bwd_ds4_p3_padding_selected_candidate_25.json
+/tmp/mmq_bwd_ds4_p3_padding_selected_control_after_25.json
+/tmp/mmq_bwd_ds4_p3_final_9.json
+/tmp/mmq_bwd_qwen_post_ds4_p3_control_9.json
+/tmp/mmq_bwd_ds4_p4_lm_g1_9.json
+/tmp/mmq_bwd_ds4_p4_lm_g2_9.json
+/tmp/mmq_bwd_ds4_p4_lm_g3_9.json
+/tmp/mmq_bwd_ds4_p4_control_before_25.json
+/tmp/mmq_bwd_ds4_p4_selected_25.json
+/tmp/mmq_bwd_ds4_p4_control_after_25.json
+```
 
-The isolated shared-down Q5_K bracket initially measured swizzle8 at `-0.36%/+2.51%/+0.80%` for B1/B4/B16. The complete Qwen matrix at `/tmp/mmq_bwd_qwen_qb1_final_25.json` then measured B4 at `1.570 ms`, worse than the QB0 `1.469 ms`. The gain was not stable in the complete matrix, so shared-down keeps swizzle4 and the candidate wrapper is removed.
-
-Q6_K M256 keeps packed extraction. The scalar candidate regresses `2.14%` and is removed.
-
-The final 170-kernel matrix measures narrow Q5_K at `0.208/0.778/3.019 ms`. Relative to QB0, checkpoint-weighted ordinary Qwen latency improves `0.94%/0.16%/0.63%` at B1/B4/B16. Q6_K M256 remains neutral at `12.520 ms`, and the complete DeepSeek control preserves Q8_0 dispatch and correctness. The full suite passes `100` tests with 14 existing warnings, and freshness plus independent reproducibility checks pass.
-
-This closes QB1 and the authorized local Qwen backward search. Further shared-down work remains deferred to QB2's model-owned representation project.
-
-### QB2: deferred Qwen shared-down representation project
-
-Status: deferred because this pass is limited to optimizations implemented inside this repository. No prepared-weight ownership, lifetime, invalidation, or model-load policy will be added in the current work.
-
-After the one legal Q5_K swizzle control, local shared-down geometry is closed. Q4_K/Q5_K remain approximately `0.78x/0.74x` BF16 across 40 ordinary tensors. The same decode ceiling appears in grouped Q4_K/IQ2_S down, while grouped task setup, spills, broad LDS caching, and local scheduling have already been ruled out.
-
-Before implementing a new representation, add an explicit benchmark-only dense shared-down floor:
-
-- allocate/copy an already decoded BF16 weight and run BF16 GEMM, deliberately excluding real decode compute;
-- report the floor separately from persistent BF16 GEMM;
-- include allocation and copy in the floor;
-- close transient BF16 immediately if this optimistic path cannot beat packed by a useful margin.
-
-A production representation must be an explicit model-owned prepared weight, never an operator-internal pointer cache or hidden BF16 shadow. The preferred direction is a lossless tile-major integer-plus-scale layout that shortens decode and swizzle live ranges. It must define preparation, lifetime, invalidation, memory, cold-call and steady-state cost, and forward/backward sharing. Approximate total storage for the 160 ordinary weights is about 475 MiB in a compact integer-plus-scale form versus about 760 MiB BF16.
-
-Acceptance requires improvement in dense Q4_K and Q5_K shared-down controls and no regression in the already-fast packed forward path. If a common representation is proposed for grouped work, it must also preserve inactive-expert sparsity and pass all four grouped route distributions. Existing grouped evidence rejects unconditional transient BF16 and persistent BF16 expansion.
-
-### DB5: deferred model-owned paired grad-input integration
-
-Status: deferred because it changes model-level API and autograd integration outside the current repository-local kernel pass.
-
-This is not a local kernel prerequisite and must not delay DB1-DB4. It is a separate model-integration opportunity derived from grouped backward's successful fused-pair design.
-
-DeepSeek has two same-input families whose backward contributions are summed:
-
-- shared gate and up, both `(N,K)=(2048,4096)` Q8_0;
-- attention Q-A `(1024,4096)` and KV `(512,4096)` Q8_0.
-
-An explicit paired grad-input API could decode two packed weights, accumulate both contributions in FP32, write one BF16 dX, and avoid one output allocation/store. Shared gate/up is the first candidate because shapes match and it represents 43 pairs. Q-A/KV requires different reduction lengths and is lower priority.
-
-The API must be model-owned and explicit. It must preserve autograd ownership, current-stream behavior, memory accounting, and a defined one-rounding reference. Do not implement a hidden pointer/version cache or infer pairing from tensor identity. Retain only on complete model-level backward timing; two isolated kernels plus `torch.add` remain the correctness/control path.
-
-ds4 provides supporting integration evidence through an explicit Q8_0 pair entry point that consumes one prequantized input and two packed weights. It does not implement the required backward sum, preserve this repository's BF16 one-rounding reference, or provide a training timing estimate. It therefore strengthens the API rationale without changing DB5's deferred status or authorizing a local fused kernel.
-
-### DB6: complete loss-loop selection and release acceptance
-
-After DB4 selects the best kernel per LM chunk, run the complete DeepSeek packed-loss loop for M32/M64/M128/M256/M512. Each phase must include:
-
-- dense packed forward;
-- in-place cross-entropy or the production loss implementation;
-- dense Q8_0 grad-input;
-- complete token coverage for physical batches 1, 4, and 16;
-- incremental peak allocation;
-- exact loss and packed hidden-gradient comparison across chunk schedules.
-
-Use a symmetric or interleaved phase order and 25 repeats, following the accepted Qwen `64/128/256/256/128/64` bracket. Select the production chunk by complete-loop latency and memory, not isolated forward, backward, or serial-call estimates.
-
-Any retained Q6_K M256 QB1 change must rerun the existing complete Qwen loss bracket. M256 remains selected unless complete loss regresses or its accepted 253.57 MiB peak budget changes. M128 remains the first lower-memory Qwen fallback.
-
-Release acceptance requires:
-
-- final complete DeepSeek and Qwen backward matrices;
-- checkpoint-weighted summaries;
-- DeepSeek complete-loss chunk selection and Qwen complete-loss regression control;
-- all independent correctness and autograd tests;
-- all production resource gates;
-- forced all-core bundle build, freshness, and independent reproducibility;
-- in-place extension build, Ruff, compileall, full tests, and `git diff --check`;
-- updated retained/rejected logs and artifact index in this document.
-
-DB6 result: select DeepSeek M512 and retain Qwen M256.
-
-Artifacts:
+### DeepSeek DB6-DB8 controls
 
 ```text
 /tmp/mmq_bwd_ds4_db6_complete_loss_b1_screen_9.json
-/tmp/mmq_bwd_ds4_db6_complete_loss_b1_25.json
-/tmp/mmq_bwd_ds4_db6_complete_loss_b4_25.json
-/tmp/mmq_bwd_ds4_db6_complete_loss_b16_m512_capacity_3.json
-/tmp/mmq_bwd_qwen_db6_complete_loss_control_25.json
 /tmp/mmq_bwd_ds4_db6_final_25.json
-/tmp/mmq_bwd_qwen_qb1_final_narrow_q5_25.json
-```
-
-The reusable harness is `bench/benchmark_mmq_complete_loss.py`. It uses the shared dense model inventory and loading helpers, then calls the production packed Liger loss implementation so every timing includes MMQ forward, in-place cross-entropy, and packed grad-input.
-
-| DeepSeek chunk | B1 complete ms | B1 peak MiB | B4 complete ms | B4 peak MiB |
-| ---: | ---: | ---: | ---: | ---: |
-| 32 | 721.928 | 32.32 | 2929.059 | 80.35 |
-| 64 | 332.749 | 48.79 | 1350.252 | 96.82 |
-| 128 | 219.147 | 81.57 | 895.870 | 129.60 |
-| 256 | 175.808 | 147.45 | 719.764 | 195.48 |
-| 512 | 173.583 | 274.76 | 705.975 | 322.79 |
-
-M512 improves over M256 by `1.28%` at B1 and `1.95%` at B4. Loss and BF16 hidden gradients are bit-exact across all five chunk schedules at both batches. At the user's direction, the full five-chunk B16 sweep was stopped after it proved too expensive. The selected M512 complete loop was measured separately at `2775.945 ms`, with 514.91 MiB incremental peak allocation and 532 MiB incremental peak reservation. That capacity is accepted, so DeepSeek production integration should use M512.
-
-The Qwen control remains selected at M256: M64/M128/M256 measure `337.030/301.309/251.852 ms`. Their peak allocations remain exactly 69.03/130.04/253.57 MiB and all schedules produce bit-exact loss and hidden gradients. All three unchanged schedules moved `2.2-2.6%` slower than the historical run, consistent with common environmental drift rather than a dispatch regression.
-
-The DB6 DeepSeek ordinary matrix had checkpoint-weighted packed/BF16 throughput of `0.998x/0.550x/0.498x` at B1/B4/B16. The later traversal phase supersedes its ordinary matrix without changing the selected LM chunk. The final Qwen ordinary matrix remains `1.120x/1.057x/1.057x`.
-
-### DB7: DeepSeek long-row grouped-M traversal
-
-A cross-log review reopened only workgroup launch traversal. The audit found that exact Q8_0 G2 wrappers used `GROUP_M=0`, which launches all M blocks for one dX-column block, while DB2 had documented an intended `GROUP_M=1` starting point. The experiment kept `128x128/K32`, width-16 decode, reduction order, LDS layout, and arithmetic unchanged.
-
-Artifacts:
-
-```text
 /tmp/mmq_bwd_ds4_group_m_qb_m2_screen_9.json
 /tmp/mmq_bwd_ds4_group_m_qb_m4_screen_9.json
 /tmp/mmq_bwd_ds4_group_m_output_m2_screen_9.json
@@ -1226,212 +652,52 @@ Artifacts:
 /tmp/mmq_bwd_ds4_group_m_m2_before_25.json
 /tmp/mmq_bwd_ds4_group_m_m1_candidate_25.json
 /tmp/mmq_bwd_ds4_group_m_m2_after_25.json
+/tmp/mmq_bwd_ds4_group_m_final_25.json
+/tmp/mmq_bwd_qwen_post_group_m_control_9.json
+/tmp/mmq_bwd_ds4_db8_group_m_control_screen_9.json
+/tmp/mmq_bwd_ds4_db8_group_m_candidate_screen_9.json
+/tmp/mmq_bwd_ds4_db8_group_m_control_before_25.json
+/tmp/mmq_bwd_ds4_db8_group_m_m2_candidate_25.json
+/tmp/mmq_bwd_ds4_db8_group_m_control_after_25.json
+/tmp/mmq_bwd_ds4_db8_group_m_m1_screen_9.json
+/tmp/mmq_bwd_ds4_db8_qb_m2_control_before_25.json
+/tmp/mmq_bwd_ds4_db8_qb_m1_candidate_25.json
+/tmp/mmq_bwd_ds4_db8_qb_m2_control_after_25.json
+```
+
+### Profiler and packaging evidence
+
+```text
+/tmp/rocprof-mmq-bwd-db2-qa
+/tmp/rocprof-mmq-bwd-db2-qb
+/tmp/rocprof-mmq-bwd-db2-output
+/tmp/rocprof-mmq-bwd-db3-qa-padding8
 /tmp/rocprof-mmq-bwd-group-m-qb-control
 /tmp/rocprof-mmq-bwd-group-m-qb-m2
 /tmp/rocprof-mmq-bwd-group-m-output-control
 /tmp/rocprof-mmq-bwd-group-m-output-m2
-/tmp/mmq_bwd_ds4_group_m_final_25.json
-/tmp/mmq_bwd_qwen_post_group_m_control_9.json
+/tmp/rocprof-mmq-bwd-db8-qa-control
+/tmp/rocprof-mmq-bwd-db8-qa-m2
+/tmp/rocprof-mmq-bwd-db8-qb-control
+/tmp/rocprof-mmq-bwd-db8-qb-m1
+/tmp/rocprof-mmq-bwd-db8-kv-control
+/tmp/rocprof-mmq-bwd-db8-kv-m2
+/tmp/rocprof-mmq-bwd-db8-shared-gate-control
+/tmp/rocprof-mmq-bwd-db8-shared-gate-m2
+/tmp/rocprof-mmq-bwd-db8-shared-down-control
+/tmp/rocprof-mmq-bwd-db8-shared-down-m2
+/tmp/mmq_bwd_pre_bundle.json
+/tmp/mmq_bwd_post_bundle.json
+/tmp/mmq_bwd_embedded_pre_control_25.json
+/tmp/mmq_bwd_bundle_control_25.json
+/tmp/mmq_bwd_embedded_post_control_25.json
 ```
 
-M2 is retained for Q-B and output-B only when rows exceed 2,048. Against all-M control midpoints, Q-B improves from `51.419/194.356 ms` to `31.482/116.296 ms` at B4/B16, latency reductions of `38.77%/40.16%`. Output-B improves from `45.779/187.065 ms` to `26.537/108.106 ms`, reductions of `42.03%/42.21%`. M4 is slower than M2 in the screens. M1 and M2 are tied within `0.75%` in the 25-repeat M2/M1/M2 bracket; M2 is retained from its stronger B4 screens and direct all-M brackets.
+## Tool notes
 
-The retained wrappers use 192 VGPRs, 14 SGPRs, 8 KiB LDS, zero private storage/spills, and no dynamic stack. Fresh B16 profiles show Q-B L2 hit rate at `9.6%` all-M versus `13.8%` M2 and occupancy at `12.0%` versus `21.1%`. Output-B changes from `17.8%` to `54.5%` L2 and `12.5%` to `23.2%` occupancy. `MemUnitBusy` is unavailable under rocprofv3 dispatch-windowed collection on gfx1151.
-
-The complete final matrix measures Q-B at `32.490/116.923 ms` and output-B at `27.674/109.909 ms` for B4/B16. Checkpoint-weighted ordinary latency falls `27.16%/25.84%` relative to DB6, and packed/BF16 throughput becomes `0.972x/0.737x/0.658x` at B1/B4/B16. The Qwen regression matrix preserves its existing static dispatch and correctness.
-
-DB7 closes Q-B/output-B B4/B16 traversal, but it also invalidates the broader claim that launch order was exhausted. Four ordinary families still use the audited all-M ordering, and Q-B B1 remains below BF16 without the M2 branch. DB8 is required before remaining deficits can be classified as representation-only.
-
-### DB8: complete DeepSeek grouped-M traversal
-
-Status: planned and bounded. This is the only remaining repository-local DeepSeek dense-backward experiment.
-
-The completed gfx1151 portability review found no additional repository-local mechanism that should be combined with this phase. In particular, do not add RDNA4 thread/tile settings, ordinary G1 or active-wave retests, Stream-K, XCC remapping, a changed quant representation, a BF16 shadow, or paired output ownership. Model-level representation and pairing work remains deferred.
-
-The current all-M launch keeps one packed-weight tile hot while traversing every M block for one dX-column block. M2 instead traverses all dX-column blocks for two adjacent M blocks before advancing in M. This shortens the cotangent reuse window and can improve effective occupancy, but it may reread more packed weights. The four untested weights are only about 2.1-8.5 MiB, so they present a different cache tradeoff from the approximately 34 MiB Q-B/output-B weights tested in DB7.
-
-Test exactly these points:
-
-| Family `(N,K)` | Current ratio | Current LDS layout | Primary candidate |
-| --- | --- | --- | --- |
-| Q-A `(1024,4096)` B4/B16 | `0.688x/0.377x` | padding8/unpadded | M2 with the matching layout at each row count |
-| KV `(512,4096)` B4/B16 | `0.449x/0.254x` | padding8/padding8 | M2 padding8 |
-| Shared gate/up `(2048,4096)` B4/B16 | `0.629x/0.446x` | padding8/unpadded | M2 with the matching layout at each row count |
-| Shared down `(4096,2048)` B4/B16 | `0.629x/0.637x` | unpadded/unpadded | M2 unpadded |
-| Q-B `(32768,1024)` B1 | `0.825x` | padding8 | M2 padding8 |
-
-This requires at most seven temporary concrete wrappers: padded and unpadded Q-A, padded KV, padded and unpadded shared gate/up, unpadded shared down, and padded Q-B. Reuse a wrapper if exact shape, layout, and template arguments already make that legal; do not weaken exact-shape dispatch to reduce wrapper count.
-
-Execution:
-
-1. Preserve `128x128/K32`, width-16 decode, active waves, reduction order, output ownership, and the DB3 row-dependent padding policy. Change only `GROUP_M` and grid traversal.
-2. Build with resource checks and inspect normalized ISA. Each candidate must retain zero private storage, spills, and dynamic stack; LDS and VGPR allocation must match its all-M layout control.
-3. Run sequential nine-repeat all-M/M2 screens for the table above. Warm packaged modules before timing and keep Q-B/output-B B4/B16 on their retained M2 dispatch.
-4. For every movement above 1%, run a 25-repeat all-M/M2/all-M bracket. Retain only a stable shape-and-row rule with at least one 2% gain and no regression above 1% in the same family.
-5. For an M2 timing winner, run M1 only as a nine-repeat tie-breaker, followed by M2/M1/M2 at 25 repeats if movement exceeds 1%. DB7 found M1 and M2 tied within `0.75%`; M1 is not an independent broad sweep.
-6. Profile B16 control and winner for L2 hit rate, effective occupancy, memory-dependency stalls, LDS stalls, and accepted cache counters. Do not require `MemUnitBusy`, which is unavailable with dispatch-windowed rocprofv3 counters on gfx1151.
-7. Run the complete DeepSeek ordinary matrix with 25 repeats and compute checkpoint-weighted B1/B4/B16 latency. Run the complete Qwen matrix as a regression control because the device body is shared. DB6 complete-loss chunk selection does not need retiming unless LM dispatch or shared source semantics change.
-8. Rebuild the complete bundle with all CPU cores, verify resource gates, freshness, and independent reproducibility, then run the full test suite.
-
-Planned artifacts:
-
-```text
-/tmp/mmq_bwd_ds4_db8_group_m_screen_9.json
-/tmp/mmq_bwd_ds4_db8_<family>_control_before_25.json
-/tmp/mmq_bwd_ds4_db8_<family>_m2_candidate_25.json
-/tmp/mmq_bwd_ds4_db8_<family>_control_after_25.json
-/tmp/rocprof-mmq-bwd-db8-<family>-control
-/tmp/rocprof-mmq-bwd-db8-<family>-m2
-/tmp/mmq_bwd_ds4_db8_final_25.json
-/tmp/mmq_bwd_qwen_post_db8_control_9.json
-```
-
-Bounds and exclusions:
-
-- Do not retest M4. It was slower than M2 on both DB7 families and no new profile mechanism supports a larger group.
-- Do not combine traversal with padding, swizzle, geometry, K-depth, decoder-width, prefetch, buffering, or arithmetic changes.
-- Do not reopen Q-B/output-B B4/B16 except as unchanged complete-matrix controls.
-- Do not tune output-B B1, which is already `1.098x` BF16, or Q-A/shared B1 points that are within 10% of BF16.
-- Do not tune LM M32/M64 in isolation. The complete packed-loss loop selects M512, whose backward kernel is `1.573x` BF16.
-
-If all DB8 candidates are neutral or slower, dense MMQ backward is exhausted under authoritative packed weights, BF16 cotangents/results, FP32 WMMA accumulation, independent calls, and no shared scratch. If any candidate wins, retain only its static shape/row/layout branch, establish a new source-of-record matrix, and apply the same exhaustion conclusion after validation. Future work then moves to DB5, QB2, prepared weights, or explicit shared scratch owned by a model-level API.
-
-### Execution order and stop conditions
-
-Execute in this order:
-
-1. DB0 baseline and decomposition.
-2. DB1 exact Q8_0 shapes.
-3. DB2 ordinary geometry.
-4. DB3 profile-supported Q8_0 lowering.
-5. DB4 LM row geometry.
-6. QB0/QB1 bounded Qwen retunes.
-7. DB6 complete-loss selection and release acceptance.
-8. DB7 Q-B/output-B long-row traversal correction.
-9. DB8 remaining grouped-M traversal completion.
-10. Leave QB2 representation and DB5 pair integration deferred as separate model-level projects.
-
-Stop local DeepSeek work after DB8 regardless of outcome, provided retained bodies remain resource-clean and the complete matrices pass. Do not continue merely because BF16 remains faster at an isolated point; DB8 is justified by DB7's measured traversal mechanism, not by the deficit alone. Qwen local work remains stopped after QB1. Further Qwen shared-down gains require QB2's explicit representation contract.
-
-## Ideas investigated and retained as deferred options
-
-### Lossless prepared Q8_0 layout
-
-The highest-priority future DeepSeek representation experiment is a size-neutral Q8_0 payload/scale separation. For each tensor, store all 32-byte signed-int payloads contiguously and all corresponding FP16 scales contiguously, or use an equivalent tile-major layout selected for both forward and backward. This preserves the exact 34 bytes per 32 values and avoids the approximately `1.88x` capacity expansion of a BF16 shadow.
-
-This must be a model-owned prepared weight created at load or conversion time. Its contract must record source quant type, exact shape, device, preparation completion, lifetime, and invalidation. The original GGUF tensor remains the independent correctness source. No operator may discover or retain the prepared tensor through pointer identity, tensor version, or stream-local state.
-
-If model integration authorizes it, first benchmark one Q-A and one shared gate/up tensor with the selected G2 layout and DB8 traversal unchanged. Compare AoS and prepared layouts for event time, global-load transactions, cache hit rate, effective occupancy, resources, cold preparation cost, and amortized complete-backward time. Require exact one-hot decode equivalence and no regression in packed forward before expanding coverage.
-
-### Decode once per ordinary call
-
-The fused kernel decodes the same packed weight tile once per M workgroup. At M=32,768, this can repeat decode hundreds of times.
-
-A two-stage path can materialize the ordinary weight once into temporary BF16 and use a tuned dense GEMM. Approximate temporary sizes are:
-
-| Shape | BF16 workspace |
-| --- | ---: |
-| Query | 32 MiB |
-| Narrow | 2 MiB |
-| Attention output | 16 MiB |
-| Shared down | 2 MiB |
-
-This has a high ceiling but is no longer an all-in-one packed kernel. It remains deferred under the current no-direct-hipBLASLt-linkage preference.
-
-### Further LDS swizzles
-
-XOR swizzles are already selected for Q3_K query, Q4_K query/narrow/shared-down, both Q5_K shapes, and all production Q6_K shapes.
-
-Four-, eight-, and 16-BF16 granularities have been compared on the important layouts. Another swizzle is justified only together with a changed fragment representation or decoder mapping, not as another address-only sweep.
-
-### Wider LDS stores
-
-The current scalar stores are a transpose from decoder-friendly registers into WMMA-friendly LDS.
-
-Possible approaches include:
-- cross-lane register transpose.
-- decoder remapping to fixed input columns across multiple K values.
-- a second LDS transpose stage.
-
-These options may lose metadata sharing or add shuffle/barrier overhead. They are lower priority than repeated fragment-load optimization.
-
-## Rejected experiments
-
-The following were measured and reverted or superseded.
-
-Geometry and traversal:
-- larger backward wave counts.
-- oversized N tiles that reduced workgroup count too far.
-- 2x2, 3x6, 4x4, and 1x16 ordinary geometries.
-- broad Qwen/global `GROUP_M=2` or `GROUP_M=4` rules on the final 128-row geometry; DB7's exact DeepSeek M2 branches supersede that broad rejection only for measured shapes.
-- shared-down 4x4 and 1x16 geometries.
-
-Decode and scheduling:
-- shuffle-based replacement of LDS sharing.
-- eight-value ordinary decoders.
-- ordinary `K_ITERATION=64` after the sixteen-value decoder.
-- vector loading the complete Q4_K metadata header.
-- cross-iteration Q3_K packed-fragment prefetch.
-- shared-down K=64.
-- disabling shared-down Q5_K local or packed-byte prefetch.
-
-LDS and configuration:
-- custom LDS-only inline-assembly barriers.
-- environment-driven production configuration.
-- Q5_K eight-BF16 LDS row padding.
-- Q4_K padding on small shared-down input width.
-
-Q6_K neighborhoods:
-- M=256 N=5 and the invalid N=7 full-tile dispatch.
-- M=256 K=16 and K=64.
-- M=128 N=3 at K=32 and K=64.
-- M=64 N=3/N=4 at K=64 and N=4/K=32.
-- four- and 16-BF16 swizzles on the selected 128x64 geometry.
-
-The dispatch is a measured shape heuristic, not an autotuning system.
-
-## Correctness and compatibility
-
-The current complete project suite passes on the exact-tile guards, valid M=256 N=4 geometry, selected LDS layouts, packed extraction source, and all DeepSeek dense Q8_0 paths:
-
-```text
-PYTHONPATH=. pytest -q
-100 passed, 14 warnings
-```
-
-The DeepSeek module contributes independent one-hot row-decode, random direct grad-input, and autograd checks for all eight dense tensor families, plus a 65-row launch-grid boundary check. The one-hot checks require exact equality with `transformers` GGUF dequantization.
-
-The historical downstream integration suite passed 9 tests with the Qwen production M256 packed-loss schedule. Current project validation is self-contained, and DB6 reruns that production loss path directly through the generic complete-loss harness.
-
-Focused Q6_K and padding experiments preserved the benchmark correctness envelope. Final LM-head NRMSE was approximately:
-
-| M | NRMSE |
-| ---: | ---: |
-| 64 | `4.919e-04` |
-| 128 | `4.741e-04` |
-| 256 | `5.158e-04` |
-
-Backward uses the authoritative packed payload and does not quantize cotangents.
-
-The extension was rebuilt for `/tmp/mmq_bwd_final_autonomous.json`. `python -m compileall -q bench` and `git diff --check` also pass.
-
-One validation run had a single grouped-pair element exceed its absolute tolerance by one BF16 step. The targeted test and an immediate complete rerun passed without source changes, so it was treated as reduction-order test variance rather than a dense MMQ failure.
-
-## Architecture-specific bundle conversion
-
-All 76 retained dense-backward specializations now compile as independent gfx1151 HSACOs through `tools/build_mmq_bundle.py`. `csrc/ck/mmq_backward.cuh` owns one reusable device body, while `csrc/mmq_bundle.cpp` preserves the established full/bounded, row-range, N-tile, K-iteration, grouped-M, decoder, prefetch, LDS-layout, and packed-byte dispatch. The old in-header launcher and all embedded backward entry points were removed.
-
-Every dense-backward artifact is resource-gated and has zero private bytes, zero VGPR/SGPR spills, and no dynamic stack.
-
-The initial nine-repeat before/after comparison measured `+0.56%` geometric latency. Sequential embedded/bundle/embedded 25-repeat controls place the package at `+1.12%` geometrically, `+0.69%` by median point, and `+0.93%` by estimated model latency against the bracket midpoint; the embedded controls drifted by `+1.04%`.
-
-The largest repeatable regressions are the `Q3_K` attention-query points at about `+2.9-7.0%`, including batch 1 at `3.199/3.448/3.248 ms` for embedded pre, bundle, and embedded post. Shared-down `Q4_K` batch 4 improves about `4.8%`, while shared-down `Q5_K` batch 4 regresses about `4.1%`. These are accepted code-object layout changes; no dispatch threshold or device-body algorithm changed. Artifacts are `/tmp/mmq_bwd_pre_bundle.json`, `/tmp/mmq_bwd_post_bundle.json`, and the three `/tmp/mmq_bwd_*_control_25.json` files. The complete design and package contract is in `docs/kernel_bundle.md`.
-
-## Profiler and tool issues
-
-- Never run two GPU benchmarks or profilers in parallel.
-- PC sampling perturbs short kernels heavily and should be interpreted qualitatively.
-- One multi-counter M=256 Q6_K run caused an HSA memory fault and queue-sync timeouts. Use one counter at a time for that specialization.
-- One earlier post-profiler process encountered a transient `hipErrorLaunchFailure`. A fresh focused test and full rerun succeeded without source changes.
-- `roc-obj-ls` fails because of a `rocm_sdk_core._cli` import error.
+- PC sampling heavily perturbs short kernels; use it qualitatively.
+- One multi-counter Q6_K M256 run caused an HSA memory fault and queue-sync timeouts. Collect one counter at a time for that body.
+- One post-profiler process reported a transient `hipErrorLaunchFailure`; focused and complete reruns passed without source changes.
+- `roc-obj-ls` is broken in the active environment because of a `rocm_sdk_core._cli` import error.
 - Inspect code objects through `.hip_fatbin`, `clang-offload-bundler`, `llvm-readobj`, `llvm-nm`, and `llvm-objdump`.
+- The complete bundle and packaging contract is documented in `docs/kernel_bundle.md`.

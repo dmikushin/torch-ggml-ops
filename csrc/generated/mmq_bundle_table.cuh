@@ -180,7 +180,14 @@ enum class MMQKernelId : std::uint16_t {
     GroupedBwdRowTaskQ4KN2048K512M128N128 = 169,
     GroupedBwdRowTaskQ5KN2048K512M128N128 = 170,
     GroupedBwdRowTaskIQ2SN2048K512M128N128 = 171,
-    Count = 172,
+    DenseBwdQ80ExactN1024K4096G2GroupM2 = 172,
+    DenseBwdQ80ExactN1024K4096G2GroupM2Padding8 = 173,
+    DenseBwdQ80ExactN32768K1024G2GroupM1Padding8 = 174,
+    DenseBwdQ80ExactN512K4096G2GroupM2Padding8 = 175,
+    DenseBwdQ80ExactN2048K4096G2GroupM2 = 176,
+    DenseBwdQ80ExactN2048K4096G2GroupM2Padding8 = 177,
+    DenseBwdQ80ExactN4096K2048G2GroupM2 = 178,
+    Count = 179,
 };
 
 struct MMQKernelSpec {
@@ -188,7 +195,7 @@ struct MMQKernelSpec {
     const char * filename;
 };
 
-inline constexpr std::array<MMQKernelSpec, 172> kMMQKernelSpecs{{
+inline constexpr std::array<MMQKernelSpec, 179> kMMQKernelSpecs{{
     MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_quantize_bf16_q8_1_d4", "torch_ggml_ops_mmq_gfx1151_v1_quantize_bf16_q8_1_d4.hsaco"},
     MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_quantize_bf16_q8_1_ds4", "torch_ggml_ops_mmq_gfx1151_v1_quantize_bf16_q8_1_ds4.hsaco"},
     MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_quantize_bf16_q8_1_d2s6", "torch_ggml_ops_mmq_gfx1151_v1_quantize_bf16_q8_1_d2s6.hsaco"},
@@ -361,6 +368,13 @@ inline constexpr std::array<MMQKernelSpec, 172> kMMQKernelSpecs{{
     MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_grouped_bwd_row_task_q4_k_n2048_k512_mt128_nt128", "torch_ggml_ops_mmq_gfx1151_v1_grouped_bwd_row_task_q4_k_n2048_k512_mt128_nt128.hsaco"},
     MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_grouped_bwd_row_task_q5_k_n2048_k512_mt128_nt128", "torch_ggml_ops_mmq_gfx1151_v1_grouped_bwd_row_task_q5_k_n2048_k512_mt128_nt128.hsaco"},
     MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_grouped_bwd_row_task_iq2_s_n2048_k512_mt128_nt128", "torch_ggml_ops_mmq_gfx1151_v1_grouped_bwd_row_task_iq2_s_n2048_k512_mt128_nt128.hsaco"},
+    MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n1024k4096_g2_group_m2", "torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n1024k4096_g2_group_m2.hsaco"},
+    MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n1024k4096_g2_group_m2_padding8", "torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n1024k4096_g2_group_m2_padding8.hsaco"},
+    MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n32768k1024_g2_group_m1_padding8", "torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n32768k1024_g2_group_m1_padding8.hsaco"},
+    MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n512k4096_g2_group_m2_padding8", "torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n512k4096_g2_group_m2_padding8.hsaco"},
+    MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n2048k4096_g2_group_m2", "torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n2048k4096_g2_group_m2.hsaco"},
+    MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n2048k4096_g2_group_m2_padding8", "torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n2048k4096_g2_group_m2_padding8.hsaco"},
+    MMQKernelSpec{"torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n4096k2048_g2_group_m2", "torch_ggml_ops_mmq_gfx1151_v1_dense_bwd_q8_0_exact_n4096k2048_g2_group_m2.hsaco"},
 }};
 
 inline constexpr const MMQKernelSpec & mmq_kernel_spec(MMQKernelId id) {
