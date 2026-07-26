@@ -15,6 +15,7 @@ from pathlib import Path
 import gguf
 import torch
 from aiter.ops.triton.gmm import gmm
+from aiter_gmm_heuristics import gmm_config as aiter_gmm_config
 from grouped_mmq_benchmark_common import (
     GroupedMMQCase as GroupedForwardCase,
 )
@@ -43,7 +44,6 @@ from mmq_benchmark_common import (
 from transformers.integrations.gguf_dequant import dequantize_gguf_tensor
 
 import torch_ggml_ops
-from torch_ggml_ops.aiter_gmm_heuristics import gmm_config as aiter_gmm_config
 
 DEFAULT_OUTPUT = Path("/tmp/torch_ggml_ops_grouped_mmq_fwd_benchmark.json")
 
@@ -494,13 +494,13 @@ def main() -> None:
             "warmup": args.warmup,
             "repeats": args.repeats,
             "correctness_rows": args.correctness_rows,
-            "aiter_heuristic": "torch_ggml_ops.aiter_gmm_heuristics.gmm_config",
+            "aiter_heuristic": "bench/aiter_gmm_heuristics.py:gmm_config",
             "reference": (
-                "BF16 AITER gmm with project-owned gmm_config"
+                "BF16 AITER gmm with benchmark-owned gmm_config"
                 if all(case.routed for case in cases)
                 else "case-specific BF16 reference; see routed_reference and fixed_reference"
             ),
-            "routed_reference": "BF16 AITER gmm with project-owned gmm_config",
+            "routed_reference": "BF16 AITER gmm with benchmark-owned gmm_config",
             "fixed_reference": "BF16 torch.bmm including public-layout conversion",
             "aiter_work_stealing": False,
         },

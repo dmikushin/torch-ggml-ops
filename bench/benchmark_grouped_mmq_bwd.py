@@ -6,7 +6,7 @@ For each routed expert group, a forward projection is
 ``dX[M,K] = dY[M,N] @ W[N,K]``. The packed path times the public grouped
 input-gradient operators on real GGUF expert weights. Paired gate/up backward
 uses one fused kernel that accumulates both logical Jacobians into one FP32
-accumulator. Routed BF16 references use AITER GMM with the project-owned
+accumulator. Routed BF16 references use AITER GMM with the benchmark-owned
 production gfx1151 heuristic. Fixed DeepSeek output-A uses the dedicated
 eight-group operator and a BF16 strided-batched GEMM reference with the public
 layout conversion included.
@@ -20,6 +20,7 @@ from pathlib import Path
 import gguf
 import torch
 from aiter.ops.triton.gmm import gmm
+from aiter_gmm_heuristics import gmm_config as aiter_gmm_config
 from grouped_mmq_benchmark_common import (
     MODEL_FAMILY_CHOICES,
     GroupedMMQCase,
@@ -46,7 +47,6 @@ from mmq_benchmark_common import (
 from transformers.integrations.gguf_dequant import dequantize_gguf_tensor
 
 import torch_ggml_ops  # noqa: F401 Register native operators before torch.ops use.
-from torch_ggml_ops.aiter_gmm_heuristics import gmm_config as aiter_gmm_config
 
 DEFAULT_OUTPUT = Path("/tmp/torch_ggml_ops_grouped_mmq_bwd_benchmark.json")
 
@@ -633,14 +633,14 @@ def main() -> None:
             "warmup": args.warmup,
             "repeats": args.repeats,
             "correctness_rows": args.correctness_rows,
-            "aiter_heuristic": "torch_ggml_ops.aiter_gmm_heuristics.gmm_config",
+            "aiter_heuristic": "bench/aiter_gmm_heuristics.py:gmm_config",
             "reference": (
-                "BF16 AITER gmm input gradient with project-owned gmm_config"
+                "BF16 AITER gmm input gradient with benchmark-owned gmm_config"
                 if all(case.routed for case in cases)
                 else "case-specific BF16 reference; see routed_reference and fixed_reference"
             ),
             "routed_reference": (
-                "BF16 AITER gmm input gradient with project-owned gmm_config"
+                "BF16 AITER gmm input gradient with benchmark-owned gmm_config"
             ),
             "fixed_reference": (
                 "BF16 torch.bmm input gradient including public-layout conversion"

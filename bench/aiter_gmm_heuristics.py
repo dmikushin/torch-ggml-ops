@@ -1,4 +1,4 @@
-"""Project-owned gfx1151 launch heuristics for AITER grouped GEMM."""
+"""Benchmark-owned gfx1151 launch heuristics for AITER grouped GEMM."""
 
 __all__ = ["gmm_config", "ptgmm_config"]
 

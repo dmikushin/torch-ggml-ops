@@ -192,7 +192,7 @@ For Qwen 128-row tasks, expert-local task counts grow from 192-257 at B1 to 512-
 
 ### BF16 references
 
-Routed performance uses AITER Triton `gmm` configured by `torch_ggml_ops.aiter_gmm_heuristics.gmm_config`. Fixed Q8_0 uses BF16 BMM in the public fixed-group layout.
+Routed performance uses AITER Triton `gmm` configured by the benchmark-owned `bench/aiter_gmm_heuristics.py` `gmm_config`. Fixed Q8_0 uses BF16 BMM in the public fixed-group layout.
 
 The timed references start with independently dequantized BF16 weights. Dequantization and active-expert selection are setup costs and are not included. This makes AITER an ideal predecoded arithmetic reference, not a complete packed-weight alternative.
 

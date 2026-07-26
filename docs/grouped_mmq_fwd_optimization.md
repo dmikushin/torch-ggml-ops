@@ -104,7 +104,7 @@ Output A consumes logical input `[..., 8, 4096]` and preserves eight independent
 
 `bench/benchmark_grouped_mmq_fwd.py` records complete packed latency, logical throughput, incremental allocation, packed shapes, quant type, route statistics, reference latency, dense-MMQ exactness, independent-reference error, and checkpoint-weighted estimates.
 
-Routed references are BF16 AITER Triton GMM with the project-owned `torch_ggml_ops.aiter_gmm_heuristics.gmm_config`; active weights are independently dequantized during setup, not in the timed reference. The fixed output-A reference is BF16 `torch.bmm` over eight groups and includes public-layout conversion. AITER and BMM are references, not a claim about the maximum possible packed throughput.
+Routed references are BF16 AITER Triton GMM with the benchmark-owned `bench/aiter_gmm_heuristics.py` `gmm_config`; active weights are independently dequantized during setup, not in the timed reference. The fixed output-A reference is BF16 `torch.bmm` over eight groups and includes public-layout conversion. AITER and BMM are references, not a claim about the maximum possible packed throughput.
 
 The four deterministic routing distributions are:
 
