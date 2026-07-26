@@ -23,17 +23,18 @@ Excluded:
 
 ## Current status
 
-Dense backward optimization is complete for the current Qwen fused packed representation. The final source-of-record benchmark is `/tmp/mmq_bwd_final_autonomous.json`. DeepSeek-V4-Flash dense Q8_0 input gradients are implemented and correctness-tested through one conservative bounds-safe kernel; production geometry tuning has not started.
+Repository-local dense backward optimization is complete for the current Qwen and DeepSeek packed representations. Final source-of-record matrices are `/tmp/mmq_bwd_qwen_qb1_final_narrow_q5_25.json` and `/tmp/mmq_bwd_ds4_db6_final_25.json`.
 
 Done:
-- all seven DeepSeek dense Q8_0 geometries, covering eight checkpoint tensor families, dispatch through the source-built bundle and autograd.
-- ordinary batch-16 Qwen packed backward is 1.193 seconds versus 1.267 seconds for the BF16 reference, approximately 5.8% faster overall.
-- Q6_K LM-head backward measures 5.357 ms at M=64, 9.084 ms at M=128, and 11.726 ms at M=256, all faster than BF16.
-- the production packed loss now uses 256-row chunks and is 26.5% faster than the former 64-row complete-loss schedule.
-- every retained production specialization has zero private segment and zero VGPR or SGPR spills.
-- exact full-tile guards and bounds-safe fallbacks pass the current correctness suite.
+- all seven DeepSeek dense Q8_0 geometries, covering eight checkpoint tensor families, use exact production-shape dispatch with bounds-safe fallbacks and independent correctness coverage.
+- checkpoint-weighted ordinary DeepSeek packed/BF16 throughput is `0.998x/0.550x/0.498x` at B1/B4/B16 after DB1-DB4 tuning.
+- checkpoint-weighted ordinary Qwen packed/BF16 throughput is `1.120x/1.057x/1.057x` at B1/B4/B16 after the bounded QB1 retune.
+- complete DeepSeek packed loss selects M512: `173.583/705.975 ms` at B1/B4 and a B16 capacity timing of `2775.945 ms`.
+- complete Qwen packed loss keeps M256 at `251.852 ms` and the established 253.57 MiB peak allocation.
+- all 170 bundle kernels pass build-time resource gates; retained production kernels have zero private storage, spills, and dynamic stack.
+- exact full-tile guards, bounds-safe fallbacks, independent references, autograd, bundle freshness, and reproducibility pass current validation.
 
-The broad local Qwen pass is complete. DeepSeek Q8_0 geometry work follows the phased plan under `Dense backward optimization plan`. Qwen shared-down Q4_K/Q5_K still require higher-level representation or cross-call reuse, while standalone-bundle evidence reopens only the bounded Qwen controls in that plan. Closed neighborhoods must not be restarted as broad sweeps.
+The authorized local Qwen and DeepSeek kernel neighborhoods are closed. Qwen shared-down Q4_K/Q5_K needs an explicit model-owned prepared representation. Long-row DeepSeek Q8_0 needs cross-workgroup decoded-weight reuse or a paired/model-owned API; neither can be implemented as a hidden operator cache. DB5 and QB2 remain deferred integration projects.
 
 ## Hardware and measurement rules
 
@@ -71,6 +72,16 @@ Focused LM-head example:
 PYTHONPATH=. python bench/benchmark_mmq_bwd.py \
   --cases lm_head_q6_k --lm-head-chunks 64,128,256 \
   --warmup 3 --repeats 9
+```
+
+Complete packed-loss example:
+
+```bash
+PYTHONPATH=. python bench/benchmark_mmq_complete_loss.py \
+  --model ~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf \
+  --model-family deepseek --batches 1 --chunks 32,64,128,256,512 \
+  --loss-module-root /path/to/production/loss/module \
+  --warmup 3 --repeats 25 --output /tmp/mmq_complete_loss.json
 ```
 
 Focused DeepSeek correctness baseline:
@@ -678,11 +689,9 @@ The remaining Q3_K/Q4_K issue is no longer packed-global bandwidth alone. High L
 
 ### Q5_K
 
-Packing four Q5_K low/high byte pairs into one 32-bit quant word reduced repeated per-byte high-bit extraction. Narrow Q5_K improved from about 3.04 to 2.845-2.868 ms and now reaches 1.03-1.05x BF16 throughput.
+Packing four Q5_K low/high byte pairs into one 32-bit quant word reduces repeated per-byte high-bit extraction and remains selected for narrow B4/B16. QB1 found that scalar extraction is better at only 2,048 rows, improving narrow B1 by `17.41%`; it regresses `2.34%/6.52%` at 8,192/32,768 rows. Final narrow latency is `0.208/0.778/3.019 ms`, or `0.91x/0.97x/0.99x` BF16 throughput.
 
-The same extraction schedule regressed shared down to 5.759 ms with its four-BF16 swizzle. Pairing packed extraction with the eight-BF16 swizzle still measured 5.695 ms, above the selected scalar-extraction path.
-
-Packed extraction is therefore selected only for the narrow shape. Shared-down Q5_K still needs lower decode issue pressure or cross-call representation reuse.
+Shared-down Q5_K retains scalar extraction and its four-BF16 swizzle. An isolated eight-BF16 bracket did not survive the complete Qwen matrix. The remaining issue is decode issue pressure and insufficient shape-local reuse, not a resource-gate failure.
 
 ### Shared down
 
@@ -719,6 +728,14 @@ M=64 was limited by its K=64 decoded-weight row stride of 128 bytes, which mappe
 This confirms that the earlier 85.3% conflict percentage represented a first-order bottleneck. The same swizzle is accepted for M=128 at about 9.17 ms. It regressed the original eight-N-tile M=256 geometry, but pairing it with the four-N-tile geometry improved M=256 to 12.156 ms. Packed quant extraction then reduced M=256 further to 11.758 ms.
 
 Bank distribution must be selected with workgroup count, accumulator pressure, and decode repetition rather than by K depth alone.
+
+### DeepSeek Q8_0
+
+DB3 removed the measured short-row LDS bottleneck: Q-A padding reduced bank conflict from `79.17%` to `58.33%`, derived LDS latency from about 585 to 245 cycles, and LDS-driven ALU stalls from `24.19%` to `15.26%`. Short-row ordinary throughput now reaches checkpoint-weighted BF16 parity at B1.
+
+Long rows remain at `0.550x/0.498x` checkpoint-weighted BF16 throughput at B4/B16. Q-B and output-B profiling showed only `0.73%/0.20%` LDS-driven ALU stalls, `11-18%` L2 hit rate, and about 12% occupancy. G2 already uses affine carries, `global_load_b128` Q8 payload loads, and resource-clean 128x128/K32 ownership. Prefetch, broad geometry, K-depth, swizzle, persistent-workgroup, split-K, and double-buffer neighborhoods are closed by measured regressions or missing profile support.
+
+The remaining DeepSeek limit is repeated packed-weight decode across independent M workgroups, coupled with low cache reuse on wide outputs and a 192-VGPR body. Fixing it requires explicit decoded-weight lifetime across calls/workgroups, a prepared representation, or a model-owned paired grad-input API. Operator-internal pointer/version/stream caches are not acceptable, and local launcher or loader changes do not address the measured kernel time.
 
 ## TensileLite and hipBLASLt lessons that remain relevant
 
@@ -1144,6 +1161,36 @@ Release acceptance requires:
 - in-place extension build, Ruff, compileall, full tests, and `git diff --check`;
 - updated retained/rejected logs and artifact index in this document.
 
+DB6 result: select DeepSeek M512 and retain Qwen M256.
+
+Artifacts:
+
+```text
+/tmp/mmq_bwd_ds4_db6_complete_loss_b1_screen_9.json
+/tmp/mmq_bwd_ds4_db6_complete_loss_b1_25.json
+/tmp/mmq_bwd_ds4_db6_complete_loss_b4_25.json
+/tmp/mmq_bwd_ds4_db6_complete_loss_b16_m512_capacity_3.json
+/tmp/mmq_bwd_qwen_db6_complete_loss_control_25.json
+/tmp/mmq_bwd_ds4_db6_final_25.json
+/tmp/mmq_bwd_qwen_qb1_final_narrow_q5_25.json
+```
+
+The reusable harness is `bench/benchmark_mmq_complete_loss.py`. It uses the shared dense model inventory and loading helpers, then calls the production packed Liger loss implementation so every timing includes MMQ forward, in-place cross-entropy, and packed grad-input.
+
+| DeepSeek chunk | B1 complete ms | B1 peak MiB | B4 complete ms | B4 peak MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 721.928 | 32.32 | 2929.059 | 80.35 |
+| 64 | 332.749 | 48.79 | 1350.252 | 96.82 |
+| 128 | 219.147 | 81.57 | 895.870 | 129.60 |
+| 256 | 175.808 | 147.45 | 719.764 | 195.48 |
+| 512 | 173.583 | 274.76 | 705.975 | 322.79 |
+
+M512 improves over M256 by `1.28%` at B1 and `1.95%` at B4. Loss and BF16 hidden gradients are bit-exact across all five chunk schedules at both batches. At the user's direction, the full five-chunk B16 sweep was stopped after it proved too expensive. The selected M512 complete loop was measured separately at `2775.945 ms`, with 514.91 MiB incremental peak allocation and 532 MiB incremental peak reservation. That capacity is accepted, so DeepSeek production integration should use M512.
+
+The Qwen control remains selected at M256: M64/M128/M256 measure `337.030/301.309/251.852 ms`. Their peak allocations remain exactly 69.03/130.04/253.57 MiB and all schedules produce bit-exact loss and hidden gradients. All three unchanged schedules moved `2.2-2.6%` slower than the historical run, consistent with common environmental drift rather than a dispatch regression.
+
+The final DeepSeek ordinary matrix has checkpoint-weighted packed/BF16 throughput of `0.998x/0.550x/0.498x` at B1/B4/B16. The final Qwen ordinary matrix remains `1.120x/1.057x/1.057x`. This is the repository-local stopping point: short-row Q8_0 reaches parity, while long-row decode reuse requires DB5 or another explicit model-owned representation/API.
+
 ### Execution order and stop conditions
 
 Execute in this order:
@@ -1239,7 +1286,7 @@ PYTHONPATH=. pytest -q
 
 The DeepSeek module contributes independent one-hot row-decode, random direct grad-input, and autograd checks for all eight dense tensor families, plus a 65-row launch-grid boundary check. The one-hot checks require exact equality with `transformers` GGUF dequantization.
 
-The historical downstream integration suite passed 9 tests with the production M=256 packed-loss schedule. Current project validation is self-contained.
+The historical downstream integration suite passed 9 tests with the Qwen production M256 packed-loss schedule. Current project validation is self-contained, and DB6 reruns that production loss path directly through the generic complete-loss harness.
 
 Focused Q6_K and padding experiments preserved the benchmark correctness envelope. Final LM-head NRMSE was approximately:
 
@@ -1257,7 +1304,7 @@ One validation run had a single grouped-pair element exceed its absolute toleran
 
 ## Architecture-specific bundle conversion
 
-All 37 retained dense-backward specializations now compile as independent gfx1151 HSACOs through `tools/build_mmq_bundle.py`. `csrc/ck/mmq_backward.cuh` owns one reusable device body, while `csrc/mmq_bundle.cpp` preserves the established full/bounded, row-range, N-tile, K-iteration, grouped-M, decoder, prefetch, LDS-layout, and packed-byte dispatch. The old in-header launcher and all embedded backward entry points were removed.
+All 74 retained dense-backward specializations now compile as independent gfx1151 HSACOs through `tools/build_mmq_bundle.py`. `csrc/ck/mmq_backward.cuh` owns one reusable device body, while `csrc/mmq_bundle.cpp` preserves the established full/bounded, row-range, N-tile, K-iteration, grouped-M, decoder, prefetch, LDS-layout, and packed-byte dispatch. The old in-header launcher and all embedded backward entry points were removed.
 
 Every dense-backward artifact is resource-gated and has zero private bytes, zero VGPR/SGPR spills, and no dynamic stack.
 
