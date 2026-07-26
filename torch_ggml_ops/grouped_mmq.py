@@ -14,7 +14,9 @@ def _fixed_grouped_mmq_grad_input_fake(
     grad_output: torch.Tensor,
     packed_weight: torch.Tensor,
 ) -> torch.Tensor:
-    return grad_output.new_empty((*grad_output.shape[:-1], packed_weight.shape[-1] // 34 * 32))
+    return grad_output.new_empty(
+        (*grad_output.shape[:-1], packed_weight.shape[-1] // 34 * 32)
+    )
 
 
 @torch.library.register_fake("torch_ggml_ops::grouped_mmq")

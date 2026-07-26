@@ -32,7 +32,8 @@ ABI_PREFIX = "torch_ggml_ops_mmq_gfx1151_v1_"
 
 QUANT_TYPES = tuple((quant_type.name, quant_type) for quant_type in QuantType)
 BACKWARD_QUANT_TYPES = tuple(
-    item for item in QUANT_TYPES
+    item
+    for item in QUANT_TYPES
     if item[0] in {"Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ2_S"}
 )
 ROW_TASK_TYPES = tuple(
@@ -438,8 +439,7 @@ def _dense_backward_specs() -> list[KernelSpec]:
         specs.append(
             _dense_backward_spec(
                 f"DenseBwdQ80ExactLMHead{'Full' if full else 'Bounded'}",
-                "dense_bwd_q8_0_exact_lm_head_"
-                f"{'full' if full else 'bounded'}",
+                f"dense_bwd_q8_0_exact_lm_head_{'full' if full else 'bounded'}",
                 QuantType.Q8_0,
                 4,
                 16,
@@ -1201,8 +1201,7 @@ def _install_bundle(
     (staging / BUILD_INPUT_STAMP).write_text(build_input + "\n")
     generated_text = _header_text(specs)
     generated_changed = (
-        not GENERATED_HEADER.is_file()
-        or GENERATED_HEADER.read_text() != generated_text
+        not GENERATED_HEADER.is_file() or GENERATED_HEADER.read_text() != generated_text
     )
     generated_staging = GENERATED_HEADER.with_suffix(".cuh.tmp")
     if generated_changed:

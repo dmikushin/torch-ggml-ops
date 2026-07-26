@@ -1,16 +1,21 @@
-"""Shared production cases, routing distributions, and timing helpers for grouped MMQ benchmarks."""
-
 import argparse
 import statistics
-from collections.abc import Container
 from dataclasses import dataclass
-from typing import Callable
+from pathlib import Path
 
+import gguf
 import numpy as np
 import torch
-from mmq_benchmark_common import cuda_event_times_ms, incremental_peak_bytes
+from mmq_benchmark_common import (
+    make_benchmark_parser,
+    select_family_cases,
+    validate_benchmark_args,
+)
+from transformers.integrations.gguf_dequant import dequantize_gguf_tensor
 
-MODEL_FAMILY_CHOICES = ("auto", "qwen", "deepseek")
+from tests.mmq_test_support import load_packed_tensor
+
+DISTRIBUTION_NAMES = ("uniform", "skewed", "sparse", "boundary")
 
 QUANT_BLOCK_GEOMETRY = {
     "Q8_0": (32, 34),
@@ -28,13 +33,12 @@ class GroupedMMQCase:
     name: str
     kind: str
     tensor_names: tuple[str, ...]
-    expected_out_features: int
-    expected_in_features: int
-    model_layer_count: int
-    priority: str
+    out_features: int
+    in_features: int
+    model_calls: int
     description: str
-    expected_quant_type: str
-    model_family: str = "qwen"
+    quant_type: str
+    priority: str = "primary"
     top_k: int = 8
     fixed_groups: int = 0
 
@@ -48,112 +52,285 @@ class GroupedMMQCase:
 
     @property
     def packed_row_bytes(self) -> int:
-        block_values, block_bytes = QUANT_BLOCK_GEOMETRY[self.expected_quant_type]
-        if self.expected_in_features % block_values != 0:
+        block_values, block_bytes = QUANT_BLOCK_GEOMETRY[self.quant_type]
+        if self.in_features % block_values != 0:
             raise ValueError(
-                f"{self.name} K={self.expected_in_features} is not divisible by "
-                f"the {self.expected_quant_type} block size {block_values}"
+                f"{self.name} K={self.in_features} is not divisible by "
+                f"the {self.quant_type} block size {block_values}"
             )
-        return self.expected_in_features // block_values * block_bytes
+        return self.in_features // block_values * block_bytes
 
 
-CASES = (
-    GroupedMMQCase(
-        "gate_up_q3_k",
-        "pair",
-        ("blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight"),
-        512,
-        2048,
-        20,
-        "primary",
-        "paired routed gate/up for layers 0-9 and 30-39",
-        "Q3_K",
+GROUPED_CASES_BY_MODEL_FAMILY = {
+    "qwen": (
+        GroupedMMQCase(
+            "gate_up_q3_k",
+            "pair",
+            ("blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight"),
+            512,
+            2048,
+            20,
+            "paired routed gate/up for layers 0-9 and 30-39",
+            "Q3_K",
+        ),
+        GroupedMMQCase(
+            "gate_up_iq2_s",
+            "pair",
+            ("blk.10.ffn_gate_exps.weight", "blk.10.ffn_up_exps.weight"),
+            512,
+            2048,
+            20,
+            "paired routed gate/up for layers 10-29",
+            "IQ2_S",
+        ),
+        GroupedMMQCase(
+            "down_iq2_s",
+            "single",
+            ("blk.10.ffn_down_exps.weight",),
+            2048,
+            512,
+            20,
+            "routed down projection for layers 10-29",
+            "IQ2_S",
+        ),
+        GroupedMMQCase(
+            "down_q4_k",
+            "single",
+            ("blk.2.ffn_down_exps.weight",),
+            2048,
+            512,
+            18,
+            "routed down projection for layers 2-9 and 30-39",
+            "Q4_K",
+        ),
+        GroupedMMQCase(
+            "down_q5_k",
+            "single",
+            ("blk.0.ffn_down_exps.weight",),
+            2048,
+            512,
+            2,
+            "routed down projection for layers 0-1",
+            "Q5_K",
+            priority="secondary",
+        ),
     ),
-    GroupedMMQCase(
-        "gate_up_iq2_s",
-        "pair",
-        ("blk.10.ffn_gate_exps.weight", "blk.10.ffn_up_exps.weight"),
-        512,
-        2048,
-        20,
-        "primary",
-        "paired routed gate/up for layers 10-29",
-        "IQ2_S",
+    "deepseek": (
+        GroupedMMQCase(
+            "ds4_output_a_q8_0",
+            "fixed",
+            ("blk.0.attn_output_a.weight",),
+            1024,
+            4096,
+            43,
+            "eight fixed attention output-A groups",
+            "Q8_0",
+            top_k=1,
+            fixed_groups=8,
+        ),
+        GroupedMMQCase(
+            "ds4_gate_up_iq2_xxs",
+            "pair",
+            ("blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight"),
+            2048,
+            4096,
+            43,
+            "paired top-six routed gate/up for all expert layers",
+            "IQ2_XXS",
+            top_k=6,
+        ),
+        GroupedMMQCase(
+            "ds4_down_q2_k",
+            "single",
+            ("blk.0.ffn_down_exps.weight",),
+            4096,
+            2048,
+            43,
+            "top-six routed down projection for all expert layers",
+            "Q2_K",
+            top_k=6,
+        ),
     ),
-    GroupedMMQCase(
-        "down_iq2_s",
-        "single",
-        ("blk.10.ffn_down_exps.weight",),
-        2048,
-        512,
-        20,
-        "primary",
-        "routed down projection for layers 10-29",
-        "IQ2_S",
-    ),
-    GroupedMMQCase(
-        "down_q4_k",
-        "single",
-        ("blk.2.ffn_down_exps.weight",),
-        2048,
-        512,
-        18,
-        "primary",
-        "routed down projection for layers 2-9 and 30-39",
-        "Q4_K",
-    ),
-    GroupedMMQCase(
-        "down_q5_k",
-        "single",
-        ("blk.0.ffn_down_exps.weight",),
-        2048,
-        512,
-        2,
-        "secondary",
-        "routed down projection for layers 0-1",
-        "Q5_K",
-    ),
-    GroupedMMQCase(
-        "ds4_output_a_q8_0",
-        "fixed",
-        ("blk.0.attn_output_a.weight",),
-        1024,
-        4096,
-        43,
-        "primary",
-        "eight fixed attention output-A groups",
-        "Q8_0",
-        model_family="deepseek",
-        top_k=1,
-        fixed_groups=8,
-    ),
-    GroupedMMQCase(
-        "ds4_gate_up_iq2_xxs",
-        "pair",
-        ("blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight"),
-        2048,
-        4096,
-        43,
-        "primary",
-        "paired top-six routed gate/up for all expert layers",
-        "IQ2_XXS",
-        model_family="deepseek",
-        top_k=6,
-    ),
-    GroupedMMQCase(
-        "ds4_down_q2_k",
-        "single",
-        ("blk.0.ffn_down_exps.weight",),
-        4096,
-        2048,
-        43,
-        "primary",
-        "top-six routed down projection for all expert layers",
-        "Q2_K",
-        model_family="deepseek",
-        top_k=6,
-    ),
-)
+}
+
+
+def parse_grouped_benchmark_args(
+    description: str,
+    default_output: Path,
+    seed: int,
+    *,
+    transient_control_help: str | None = None,
+) -> argparse.Namespace:
+    parser = make_benchmark_parser(
+        description,
+        default_output=default_output,
+        seed=seed,
+        repeats=9,
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="override the selected model family's routed top-k",
+    )
+    parser.add_argument(
+        "--distributions",
+        type=parse_name_list,
+        default=DISTRIBUTION_NAMES,
+    )
+    parser.add_argument("--correctness-rows", type=int, default=256)
+    parser.add_argument(
+        "--cases",
+        default="",
+        help="comma-separated case names; empty selects every production case",
+    )
+    parser.add_argument(
+        "--primary-only",
+        action="store_true",
+        help="benchmark only cases marked primary",
+    )
+    if transient_control_help is not None:
+        parser.add_argument(
+            "--transient-bf16-control",
+            action="store_true",
+            help=transient_control_help,
+        )
+    args = parser.parse_args()
+    validate_benchmark_args(parser, args)
+    if args.top_k is not None and args.top_k <= 0:
+        parser.error("--top-k must be positive")
+    if args.correctness_rows <= 0:
+        parser.error("--correctness-rows must be positive")
+    unknown = sorted(set(args.distributions) - set(DISTRIBUTION_NAMES))
+    if unknown:
+        parser.error(
+            f"unknown distributions {unknown}; expected {list(DISTRIBUTION_NAMES)}"
+        )
+    return args
+
+
+@dataclass(frozen=True)
+class RoutedWeights:
+    packed: tuple[torch.Tensor, ...]
+    logical: tuple[torch.Tensor, ...]
+    physical_shapes: tuple[tuple[int, ...], ...]
+    quant_type: int
+    quant_name: str
+
+
+@dataclass(frozen=True)
+class FixedWeight:
+    packed: torch.Tensor
+    logical: torch.Tensor
+    quant_type: int
+    quant_name: str
+
+
+def validate_grouped_quant_type(
+    case: GroupedMMQCase,
+    tensors: tuple[gguf.ReaderTensor, ...],
+) -> tuple[int, str]:
+    quant_types = {int(tensor.tensor_type) for tensor in tensors}
+    if len(quant_types) != 1:
+        raise RuntimeError(f"{case.name} paired tensors have different quant types")
+    quant_type = quant_types.pop()
+    quant_name = tensors[0].tensor_type.name
+    if quant_name != case.quant_type:
+        raise RuntimeError(
+            f"{case.name} has quant type {quant_name}, expected {case.quant_type}"
+        )
+    return quant_type, quant_name
+
+
+def load_routed_weights(
+    case: GroupedMMQCase,
+    tensors: tuple[gguf.ReaderTensor, ...],
+) -> RoutedWeights:
+    quant_type, quant_name = validate_grouped_quant_type(case, tensors)
+    packed_weights = tuple(load_packed_tensor(tensor) for tensor in tensors)
+    physical_shapes = []
+    expected_shape = (case.out_features, case.in_features)
+    for tensor, packed in zip(tensors, packed_weights, strict=True):
+        logical_shape = tuple(int(value) for value in reversed(tensor.shape[:-1]))
+        if logical_shape != expected_shape:
+            raise RuntimeError(
+                f"{tensor.name} has logical per-expert shape {logical_shape}, "
+                f"expected {expected_shape}"
+            )
+        if packed.shape[0] != 256:
+            raise RuntimeError(
+                f"{tensor.name} has {packed.shape[0]} experts, expected 256"
+            )
+        if packed.shape[2] != case.packed_row_bytes:
+            raise RuntimeError(
+                f"{tensor.name} has {packed.shape[2]} packed bytes per row, "
+                f"expected {case.packed_row_bytes} for {case.quant_type}"
+            )
+        physical_shapes.append(tuple(packed.shape))
+
+    logical_weights = tuple(
+        dequantize_gguf_tensor(
+            packed,
+            tensor.tensor_type,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        .reshape(256, case.out_features, case.in_features)
+        .contiguous()
+        for tensor, packed in zip(tensors, packed_weights, strict=True)
+    )
+    return RoutedWeights(
+        packed_weights,
+        logical_weights,
+        tuple(physical_shapes),
+        quant_type,
+        quant_name,
+    )
+
+
+def load_fixed_weight(
+    case: GroupedMMQCase,
+    tensor: gguf.ReaderTensor,
+) -> FixedWeight:
+    quant_type, quant_name = validate_grouped_quant_type(case, (tensor,))
+    flat_packed = load_packed_tensor(tensor)
+    expected_packed_shape = (
+        case.fixed_groups * case.out_features,
+        case.packed_row_bytes,
+    )
+    if tuple(flat_packed.shape) != expected_packed_shape:
+        raise RuntimeError(
+            f"{tensor.name} has packed shape {tuple(flat_packed.shape)}, "
+            f"expected {expected_packed_shape}"
+        )
+    expected_logical_shape = (
+        case.fixed_groups * case.out_features,
+        case.in_features,
+    )
+    logical_shape = tuple(int(value) for value in reversed(tensor.shape))
+    if logical_shape != expected_logical_shape:
+        raise RuntimeError(
+            f"{tensor.name} has logical shape {logical_shape}, "
+            f"expected {expected_logical_shape}"
+        )
+
+    packed_weight = flat_packed.view(
+        case.fixed_groups,
+        case.out_features,
+        flat_packed.shape[-1],
+    )
+    logical_weight = dequantize_gguf_tensor(
+        packed_weight,
+        tensor.tensor_type,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).reshape(case.fixed_groups, case.out_features, case.in_features)
+    return FixedWeight(
+        packed_weight,
+        logical_weight,
+        quant_type,
+        quant_name,
+    )
 
 
 @dataclass(frozen=True)
@@ -165,16 +342,6 @@ class RouteDistribution:
     @property
     def rows(self) -> int:
         return sum(self.group_sizes_cpu)
-
-
-def resolve_model_family(
-    requested: str,
-    tensor_names: Container[str],
-) -> tuple[str, str]:
-    detected = (
-        "deepseek" if "blk.0.attn_output_a.weight" in tensor_names else "qwen"
-    )
-    return (detected if requested == "auto" else requested), detected
 
 
 def fixed_group_distribution(rows: int, groups: int) -> RouteDistribution:
@@ -214,31 +381,15 @@ def parse_name_list(value: str) -> tuple[str, ...]:
 def select_cases(
     case_names: str,
     primary_only: bool,
-    model_family: str = "qwen",
+    model_family: str,
 ) -> tuple[GroupedMMQCase, ...]:
-    by_name = {case.name: case for case in CASES}
-    if case_names:
-        names = tuple(name.strip() for name in case_names.split(",") if name.strip())
-        unknown = sorted(set(names) - set(by_name))
-        if unknown:
-            raise ValueError(
-                f"unknown cases {unknown}; available cases are {sorted(by_name)}"
-            )
-        selected = tuple(by_name[name] for name in names)
-        mismatched = [
-            case.name for case in selected if case.model_family != model_family
-        ]
-        if mismatched:
-            raise ValueError(
-                f"cases {mismatched} do not belong to model family {model_family}"
-            )
-    else:
-        selected = tuple(case for case in CASES if case.model_family == model_family)
-    if primary_only:
-        selected = tuple(case for case in selected if case.priority == "primary")
-    if not selected:
-        raise ValueError("no grouped benchmark cases selected")
-    return selected
+    return select_family_cases(
+        case_names,
+        primary_only,
+        model_family,
+        GROUPED_CASES_BY_MODEL_FAMILY,
+        description="grouped benchmark",
+    )
 
 
 def adjust_positive_sizes(values: list[int], total: int) -> tuple[int, ...]:
@@ -316,7 +467,42 @@ def distribution_summary(distribution: RouteDistribution) -> dict:
     }
 
 
-def device_metadata(
+def grouped_result_metadata(
+    case: GroupedMMQCase,
+    batch: int,
+    rows: int,
+    quant_name: str,
+    quant_type: int,
+    distribution: RouteDistribution,
+    physical_weight_shapes: tuple[tuple[int, ...], ...],
+    *,
+    top_k: int | None = None,
+) -> dict[str, object]:
+    result = {
+        "case": case.name,
+        "kind": case.kind,
+        "description": case.description,
+        "priority": case.priority,
+        "batch": batch,
+        "rows": rows,
+        "out_features": case.out_features,
+        "in_features": case.in_features,
+        "projections": case.projections,
+        "quant_type": quant_name,
+        "quant_type_id": quant_type,
+        "distribution": distribution.name,
+        "group_summary": distribution_summary(distribution),
+        "expert_indices": list(distribution.expert_indices_cpu),
+        "group_sizes": list(distribution.group_sizes_cpu),
+        "physical_weight_shapes": [list(shape) for shape in physical_weight_shapes],
+        "model_calls": case.model_calls,
+    }
+    if top_k is not None:
+        result["top_k"] = top_k
+    return result
+
+
+def make_route_tensors(
     distribution: RouteDistribution,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     expert_indices = torch.tensor(
@@ -347,52 +533,3 @@ def truncate_distribution(
     return RouteDistribution(
         f"{distribution.name}_correctness", tuple(experts), tuple(sizes)
     )
-
-
-def timing_summary(
-    times_ms: list[float], rows: int, n: int, k: int, projections: int
-) -> dict:
-    median_ms = statistics.median(times_ms)
-    logical_flops = 2 * projections * rows * n * k
-    return {
-        "samples_ms": times_ms,
-        "median_ms": median_ms,
-        "min_ms": min(times_ms),
-        "max_ms": max(times_ms),
-        "logical_tflops": logical_flops / (median_ms * 1.0e9),
-    }
-
-
-def benchmark_function(
-    function: Callable[[], object],
-    rows: int,
-    n: int,
-    k: int,
-    projections: int,
-    warmup: int,
-    repeats: int,
-) -> dict:
-    times = cuda_event_times_ms(function, warmup, repeats)
-    allocated, reserved = incremental_peak_bytes(function)
-    result = timing_summary(times, rows, n, k, projections)
-    result.update(
-        {
-            "incremental_peak_allocated_bytes": allocated,
-            "incremental_peak_reserved_bytes": reserved,
-        }
-    )
-    return result
-
-
-def error_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict:
-    difference = actual.float() - expected.float()
-    reference_rms = expected.float().square().mean().sqrt()
-    error_rms = difference.square().mean().sqrt()
-    return {
-        "reference_rms": float(reference_rms),
-        "error_rms": float(error_rms),
-        "normalized_rmse": float(error_rms / reference_rms),
-        "max_absolute_error": float(difference.abs().max()),
-        "different_bf16_elements": int(torch.count_nonzero(actual != expected)),
-        "elements": actual.numel(),
-    }

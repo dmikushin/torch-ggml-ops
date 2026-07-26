@@ -14,7 +14,6 @@ Qwen pre-tail final:       /tmp/grouped_mmq_bwd_final_full.json
 ```
 
 Latest outcome:
-
 - Qwen packed kernels win 35/60 individual case, batch, and routing points against predecoded BF16 AITER GMM.
 - Both Qwen fused gate/up families win all 24 points. The checkpoint-weighted Qwen estimate wins all 12 batch/routing combinations by `1.255-2.159x`.
 - DeepSeek wins all 27 references: fixed Q8_0 wins 3/3 against BF16 BMM, routed IQ2_XXS wins 12/12, and routed Q2_K wins 12/12 against predecoded BF16 AITER.
@@ -31,14 +30,13 @@ The latest Qwen matrix uses `~/models/qwen3.6/Qwen3.6-35B-A3B-APEX-I-Mini.gguf` 
 
 | Family | Wins | Reference/packed latency range | Median | Packed latency by batch |
 | --- | ---: | ---: | ---: | --- |
-| Fused Q3_K gate/up | 12/12 | `1.596-3.006x` | `2.236x` | B1 `3.650-5.701 ms`; B4 `10.736-14.242 ms`; B16 `46.298-49.892 ms` |
-| Fused IQ2_S gate/up | 12/12 | `1.451-2.926x` | `2.175x` | B1 `4.076-6.171 ms`; B4 `10.885-14.703 ms`; B16 `46.758-49.303 ms` |
-| IQ2_S down | 1/12 | `0.813-1.294x` | `0.936x` | B1 `3.483-4.496 ms`; B4 `9.779-10.481 ms`; B16 `33.925-35.199 ms` |
-| Q4_K down | 4/12 | `0.795-1.360x` | `0.940x` | B1 `3.551-4.257 ms`; B4 `9.701-9.917 ms`; B16 `33.034-33.824 ms` |
-| Q5_K down | 6/12 | `0.814-1.310x` | `1.008x` | B1 `3.737-4.011 ms`; B4 `9.498-10.096 ms`; B16 `33.128-33.437 ms` |
+| Fused Q3_K gate/up | 12/12 | `1.596-3.006x` | `2.236x` | B1 `3.650-5.701 ms`, B4 `10.736-14.242 ms`, B16 `46.298-49.892 ms` |
+| Fused IQ2_S gate/up | 12/12 | `1.451-2.926x` | `2.175x` | B1 `4.076-6.171 ms`, B4 `10.885-14.703 ms`, B16 `46.758-49.303 ms` |
+| IQ2_S down | 1/12 | `0.813-1.294x` | `0.936x` | B1 `3.483-4.496 ms`, B4 `9.779-10.481 ms`, B16 `33.925-35.199 ms` |
+| Q4_K down | 4/12 | `0.795-1.360x` | `0.940x` | B1 `3.551-4.257 ms`, B4 `9.701-9.917 ms`, B16 `33.034-33.824 ms` |
+| Q5_K down | 6/12 | `0.814-1.310x` | `1.008x` | B1 `3.737-4.011 ms`, B4 `9.498-10.096 ms`, B16 `33.128-33.437 ms` |
 
 Q4_K and Q5_K include the final inactive-M row-task suppression. Relative to sequential 25-repeat false controls:
-
 - Q4_K improves every B4/B16 point by `5.27-11.60%`, with a `9.16%` geometric gain.
 - Q5_K improves every B4/B16 point by `1.05-6.34%`, with a `3.68%` geometric gain.
 - IQ2_S suppression was rejected. It improved geometrically by only `1.06%` and regressed B4 uniform and B16 boundary.
@@ -68,9 +66,9 @@ The latest DeepSeek matrix uses `~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf`. Ro
 
 | Family | Wins | Reference/packed latency range | Median | Packed latency by batch |
 | --- | ---: | ---: | ---: | --- |
-| Fixed Q8_0 output-A | 3/3 | `1.154-1.225x` | `1.193x` | B1 `6.146 ms`; B4 `25.460 ms`; B16 `97.206 ms` |
-| Fused IQ2_XXS gate/up | 12/12 | `1.531-2.401x` | `1.993x` | B1 `30.966-35.551 ms`; B4 `104.728-116.506 ms`; B16 `436.487-450.460 ms` |
-| Q2_K down | 12/12 | `1.267-2.157x` | `1.614x` | B1 `18.934-21.931 ms`; B4 `50.027-51.971 ms`; B16 `173.735-186.494 ms` |
+| Fixed Q8_0 output-A | 3/3 | `1.154-1.225x` | `1.193x` | B1 `6.146 ms`, B4 `25.460 ms`, B16 `97.206 ms` |
+| Fused IQ2_XXS gate/up | 12/12 | `1.531-2.401x` | `1.993x` | B1 `30.966-35.551 ms`, B4 `104.728-116.506 ms`, B16 `436.487-450.460 ms` |
+| Q2_K down | 12/12 | `1.267-2.157x` | `1.614x` | B1 `18.934-21.931 ms`, B4 `50.027-51.971 ms`, B16 `173.735-186.494 ms` |
 
 Checkpoint-weighted DeepSeek estimate includes 43 calls each of fixed output-A, fused gate/up, and routed down:
 
@@ -94,7 +92,6 @@ DeepSeek does not need an expanded decoded representation. Every packed family a
 ## Scope and contracts
 
 This document covers three input-gradient operators:
-
 - `grouped_mmq_grad_input` for one routed frozen packed projection.
 - `grouped_mmq_pair_grad_input` for fused routed gate/up input gradients.
 - `fixed_grouped_mmq_grad_input` for DeepSeek's fixed eight-group output-A layout.
@@ -109,7 +106,6 @@ backward: dX[M, K] = dY[M, N] @ W[N, K]
 The public cotangent and result are BF16. WMMA accumulation is FP32. The authoritative weights remain packed GGUF tensors.
 
 Production invariants:
-
 - Use the current CUDA/HIP stream.
 - Do not materialize a logical dense weight matrix in the ordinary path.
 - Do not launch arithmetic workgroups for inactive experts.
@@ -180,7 +176,6 @@ DeepSeek sequence length is 2,048 and top-k is 6.
 ### Routing distributions
 
 Routed benchmarks cover four deterministic distributions:
-
 - `uniform`: all experts have equal group sizes.
 - `skewed`: all experts are active with deterministic nonuniform sizes.
 - `sparse`: 192, 224, and 240 active experts at batches 1, 4, and 16.
@@ -201,7 +196,6 @@ The Qwen heuristic selects M128/N128/K64 with 256 threads and 256 persistent pro
 For fused pairs, AITER runs two GMM calls and adds two BF16 outputs. It is the production performance reference but not a bitwise numerical oracle because the packed pair accumulates both projections in FP32 and rounds once.
 
 Correctness references:
-
 - Qwen supported types use the independent dense packed path.
 - DeepSeek Q2_K and IQ2_XXS use independently dequantized BF16 weights.
 - Fixed Q8_0 uses independent GGUF decode and BF16 BMM in `[tokens, 8, K]` layout.
@@ -249,13 +243,13 @@ Dispatch uses only host-visible shape, quant type, total rows, and group count. 
 
 | Model/family | Production dispatch |
 | --- | --- |
-| Qwen Q3_K pair | M64/N64/K32 below `128 * num_groups`; M128/N64/K32 otherwise |
-| Qwen IQ2_S pair | M64/N64/K32 below `128 * num_groups`; M128/N64/K32 otherwise |
-| Qwen Q4_K down | M64/N64 below 80 rows/group; M128/N64 at 80-127; M128/N128 row tasks at 128+ |
-| Qwen Q5_K down | M64/N64 below 128 rows/group; M128/N128 row tasks at 128+ |
-| Qwen IQ2_S down | M64/N64 below 80 rows/group; M128/N64 at 80-127; M128/N128 row tasks at 128+ |
+| Qwen Q3_K pair | M64/N64/K32 below `128 * num_groups`, M128/N64/K32 otherwise |
+| Qwen IQ2_S pair | M64/N64/K32 below `128 * num_groups`, M128/N64/K32 otherwise |
+| Qwen Q4_K down | M64/N64 below 80 rows/group, M128/N64 at 80-127, M128/N128 row tasks at 128+ |
+| Qwen Q5_K down | M64/N64 below 128 rows/group, M128/N128 row tasks at 128+ |
+| Qwen IQ2_S down | M64/N64 below 80 rows/group, M128/N64 at 80-127, M128/N128 row tasks at 128+ |
 | DeepSeek IQ2_XXS pair | M64/N64/K32, width-16 decode, swizzle4 at all route sizes |
-| DeepSeek Q2_K down | M64/U1 below 128 rows/group; M128/U2 at 128-511; M128/U1 at 512+ |
+| DeepSeek Q2_K down | M64/U1 below 128 rows/group, M128/U2 at 128-511, M128/U1 at 512+ |
 | DeepSeek fixed Q8_0 | M256/N64/K32, width-16 decode, no swizzle at all batches |
 | Unsupported type or shape | Generic grouped compatibility kernel |
 
@@ -264,7 +258,6 @@ Every selected kernel remains bounded-correct for nonuniform groups. Average row
 ### Retained arithmetic mechanisms
 
 Common choices:
-
 - Four wave32 waves and 128 threads.
 - K32 reduction tiles.
 - Cooperative width-16 packed decode matched to natural quant metadata sharing.
@@ -275,7 +268,6 @@ Common choices:
 - Zero private storage and zero spills as hard retention gates.
 
 Qwen-specific choices:
-
 - Q3_K pair uses padded LDS rows.
 - Q4_K down uses a sixteen-BF16 XOR layout.
 - Q5_K uses swizzle4 for M64 and swizzle8 for row tasks.
@@ -286,7 +278,6 @@ Qwen-specific choices:
 - IQ2_S row-task suppression is disabled because its route-level result was unstable.
 
 DeepSeek-specific choices:
-
 - IQ2_XXS pair uses two separate weight LDS tiles, width-16 decode, swizzle4, and inactive-M consumer suppression.
 - Q2_K uses width-16 decode that shares each scale/min group and packed shift. Inactive-M consumer suppression is enabled in all three production wrappers.
 - Fixed Q8_0 preserves token-major public layout and stages one unswizzled N64/K32 weight tile per fixed group.
@@ -295,7 +286,7 @@ DeepSeek-specific choices:
 
 Qwen large single-down paths use an atomics-free 256-thread prefix-sum setup to build device-resident 128-row tasks. Setup averages approximately `0.004 ms`, so caching route tasks is not a meaningful optimization target.
 
-M-major ordering is required. N-major ordering nearly doubled B16 latency. Pair and small-row paths stay serial. DeepSeek Q2_K stays serial because it already exposes 32 N workgroups per expert and thousands of workgroups overall; adding row tasks would not remove rounded tail arithmetic.
+M-major ordering is required. N-major ordering nearly doubled B16 latency. Pair and small-row paths stay serial. DeepSeek Q2_K stays serial because it already exposes 32 N workgroups per expert and thousands of workgroups overall. Adding row tasks would not remove rounded tail arithmetic.
 
 ### Code-object resources
 
@@ -325,7 +316,7 @@ Every listed kernel has zero private bytes, zero VGPR/SGPR spills, and `uses_dyn
 
 ### Correctness and allocation
 
-Qwen and DeepSeek single-projection samples are exact against their packed or independently dequantized BF16 references. Q2_K has zero NRMSE; differing-element counts with zero absolute error are signed-zero differences.
+Qwen and DeepSeek single-projection samples are exact against their packed or independently dequantized BF16 references. Q2_K has zero NRMSE. Differing-element counts with zero absolute error are signed-zero differences.
 
 Fused Qwen and DeepSeek pairs remain in the expected one-rounding envelope, approximately `0.00286` NRMSE against two separately rounded BF16 projections plus addition. Fixed Q8_0 is approximately `5e-5` NRMSE against BF16 BMM.
 
@@ -346,7 +337,6 @@ Qwen row-task metadata adds only about 9-10 KiB at batch 4 and 27-28 KiB at batc
 No evidence-backed local grouped-backward experiment remains pending.
 
 The following neighborhoods are closed by direct controls:
-
 - Runtime full/tail branching and split full/tail task lists.
 - N-major tasks, fixed persistent traversal, and broad row-task geometry sweeps.
 - K64, two-LDS buffering, GSU, split-K, grouped Stream-K, and direct-to-VGPR variants.
@@ -363,7 +353,6 @@ A local kernel experiment should be reopened only if new profiler evidence contr
 The only substantive remaining optimization is a separate model-owned compact representation for Qwen Q4_K and IQ2_S single-down weights. This is not an operator-internal cache.
 
 A viable project must define:
-
 - A prepare API and the exact lossless integer-plus-scale bytes stored per projection.
 - Ownership and lifetime across forward and backward.
 - Mutation/version invalidation.
@@ -375,7 +364,6 @@ A viable project must define:
 The packed GGUF tensor remains authoritative. The likely direction is a WMMA-friendly tile-major integer-plus-scale representation, not a BF16 shadow.
 
 Already rejected representation controls:
-
 - A transient BF16 materialization floor was `1.15-1.34x` slower for IQ2_S and `1.08-1.60x` slower for Q4_K before real packed reads and decode were added.
 - One transient projection needs 512 MiB of BF16 workspace and 528-768 MiB incremental peak memory.
 - Persistent BF16 shadows require 19 GiB for the remaining Q4_K/IQ2_S down tensors and 60 GiB for all benchmarked Qwen expert projections.
@@ -383,14 +371,13 @@ Already rejected representation controls:
 - Ideal predecoded AITER saves only 22.1 ms model-wide at B1 and 43.9 ms at B4 for the two down families, then loses 401.1 ms at B16.
 
 Acceptance gates for a compact representation:
-
-1. Preserve lossless GGUF semantics and BF16 public inputs/outputs.
-2. Include preparation, workspace, synchronization, and invalidation costs.
-3. Preserve sparse inactive-expert behavior.
-4. Improve grouped and dense shared-down controls, proving that common decode cost was removed.
-5. Improve all four route distributions or provide a legal shape-based dispatch boundary.
-6. Preserve pair one-rounding and output allocation when pair families use the representation.
-7. State cold-call and steady-state memory/latency explicitly.
+- Preserve lossless GGUF semantics and BF16 public inputs/outputs.
+- Include preparation, workspace, synchronization, and invalidation costs.
+- Preserve sparse inactive-expert behavior.
+- Improve grouped and dense shared-down controls, proving that common decode cost was removed.
+- Improve all four route distributions or provide a legal shape-based dispatch boundary.
+- Preserve pair one-rounding and output allocation when pair families use the representation.
+- State cold-call and steady-state memory/latency explicitly.
 
 DeepSeek should remain packed. Its kernels already beat ideal predecoded references at every measured point.
 
@@ -455,7 +442,6 @@ P3 introduced exact `(N,K)=(2048,4096)` M64/N64/K32 pair ownership and cooperati
 An early decoder took the address of a local packed word and created an 8-byte private segment. Shift/mask extraction restored a register-only body. M128 remained at 8 private bytes and was rejected before timing.
 
 Layout controls:
-
 - Width32 had mixed movement: two B1 wins but sparse/boundary and B4 regressions with no legal host-visible separator. Width16 was retained.
 - Swizzle4 improved all 12 points by about 20-28% over unswizzled.
 - Swizzle16 regressed 24-39% relative to swizzle4.
@@ -477,7 +463,6 @@ Artifacts:
 P4 introduced M64 and M128 N64/K32 bodies. Width16 decode shares one Q2_K scale/min group and packed shift across sixteen values.
 
 Reduction unroll controls:
-
 - U2 improved all B4 routes but regressed B1 and one B16 boundary point, so it is dispatched only for 128-511 rows/group.
 - Sequential 25-repeat B4 controls confirmed U2 over U1 by `1.83-2.83%` across all four routes.
 - U4 lost to U2 by `1.2-4.3%` despite remaining spill-free at 174 VGPRs.
@@ -531,7 +516,7 @@ GB1 retained Q4_K M128/N128/K32 with width16 decode and a sixteen-BF16 XOR layou
 
 GB2 retained a fused Q3_K pair with separate padded weight tiles, one accumulator set, and one final BF16 rounding. Representative B4/B16 points improved by 8-14x over baseline and beat AITER by about 2.1-2.9x.
 
-GB3 introduced exact M64/N64/K32 S1 bodies. Universal M128 S2 was rejected because 64-row uniform groups became half-empty bounded tiles: Q3_K uniform regressed from 3.614 to 6.936 ms and Q4_K from 3.590 to 4.185 ms. Q4_K S2 was retained only at 80-127 rows/group; a 25-repeat sparse control measured 4.037 ms S2 versus 5.201 ms S1.
+GB3 introduced exact M64/N64/K32 S1 bodies. Universal M128 S2 was rejected because 64-row uniform groups became half-empty bounded tiles: Q3_K uniform regressed from 3.614 to 6.936 ms and Q4_K from 3.590 to 4.185 ms. Q4_K S2 was retained only at 80-127 rows/group. A 25-repeat sparse control measured 4.037 ms S2 versus 5.201 ms S1.
 
 Artifacts:
 
@@ -557,7 +542,6 @@ Representative task speedups over serial:
 | IQ2_S B16 uniform | 38.992 ms | 32.806 ms | 1.19x |
 
 Rejected scheduling controls:
-
 - N-major order nearly doubled B16 latency.
 - Fixed 1,024-program traversal regressed Q4_K/IQ2_S and gave Q5_K 10 spills plus a 44-byte private segment.
 - Runtime full/tail branching produced private segments and 2-4 spills.
@@ -582,9 +566,9 @@ Artifacts:
 
 ### Qwen GB7 and final local controls: pair geometry, layouts, and tails
 
-IQ2_S down retained swizzle16; IQ2_S pair retained swizzle4. Swizzle4 regressed down by 20-35% but improved pair by 15-25%, proving that pair and single layouts must remain separate.
+IQ2_S down retained swizzle16. IQ2_S pair retained swizzle4. Swizzle4 regressed down by 20-35% but improved pair by 15-25%, proving that pair and single layouts must remain separate.
 
-IQ2_S and Q3_K large pairs retained M128/N64/K32. Reducing N relieved pair resource pressure and improved representative points by 1-7%. Width8 IQ2_S decode was rejected because it duplicated scale work and doubled loader groups; pair B16 uniform regressed from 44.101 to 50.274 ms and down B16 uniform from 32.959 to 42.949 ms.
+IQ2_S and Q3_K large pairs retained M128/N64/K32. Reducing N relieved pair resource pressure and improved representative points by 1-7%. Width8 IQ2_S decode was rejected because it duplicated scale work and doubled loader groups. Pair B16 uniform regressed from 44.101 to 50.274 ms and down B16 uniform from 32.959 to 42.949 ms.
 
 Q5_K swizzle8 was retained only for row tasks. A universal swizzle8 regressed M64/B1 by 5.6-22.5%, while sequential controls improved all row-task routes by `4.2-6.4%` at B4 and `5.2-6.6%` at B16. Row-task VGPR use fell from 256 to 233 before final inactive-M suppression.
 
@@ -644,15 +628,15 @@ Artifacts:
 | Qwen row tasks | Runtime full/tail branch | Private storage and 2-4 spills |
 | Qwen row tasks | Split full/tail lists | Second launch regressed nonuniform B4 by 6-14% |
 | Qwen IQ2_S | Width8 decode | Duplicated scale work and loader groups |
-| Qwen IQ2_S | Shared pair/down swizzle | Opposite measured preferences; keep layouts separate |
-| Qwen Q5_K | Universal swizzle8 | Regressed B1; retain only for row tasks |
+| Qwen IQ2_S | Shared pair/down swizzle | Opposite measured preferences. Keep layouts separate |
+| Qwen Q5_K | Universal swizzle8 | Regressed B1. Retain only for row tasks |
 | Qwen IQ2_S | Inactive-M row-task suppression | Mixed route movement and two regressions |
 | DeepSeek IQ2_XXS | M128/N64 | 8-byte private segment failed the gate |
 | DeepSeek IQ2_XXS | Width32 | Mixed route movement with no legal host separator |
-| DeepSeek IQ2_XXS | Swizzle0 or swizzle16 | Swizzle4 was uniformly faster; swizzle16 lost 24-39% |
+| DeepSeek IQ2_XXS | Swizzle0 or swizzle16 | Swizzle4 was uniformly faster. Swizzle16 lost 24-39% |
 | DeepSeek Q2_K | U4 | Lost to U2 by 1.2-4.3% |
 | DeepSeek Q2_K | N128/U1 | 255-VGPR cliff and 3.06% geometric regression |
-| DeepSeek Q2_K | Row tasks | Sufficient N-grid parallelism; no reduction in rounded tail work |
+| DeepSeek Q2_K | Row tasks | Sufficient N-grid parallelism. No reduction in rounded tail work |
 | DeepSeek fixed Q8_0 | M64/M128 | M256 won sequential controls |
 | DeepSeek fixed Q8_0 | Width32 or swizzle4 | Regressed all target batches |
 | DeepSeek fixed Q8_0 | M512 | Accumulator growth would exceed the VGPR warning budget |
@@ -673,7 +657,7 @@ Do not replace fused pairs with two public outputs plus `torch.add`. That change
 - Preserve device-resident routing and inactive-expert sparsity.
 - Match cooperative decode width to actual metadata sharing boundaries.
 - Keep decode temporaries dead before long WMMA phases.
-- Specialize and shorten state before reducing N; never retain spills.
+- Specialize and shorten state before reducing N. Never retain spills.
 - Keep pair, single-down, and fixed layouts separate when semantics or measurements differ.
 - Keep adjacent N workgroups for one row task contiguous in M-major order.
 - Keep decode and barriers unconditional when suppressing only inactive consumer minitiles.
@@ -685,7 +669,6 @@ Do not replace fused pairs with two public outputs plus `torch.add`. That change
 ## Validation and packaging
 
 Final validation after the retained tail controls:
-
 - `67 passed, 14 warnings` from `PYTHONPATH=. pytest -q`.
 - Ruff and compileall pass.
 - `git diff --check` passes.
@@ -711,7 +694,6 @@ The concrete-wrapper conversion established byte-identical HSACOs for all 118 th
 Earlier apparent B1 movements above 1% were checked against rebuilt byte-identical Q4_K, Q5_K, and IQ2_S artifacts. Sequential warmed 25-repeat controls still ranged from `-2.21%` to `+0.61%`, confirming timing variance rather than an ISA regression. Byte-identical timing movement must not reopen a semantic optimization decision.
 
 The current bundle has 32 grouped-backward entries:
-
 - Seven generic singles.
 - Seven generic pairs.
 - One generic fixed Q8_0 entry.
@@ -789,7 +771,6 @@ The current bundle has 32 grouped-backward entries:
 ```
 
 Related documents:
-
 - `docs/mmq_bwd_optimization.md` for dense backward.
 - `docs/grouped_mmq_fwd_optimization.md` for grouped forward.
 - `docs/kernel_bundle.md` for source-only bundle generation and packaging.

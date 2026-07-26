@@ -11,82 +11,37 @@ The packed LM head uses bounded token chunks because full-sequence logits and
 cotangents are never retained by production training.
 """
 
-import argparse
-import gc
-import json
+from argparse import Namespace
 from pathlib import Path
 
 import gguf
 import torch
 from mmq_benchmark_common import (
-    DEFAULT_MODEL,
-    MODEL_FAMILY_CHOICES,
-    cuda_event_times_ms,
-    incremental_peak_bytes,
-    load_packed_tensor,
+    DenseMMQCase,
+    benchmark_callable,
+    clear_cuda_cache,
+    cuda_device_info,
+    dense_result_metadata,
+    error_metrics,
+    load_gguf_tensors,
     make_bf16_input,
     make_row_specs,
-    parse_int_list,
+    parse_dense_benchmark_args,
+    performance_comparison,
+    print_benchmark_header,
+    print_dense_result,
     resolve_lm_head_chunks,
-    resolve_model_family,
     select_cases,
-    summarize_timing,
     synchronize,
     validate_weight_case,
+    write_json_report,
 )
 from transformers.integrations.gguf_dequant import dequantize_gguf_tensor
 
 import torch_ggml_ops  # noqa: F401 Register native operators before torch.ops use.
+from tests.mmq_test_support import load_packed_tensor
 
 DEFAULT_OUTPUT = Path("/tmp/torch_ggml_ops_mmq_bwd_benchmark.json")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument(
-        "--model-family",
-        choices=MODEL_FAMILY_CHOICES,
-        default="auto",
-        help="case family; auto detects DeepSeek from attn_output_a",
-    )
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--sequence-length", type=int, default=2048)
-    parser.add_argument("--batches", type=parse_int_list, default=(1, 4, 16))
-    parser.add_argument(
-        "--lm-head-chunks",
-        type=parse_int_list,
-        default=None,
-        help="comma-separated chunks; defaults to the selected model family",
-    )
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--repeats", type=int, default=7)
-    parser.add_argument("--correctness-rows", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=20260706)
-    parser.add_argument(
-        "--cases",
-        type=str,
-        default="",
-        help="comma-separated case names; empty selects every production case",
-    )
-    parser.add_argument(
-        "--primary-only",
-        action="store_true",
-        help="benchmark only cases marked primary",
-    )
-    args = parser.parse_args()
-
-    if not args.model.is_file():
-        parser.error(f"GGUF model not found: {args.model}")
-    if args.sequence_length <= 0:
-        parser.error("--sequence-length must be positive")
-    if args.warmup < 0:
-        parser.error("--warmup must be nonnegative")
-    if args.repeats <= 0:
-        parser.error("--repeats must be positive")
-    if args.correctness_rows <= 0:
-        parser.error("--correctness-rows must be positive")
-    return args
 
 
 def correctness_metrics(
@@ -95,140 +50,186 @@ def correctness_metrics(
     logical_weight: torch.Tensor,
     quant_type: int,
     in_features: int,
-) -> dict:
+) -> dict[str, object]:
     with torch.inference_mode():
-        packed_grad_input = torch.ops.torch_ggml_ops.mmq_grad_input.default(
+        actual = torch.ops.torch_ggml_ops.mmq_grad_input.default(
             grad_output,
             packed_weight,
             quant_type,
             in_features,
         )
-        bf16_grad_input = torch.mm(grad_output, logical_weight)
-        difference = packed_grad_input.float() - bf16_grad_input.float()
-        reference_rms = bf16_grad_input.float().square().mean().sqrt()
-        error_rms = difference.square().mean().sqrt()
-        result = {
-            "rows": grad_output.shape[0],
-            "reference_rms": float(reference_rms),
-            "error_rms": float(error_rms),
-            "normalized_rmse": float(error_rms / reference_rms),
-            "max_absolute_error": float(difference.abs().max()),
-            "different_bf16_elements": int(
-                torch.count_nonzero(packed_grad_input != bf16_grad_input)
-            ),
-            "elements": packed_grad_input.numel(),
-        }
-        del packed_grad_input, bf16_grad_input, difference
-        return result
+        expected = torch.mm(grad_output, logical_weight)
+    return {"rows": grad_output.shape[0], **error_metrics(actual, expected)}
 
 
-def benchmark_mmq_grad_input(
-    grad_output: torch.Tensor,
+def benchmark_packed_rows(
+    args: Namespace,
+    case: DenseMMQCase,
+    case_index: int,
+    rows_to_measure: tuple[int, ...],
     packed_weight: torch.Tensor,
     quant_type: int,
-    in_features: int,
-    warmup: int,
-    repeats: int,
-) -> dict:
-    def function() -> torch.Tensor:
-        return torch.ops.torch_ggml_ops.mmq_grad_input.default(
-            grad_output,
-            packed_weight,
-            quant_type,
-            in_features,
+) -> dict[int, dict[str, object]]:
+    measurements = {}
+    for row_index, rows in enumerate(rows_to_measure):
+        grad_output = make_bf16_input(
+            rows,
+            case.out_features,
+            args.seed + case_index * 1000 + row_index,
         )
+        measurements[rows] = benchmark_callable(
+            lambda grad_output=grad_output, packed_weight=packed_weight, quant_type=quant_type, in_features=case.in_features: (
+                torch.ops.torch_ggml_ops.mmq_grad_input.default(
+                    grad_output,
+                    packed_weight,
+                    quant_type,
+                    in_features,
+                )
+            ),
+            rows,
+            case.out_features,
+            case.in_features,
+            args.warmup,
+            args.repeats,
+        )
+        del grad_output
+    return measurements
 
-    times = cuda_event_times_ms(function, warmup, repeats)
-    allocated, reserved = incremental_peak_bytes(function)
-    result = summarize_timing(
-        times,
-        grad_output.shape[0],
-        grad_output.shape[1],
-        in_features,
-    )
-    result.update(
-        {
-            "incremental_peak_allocated_bytes": allocated,
-            "incremental_peak_reserved_bytes": reserved,
-        }
-    )
-    return result
 
-
-def benchmark_bf16_grad_input(
-    grad_output: torch.Tensor,
+def benchmark_reference_rows(
+    args: Namespace,
+    case: DenseMMQCase,
+    case_index: int,
+    rows_to_measure: tuple[int, ...],
+    packed_weight: torch.Tensor,
     logical_weight: torch.Tensor,
-    warmup: int,
-    repeats: int,
-) -> dict:
-    def function() -> torch.Tensor:
-        return torch.mm(grad_output, logical_weight)
+    quant_type: int,
+) -> tuple[dict[int, dict[str, object]], dict[int, dict[str, object]]]:
+    reference_measurements = {}
+    correctness = {}
+    for row_index, rows in enumerate(rows_to_measure):
+        grad_output = make_bf16_input(
+            rows,
+            case.out_features,
+            args.seed + case_index * 1000 + row_index,
+        )
+        reference_measurements[rows] = benchmark_callable(
+            lambda grad_output=grad_output, logical_weight=logical_weight: torch.mm(
+                grad_output, logical_weight
+            ),
+            rows,
+            case.out_features,
+            case.in_features,
+            args.warmup,
+            args.repeats,
+        )
+        correctness_grad_output = grad_output[
+            : min(args.correctness_rows, rows)
+        ].clone()
+        correctness[rows] = correctness_metrics(
+            correctness_grad_output,
+            packed_weight,
+            logical_weight,
+            quant_type,
+            case.in_features,
+        )
+        del grad_output, correctness_grad_output
+    return reference_measurements, correctness
 
-    times = cuda_event_times_ms(function, warmup, repeats)
-    allocated, reserved = incremental_peak_bytes(function)
-    result = summarize_timing(
-        times,
-        grad_output.shape[0],
-        logical_weight.shape[0],
-        logical_weight.shape[1],
+
+def benchmark_case(
+    args: Namespace,
+    case: DenseMMQCase,
+    case_index: int,
+    tensor: gguf.ReaderTensor,
+    lm_head_chunks: tuple[int, ...],
+) -> list[dict[str, object]]:
+    quant_type, quant_name, physical_shape = validate_weight_case(tensor, case)
+    packed_weight = load_packed_tensor(tensor)
+    if packed_weight.dtype != torch.uint8 or not packed_weight.is_contiguous():
+        raise RuntimeError("packed benchmark weight is not contiguous uint8")
+
+    row_specs, unique_rows = make_row_specs(
+        case,
+        args.batches,
+        args.sequence_length,
+        lm_head_chunks,
     )
-    result.update(
-        {
-            "incremental_peak_allocated_bytes": allocated,
-            "incremental_peak_reserved_bytes": reserved,
+    packed_by_rows = benchmark_packed_rows(
+        args,
+        case,
+        case_index,
+        unique_rows,
+        packed_weight,
+        quant_type,
+    )
+
+    synchronize()
+    logical_weight = dequantize_gguf_tensor(
+        packed_weight,
+        tensor.tensor_type,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).reshape(case.out_features, case.in_features)
+    logical_weight = logical_weight.contiguous()
+    reference_by_rows, correctness_by_rows = benchmark_reference_rows(
+        args,
+        case,
+        case_index,
+        unique_rows,
+        packed_weight,
+        logical_weight,
+        quant_type,
+    )
+
+    results = []
+    for row_spec in row_specs:
+        rows = row_spec["m"]
+        packed = packed_by_rows[rows]
+        reference = reference_by_rows[rows]
+        model_calls = row_spec["calls"] * case.model_calls
+        result = {
+            **dense_result_metadata(
+                case,
+                row_spec,
+                args.sequence_length,
+                physical_shape,
+                quant_name,
+                quant_type,
+            ),
+            "grad_output_shape": [rows, case.out_features],
+            "grad_input_shape": [rows, case.in_features],
+            "grad_output_dtype": str(torch.bfloat16),
+            "packed_weight_dtype": str(torch.uint8),
+            "grad_input_dtype": str(torch.bfloat16),
+            "packed": packed,
+            "bf16_reference": reference,
+            **performance_comparison(packed, reference, model_calls),
+            "correctness": correctness_by_rows[rows],
         }
-    )
-    return result
+        results.append(result)
+        print_dense_result(result)
 
-
-def print_result(row: dict) -> None:
-    packed = row["mmq_grad_input"]
-    bf16 = row["torch_bf16"]
-    print(
-        f"{row['case']:<23} "
-        f"B={row['batch']:>2} calls={row['model_invocations_per_backward']:>3} "
-        f"M={row['m']:>6} N={row['n']:>6} K={row['k']:>4} "
-        f"{row['quant_type']:<5} "
-        f"PACKED={packed['median_ms']:>8.3f} ms "
-        f"{packed['logical_tflops']:>6.2f} TF "
-        f"BF16={bf16['median_ms']:>8.3f} ms {bf16['logical_tflops']:>6.2f} TF "
-        f"ratio={row['packed_to_bf16_tflops_ratio']:>5.2f}x "
-        f"NRMSE={row['correctness']['normalized_rmse']:.3e}",
-        flush=True,
-    )
+    del logical_weight, packed_weight
+    clear_cuda_cache()
+    return results
 
 
 def main() -> None:
-    args = parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("a HIP/CUDA device is required")
-
-    device = torch.cuda.current_device()
-    properties = torch.cuda.get_device_properties(device)
-    reader = gguf.GGUFReader(args.model)
-    tensors = {tensor.name: tensor for tensor in reader.tensors}
-    model_family, detected_model_family = resolve_model_family(
-        args.model_family, set(tensors)
+    args = parse_dense_benchmark_args(__doc__, DEFAULT_OUTPUT, 20260706)
+    device = cuda_device_info()
+    cases = select_cases(args.cases, args.primary_only, args.model_family)
+    reader, tensors = load_gguf_tensors(
+        args.model,
+        tuple(case.tensor_name for case in cases),
     )
-    lm_head_chunks = resolve_lm_head_chunks(args.lm_head_chunks, model_family)
-
-    cases = select_cases(args.cases, args.primary_only, model_family)
-    missing = [case.tensor_name for case in cases if case.tensor_name not in tensors]
-    if missing:
-        raise RuntimeError(f"checkpoint is missing benchmark tensors: {missing}")
-
+    lm_head_chunks = resolve_lm_head_chunks(args.lm_head_chunks, args.model_family)
     report = {
         "model": str(args.model),
-        "device": {
-            "name": properties.name,
-            "gcn_arch_name": getattr(properties, "gcnArchName", None),
-            "torch_version": torch.__version__,
-            "hip_version": torch.version.hip,
-        },
+        "model_family": args.model_family,
+        "operation": "backward",
+        "device": device,
         "configuration": {
-            "model_family": model_family,
-            "detected_model_family": detected_model_family,
-            "requested_model_family": args.model_family,
             "sequence_length": args.sequence_length,
             "batches": list(args.batches),
             "lm_head_chunks": list(lm_head_chunks),
@@ -238,147 +239,27 @@ def main() -> None:
             "grad_output_dtype": str(torch.bfloat16),
             "packed_storage_dtype": str(torch.uint8),
             "grad_input_dtype": str(torch.bfloat16),
-            "cotangent_quantization": None,
-            "torch_reference": ("torch.mm(BF16_grad_output, dequantized_BF16_weight)"),
+            "grad_output_quantization": None,
+            "reference": "torch.mm(BF16_grad_output, dequantized_BF16_weight)",
         },
         "results": [],
     }
-
-    print(
-        f"device={properties.name} arch={getattr(properties, 'gcnArchName', None)} "
-        f"torch={torch.__version__} hip={torch.version.hip}",
-        flush=True,
-    )
-    print(
-        f"model={args.model} family={model_family} "
-        f"detected={detected_model_family}",
-        flush=True,
-    )
+    print_benchmark_header(device, args.model, args.model_family)
 
     with torch.inference_mode():
         for case_index, case in enumerate(cases):
-            tensor = tensors[case.tensor_name]
-            quant_type, quant_name, physical_shape = validate_weight_case(
-                tensor, case
-            )
-            packed_weight = load_packed_tensor(tensor)
-            if packed_weight.dtype != torch.uint8 or not packed_weight.is_contiguous():
-                raise RuntimeError("packed benchmark weight is not contiguous uint8")
-
-            row_specs, unique_m = make_row_specs(
-                case,
-                args.batches,
-                args.sequence_length,
-                lm_head_chunks,
+            report["results"].extend(
+                benchmark_case(
+                    args,
+                    case,
+                    case_index,
+                    tensors[case.tensor_name],
+                    lm_head_chunks,
+                )
             )
 
-            packed_by_m = {}
-            for m_index, rows in enumerate(unique_m):
-                grad_seed = args.seed + case_index * 1000 + m_index
-                grad_output = make_bf16_input(
-                    rows,
-                    case.expected_out_features,
-                    grad_seed,
-                )
-                packed_by_m[rows] = benchmark_mmq_grad_input(
-                    grad_output,
-                    packed_weight,
-                    quant_type,
-                    case.expected_in_features,
-                    args.warmup,
-                    args.repeats,
-                )
-                del grad_output
-
-            synchronize()
-            logical_weight = dequantize_gguf_tensor(
-                packed_weight,
-                tensor.tensor_type,
-                dtype=torch.bfloat16,
-                device="cuda",
-            ).reshape(case.expected_out_features, case.expected_in_features)
-            logical_weight = logical_weight.contiguous()
-
-            bf16_by_m = {}
-            correctness_by_m = {}
-            for m_index, rows in enumerate(unique_m):
-                grad_seed = args.seed + case_index * 1000 + m_index
-                grad_output = make_bf16_input(
-                    rows,
-                    case.expected_out_features,
-                    grad_seed,
-                )
-                bf16_by_m[rows] = benchmark_bf16_grad_input(
-                    grad_output,
-                    logical_weight,
-                    args.warmup,
-                    args.repeats,
-                )
-                checked_rows = min(args.correctness_rows, rows)
-                correctness_grad_output = grad_output[:checked_rows].clone()
-                correctness_by_m[rows] = correctness_metrics(
-                    correctness_grad_output,
-                    packed_weight,
-                    logical_weight,
-                    quant_type,
-                    case.expected_in_features,
-                )
-                del grad_output, correctness_grad_output
-
-            for spec in row_specs:
-                rows = spec["m"]
-                packed_result = packed_by_m[rows]
-                bf16_result = bf16_by_m[rows]
-                model_invocations = spec["calls"] * case.model_tensor_count
-                result = {
-                    "case": case.name,
-                    "description": case.description,
-                    "priority": case.priority,
-                    "tensor_name": case.tensor_name,
-                    "model_tensor_count": case.model_tensor_count,
-                    "batch": spec["batch"],
-                    "sequence_length": args.sequence_length,
-                    "m": rows,
-                    "n": case.expected_out_features,
-                    "k": case.expected_in_features,
-                    "grad_output_shape": [rows, case.expected_out_features],
-                    "logical_weight_shape": [
-                        case.expected_out_features,
-                        case.expected_in_features,
-                    ],
-                    "physical_weight_shape": list(physical_shape),
-                    "grad_input_shape": [rows, case.expected_in_features],
-                    "grad_output_dtype": str(torch.bfloat16),
-                    "packed_weight_dtype": str(torch.uint8),
-                    "grad_input_dtype": str(torch.bfloat16),
-                    "quant_type": quant_name,
-                    "quant_type_id": quant_type,
-                    "model_rows": spec["model_rows"],
-                    "calls_per_weight_per_model_backward": spec["calls"],
-                    "model_invocations_per_backward": model_invocations,
-                    "mmq_grad_input": packed_result,
-                    "torch_bf16": bf16_result,
-                    "packed_to_bf16_tflops_ratio": (
-                        packed_result["logical_tflops"] / bf16_result["logical_tflops"]
-                    ),
-                    "estimated_packed_model_backward_ms": (
-                        model_invocations * packed_result["median_ms"]
-                    ),
-                    "estimated_torch_bf16_model_backward_ms": (
-                        model_invocations * bf16_result["median_ms"]
-                    ),
-                    "correctness": correctness_by_m[rows],
-                }
-                report["results"].append(result)
-                print_result(result)
-
-            del logical_weight, packed_weight
-            gc.collect()
-            torch.cuda.empty_cache()
-            synchronize()
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2))
+    del reader
+    write_json_report(args.output, report)
     print(f"report={args.output}", flush=True)
 
 

@@ -118,7 +118,9 @@ def _render_forward(symbol: str, config: ForwardConfig) -> str:
     prefix = _PREAMBLE + '#include "mmq_core.cuh"\n\n'
     if config.kind == ForwardKind.QUANTIZE:
         quant_type = _cpp_quant(config.quant_type)
-        return prefix + f"""extern "C" __launch_bounds__(512, 1) __global__
+        return (
+            prefix
+            + f"""extern "C" __launch_bounds__(512, 1) __global__
 void {symbol}(
         const __hip_bfloat16 * __restrict__ input,
         block_q8_1_mmq * __restrict__ output,
@@ -129,10 +131,13 @@ void {symbol}(
         input, output, rows, rows_padded, k);
 }}
 """
+        )
 
     if config.kind == ForwardKind.DENSE:
         quant_type = _cpp_quant(config.quant_type)
-        return prefix + f"""extern "C" __launch_bounds__(MMQ_NTHREADS, 2) __global__
+        return (
+            prefix
+            + f"""extern "C" __launch_bounds__(MMQ_NTHREADS, 2) __global__
 void {symbol}(
         const char * __restrict__ weights,
         const int * __restrict__ activations,
@@ -156,10 +161,13 @@ void {symbol}(
         blocks_per_weight_row);
 }}
 """
+        )
 
     if config.kind == ForwardKind.GROUPED_SERIAL:
         quant_type = _cpp_quant(config.quant_type)
-        return prefix + f"""extern "C" __launch_bounds__(MMQ_NTHREADS, 2) __global__
+        return (
+            prefix
+            + f"""extern "C" __launch_bounds__(MMQ_NTHREADS, 2) __global__
 void {symbol}(
         const char * __restrict__ weights,
         const int * __restrict__ activations,
@@ -191,10 +199,13 @@ void {symbol}(
             bytes_per_expert);
 }}
 """
+        )
 
     if config.kind == ForwardKind.GROUPED_ROW_TASK:
         quant_type = _cpp_quant(config.quant_type)
-        return prefix + f"""extern "C" __launch_bounds__(MMQ_NTHREADS, 2) __global__
+        return (
+            prefix
+            + f"""extern "C" __launch_bounds__(MMQ_NTHREADS, 2) __global__
 void {symbol}(
         const char * __restrict__ weights,
         const int * __restrict__ activations,
@@ -221,9 +232,12 @@ void {symbol}(
             bytes_per_expert);
 }}
 """
+        )
 
     if config.kind == ForwardKind.FIXED_GROUPED:
-        return prefix + f"""extern "C" __launch_bounds__(MMQ_NTHREADS, 2) __global__
+        return (
+            prefix
+            + f"""extern "C" __launch_bounds__(MMQ_NTHREADS, 2) __global__
 void {symbol}(
         const char * __restrict__ weights,
         const int * __restrict__ activations,
@@ -244,9 +258,12 @@ void {symbol}(
             bytes_per_group);
 }}
 """
+        )
 
     if config.kind == ForwardKind.ROW_TASK_SETUP:
-        return prefix + f"""extern "C" __launch_bounds__(256, 1) __global__
+        return (
+            prefix
+            + f"""extern "C" __launch_bounds__(256, 1) __global__
 void {symbol}(
         const int64_t * __restrict__ expert_indices,
         const int32_t * __restrict__ expert_offsets,
@@ -271,12 +288,15 @@ void {symbol}(
         row_tile);
 }}
 """
+        )
 
     raise ValueError(f"unsupported forward kind {config.kind}")
 
 
 def _render_dense_backward(symbol: str, config: DenseBackwardConfig) -> str:
-    return _PREAMBLE + f"""#include "ck/mmq_backward.cuh"
+    return (
+        _PREAMBLE
+        + f"""#include "ck/mmq_backward.cuh"
 
 extern "C" __launch_bounds__(torch_ggml_ops::ck::BACKWARD_THREADS, 2) __global__
 void {symbol}(
@@ -314,6 +334,7 @@ void {symbol}(
             blocks_per_weight_row);
 }}
 """
+    )
 
 
 _SINGLE_ARGUMENTS = """        const __hip_bfloat16 * __restrict__ grad_output,
@@ -383,42 +404,26 @@ _FIXED_ARGUMENTS = """        const __hip_bfloat16 * __restrict__ grad_output,
 
 
 _SPECIAL_GROUPED_CALLS = {
-    GroupedBackwardKind.Q4_SINGLE_M64:
-        "torch_ggml_ops::ck::grouped_mmq_grad_input_q4_small_body",
-    GroupedBackwardKind.Q4_SINGLE_M128:
-        "torch_ggml_ops::ck::grouped_mmq_grad_input_q4_small_s2_body",
-    GroupedBackwardKind.Q3_PAIR_M64:
-        "torch_ggml_ops::ck::grouped_mmq_pair_grad_input_q3_small_body",
-    GroupedBackwardKind.Q3_PAIR_M128:
-        "torch_ggml_ops::ck::grouped_mmq_pair_grad_input_q3_n64_large_body",
-    GroupedBackwardKind.Q5_SINGLE_M64:
-        "torch_ggml_ops::ck::grouped_mmq_grad_input_q5_small_body",
-    GroupedBackwardKind.IQ2_S_SINGLE_M64:
-        "torch_ggml_ops::ck::grouped_mmq_grad_input_iq2_tiled_body<true>",
-    GroupedBackwardKind.IQ2_S_SINGLE_M128:
-        "torch_ggml_ops::ck::grouped_mmq_grad_input_iq2_s2_body",
-    GroupedBackwardKind.IQ2_S_PAIR_M64:
-        "torch_ggml_ops::ck::grouped_mmq_pair_grad_input_iq2_tiled_body<true>",
-    GroupedBackwardKind.IQ2_S_PAIR_M128:
-        "torch_ggml_ops::ck::grouped_mmq_pair_grad_input_iq2_n64_large_body",
-    GroupedBackwardKind.Q4_ROW_TASK:
-        "torch_ggml_ops::ck::grouped_mmq_grad_input_q4_row_task_body",
-    GroupedBackwardKind.Q5_ROW_TASK:
-        "torch_ggml_ops::ck::grouped_mmq_grad_input_q5_row_task_body",
-    GroupedBackwardKind.IQ2_S_ROW_TASK:
-        "torch_ggml_ops::ck::grouped_mmq_grad_input_iq2_row_task_body",
-    GroupedBackwardKind.Q2_K_SINGLE_M64_U1:
-        "torch_ggml_ops::ck::grouped_mmq_grad_input_deepseek_body<"
-        "GGML_TYPE_Q2_K, 4096, 2048, 8, 1, 1, true>",
-    GroupedBackwardKind.Q2_K_SINGLE_M128_U1:
-        "torch_ggml_ops::ck::grouped_mmq_grad_input_deepseek_body<"
-        "GGML_TYPE_Q2_K, 4096, 2048, 8, 2, 1, true>",
-    GroupedBackwardKind.IQ2_XXS_PAIR_M64:
-        "torch_ggml_ops::ck::grouped_mmq_pair_grad_input_deepseek_body<"
-        "GGML_TYPE_IQ2_XXS, 2048, 4096, 16, 1, true>",
-    GroupedBackwardKind.Q2_K_SINGLE_M128_U2:
-        "torch_ggml_ops::ck::grouped_mmq_grad_input_deepseek_body<"
-        "GGML_TYPE_Q2_K, 4096, 2048, 8, 2, 2, true>",
+    GroupedBackwardKind.Q4_SINGLE_M64: "torch_ggml_ops::ck::grouped_mmq_grad_input_q4_small_body",
+    GroupedBackwardKind.Q4_SINGLE_M128: "torch_ggml_ops::ck::grouped_mmq_grad_input_q4_small_s2_body",
+    GroupedBackwardKind.Q3_PAIR_M64: "torch_ggml_ops::ck::grouped_mmq_pair_grad_input_q3_small_body",
+    GroupedBackwardKind.Q3_PAIR_M128: "torch_ggml_ops::ck::grouped_mmq_pair_grad_input_q3_n64_large_body",
+    GroupedBackwardKind.Q5_SINGLE_M64: "torch_ggml_ops::ck::grouped_mmq_grad_input_q5_small_body",
+    GroupedBackwardKind.IQ2_S_SINGLE_M64: "torch_ggml_ops::ck::grouped_mmq_grad_input_iq2_tiled_body<true>",
+    GroupedBackwardKind.IQ2_S_SINGLE_M128: "torch_ggml_ops::ck::grouped_mmq_grad_input_iq2_s2_body",
+    GroupedBackwardKind.IQ2_S_PAIR_M64: "torch_ggml_ops::ck::grouped_mmq_pair_grad_input_iq2_tiled_body<true>",
+    GroupedBackwardKind.IQ2_S_PAIR_M128: "torch_ggml_ops::ck::grouped_mmq_pair_grad_input_iq2_n64_large_body",
+    GroupedBackwardKind.Q4_ROW_TASK: "torch_ggml_ops::ck::grouped_mmq_grad_input_q4_row_task_body",
+    GroupedBackwardKind.Q5_ROW_TASK: "torch_ggml_ops::ck::grouped_mmq_grad_input_q5_row_task_body",
+    GroupedBackwardKind.IQ2_S_ROW_TASK: "torch_ggml_ops::ck::grouped_mmq_grad_input_iq2_row_task_body",
+    GroupedBackwardKind.Q2_K_SINGLE_M64_U1: "torch_ggml_ops::ck::grouped_mmq_grad_input_deepseek_body<"
+    "GGML_TYPE_Q2_K, 4096, 2048, 8, 1, 1, true>",
+    GroupedBackwardKind.Q2_K_SINGLE_M128_U1: "torch_ggml_ops::ck::grouped_mmq_grad_input_deepseek_body<"
+    "GGML_TYPE_Q2_K, 4096, 2048, 8, 2, 1, true>",
+    GroupedBackwardKind.IQ2_XXS_PAIR_M64: "torch_ggml_ops::ck::grouped_mmq_pair_grad_input_deepseek_body<"
+    "GGML_TYPE_IQ2_XXS, 2048, 4096, 16, 1, true>",
+    GroupedBackwardKind.Q2_K_SINGLE_M128_U2: "torch_ggml_ops::ck::grouped_mmq_grad_input_deepseek_body<"
+    "GGML_TYPE_Q2_K, 4096, 2048, 8, 2, 2, true>",
 }
 
 _PAIR_KINDS = {
@@ -451,7 +456,9 @@ def _render_grouped_backward(symbol: str, config: GroupedBackwardConfig) -> str:
     kind = config.kind
     if kind == GroupedBackwardKind.GENERIC_SINGLE:
         quant_type = _cpp_quant(config.quant_type)
-        return prefix + f"""extern "C" __launch_bounds__(torch_ggml_ops::ck::GROUPED_BACKWARD_THREADS, 1) __global__
+        return (
+            prefix
+            + f"""extern "C" __launch_bounds__(torch_ggml_ops::ck::GROUPED_BACKWARD_THREADS, 1) __global__
 void {symbol}(
         const __hip_bfloat16 * __restrict__ grad_output,
         const char * __restrict__ packed_weight,
@@ -478,10 +485,13 @@ void {symbol}(
         bytes_per_expert);
 }}
 """
+        )
 
     if kind == GroupedBackwardKind.GENERIC_PAIR:
         quant_type = _cpp_quant(config.quant_type)
-        return prefix + f"""extern "C" __launch_bounds__(torch_ggml_ops::ck::GROUPED_BACKWARD_THREADS, 1) __global__
+        return (
+            prefix
+            + f"""extern "C" __launch_bounds__(torch_ggml_ops::ck::GROUPED_BACKWARD_THREADS, 1) __global__
 void {symbol}(
         const __hip_bfloat16 * __restrict__ first_grad_output,
         const __hip_bfloat16 * __restrict__ second_grad_output,
@@ -512,9 +522,12 @@ void {symbol}(
         bytes_per_expert);
 }}
 """
+        )
 
     if kind == GroupedBackwardKind.FIXED_Q8_0_GENERIC:
-        return prefix + f"""extern "C" __launch_bounds__(torch_ggml_ops::ck::GROUPED_BACKWARD_THREADS, 1) __global__
+        return (
+            prefix
+            + f"""extern "C" __launch_bounds__(torch_ggml_ops::ck::GROUPED_BACKWARD_THREADS, 1) __global__
 void {symbol}(
 {_FIXED_ARGUMENTS}) {{
     torch_ggml_ops::ck::fixed_grouped_q8_0_grad_input_body(
@@ -526,9 +539,12 @@ void {symbol}(
         bytes_per_group);
 }}
 """
+        )
 
     if kind == GroupedBackwardKind.FIXED_Q8_0_M256:
-        return prefix + f"""extern "C" __launch_bounds__(torch_ggml_ops::ck::BACKWARD_THREADS, 1) __global__
+        return (
+            prefix
+            + f"""extern "C" __launch_bounds__(torch_ggml_ops::ck::BACKWARD_THREADS, 1) __global__
 void {symbol}(
 {_FIXED_ARGUMENTS}) {{
     torch_ggml_ops::ck::fixed_grouped_q8_0_grad_input_tiled_body<4, 16, 0>(
@@ -539,6 +555,7 @@ void {symbol}(
         bytes_per_group);
 }}
 """
+        )
 
     call = _SPECIAL_GROUPED_CALLS.get(kind)
     if call is None:

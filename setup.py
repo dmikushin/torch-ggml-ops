@@ -27,13 +27,7 @@ SDIST_INPUTS = [
 CUDAExtension = cpp_extension.CUDAExtension
 
 
-def _env_flag_enabled(name: str) -> bool:
-    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
-
-
 def _enable_ccache() -> None:
-    if _env_flag_enabled("TORCH_GGML_OPS_DISABLE_CCACHE"):
-        return
     ccache = shutil.which("ccache")
     hipcc = shutil.which("hipcc")
     if ccache is None or hipcc is None:
@@ -84,7 +78,7 @@ stable_defines = [
 ]
 
 setup(
-    packages=find_packages(),
+    packages=find_packages(exclude=("tests", "tests.*")),
     ext_modules=[
         CUDAExtension(
             name="torch_ggml_ops._C",

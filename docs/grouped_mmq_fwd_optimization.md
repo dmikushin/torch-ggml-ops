@@ -3,7 +3,6 @@
 ## Status at a glance
 
 This document is the source of truth for grouped MMQ forward kernel behavior, dispatch, benchmark evidence, and retuning decisions on gfx1151. It covers:
-
 - `grouped_mmq_pair` for routed gate/up projections.
 - `grouped_mmq` for routed down projections.
 - `fixed_grouped_mmq` for the eight-group DeepSeek output-A projection.
@@ -26,35 +25,34 @@ They use warmup 3, 9 sequential repeats, correctness rows 256, and the consolida
 | Qwen | 60 points | 84/84 exact | 54/60 vs BF16 AITER | Six nonuniform IQ2_S down points at batches 1 and 4 |
 | DeepSeek-V4-Flash | 27 points | 39/39 exact | 24/24 routed points vs AITER | Fixed Q8_0 output A remains slower than BF16 BMM |
 
-The latest 9-repeat results show the same qualitative conclusions as the bracketed 25-repeat controls: Qwen wins every gate/up and Q4_K/Q5_K down point; DeepSeek wins every routed point; fixed Q8_0 is a stable representation gap rather than a launch or compiler-layout issue.
+The latest 9-repeat results show the same qualitative conclusions as the bracketed 25-repeat controls: Qwen wins every gate/up and Q4_K/Q5_K down point. DeepSeek wins every routed point. Fixed Q8_0 is a stable representation gap rather than a launch or compiler-layout issue.
 
 ## Retained production dispatch
 
 Dispatch is static and explainable. It depends on quant type, operator kind, exact production geometry, and a coarse total-row threshold. It does not inspect device offsets on the host, use route names, use environment variables, or perform online autotuning.
 
-Here `rows` is the total routed row count and `num_groups` is the number of route groups. Thresholds are launch hints; the device kernels still handle inactive experts, skew, and partial row tiles correctly.
+Here `rows` is the total routed row count and `num_groups` is the number of route groups. Thresholds are launch hints. The device kernels still handle inactive experts, skew, and partial row tiles correctly.
 
 | Workload | Exact geometry | Retained branch | Threshold |
 |---|---|---|---|
-| Qwen gate/up | `(N,K)=(512,2048)` | serial J64 for small groups; device row-task J64 for large groups | row tasks when `rows >= 128 * num_groups` |
-| Qwen down Q5_K | `(N,K)=(2048,512)` | standalone serial J32 for small groups; serial J64 otherwise | J32 when `rows < 128 * num_groups` |
-| Qwen down IQ2_S | `(N,K)=(2048,512)` | serial J64 with a J32 final-tail body for small groups; serial J64 otherwise | mixed tail when `rows < 128 * num_groups` |
+| Qwen gate/up | `(N,K)=(512,2048)` | serial J64 for small groups. Device row-task J64 for large groups | row tasks when `rows >= 128 * num_groups` |
+| Qwen down Q5_K | `(N,K)=(2048,512)` | standalone serial J32 for small groups. Serial J64 otherwise | J32 when `rows < 128 * num_groups` |
+| Qwen down IQ2_S | `(N,K)=(2048,512)` | serial J64 with a J32 final-tail body for small groups. Serial J64 otherwise | mixed tail when `rows < 128 * num_groups` |
 | Qwen down other production types | `(N,K)=(2048,512)` | serial J64 | no extra branch |
 | DeepSeek output A | eight groups, `(N,K)=(1024,4096)` | fixed-group J64 | always |
-| DeepSeek gate/up | `(N,K)=(2048,4096)` IQ2_XXS | serial J64 for small/medium groups; serial J80 for large groups | J80 when `rows >= 512 * num_groups` |
-| DeepSeek down | `(N,K)=(4096,2048)` Q2_K | serial J32 with factor-4 scale/min unrolling; optional J16 tail | J16 tail when `rows < 64 * num_groups` |
+| DeepSeek gate/up | `(N,K)=(2048,4096)` IQ2_XXS | serial J64 for small/medium groups. Serial J80 for large groups | J80 when `rows >= 512 * num_groups` |
+| DeepSeek down | `(N,K)=(4096,2048)` Q2_K | serial J32 with factor-4 scale/min unrolling. Optional J16 tail | J16 tail when `rows < 64 * num_groups` |
 | Other supported shapes | runtime geometry | bounds-safe generic J128 fallback | none |
 
 The common retained tile is `I=64`, with 128 threads and four wave32 waves. Qwen and DeepSeek exact branches specialize their production N/K and packed K-block counts at compile time. The fixed Q8_0 path uses a full-N J64 body when the output shape is complete and a bounded variant only for non-multiple output widths.
 
-Gate/up row tasks are built once on the device and reused for the two projections. Each task stores an expert ID and a bounded row interval. Batch-1-sized Qwen groups retain serial ownership to preserve sparse launch behavior. Down retains serial expert row ownership because its many output tiles already expose enough parallelism; the down descriptor experiment regressed.
+Gate/up row tasks are built once on the device and reused for the two projections. Each task stores an expert ID and a bounded row interval. Batch-1-sized Qwen groups retain serial ownership to preserve sparse launch behavior. Down retains serial expert row ownership because its many output tiles already expose enough parallelism. The down descriptor experiment regressed.
 
 ## Production contract
 
-The public activation and output dtype is BF16. Activations are quantized internally to Q8_1 for the packed arithmetic path. Packed GGUF weights remain authoritative; the production path does not construct logical BF16 expert matrices.
+The public activation and output dtype is BF16. Activations are quantized internally to Q8_1 for the packed arithmetic path. Packed GGUF weights remain authoritative. The production path does not construct logical BF16 expert matrices.
 
 The route metadata ABI is:
-
 - `expert_indices`: contiguous CUDA `torch.int64`, shape `[G]`.
 - `expert_offsets`: contiguous CUDA `torch.int32`, shape `[G]`.
 - `expert_offsets[-1] = R`.
@@ -80,7 +78,7 @@ The Qwen checkpoint is `Qwen3.6-35B-A3B-APEX-I-Mini.gguf`, with sequence length 
 | 4 | 65,536 | 256 |
 | 16 | 262,144 | 1,024 |
 
-Gate and up share one Q8_1 activation workspace but execute as two grouped arithmetic launches. Batch 1 commonly has fewer than 256 active experts; batches 4 and 16 generally activate all experts with skewed group sizes.
+Gate and up share one Q8_1 activation workspace but execute as two grouped arithmetic launches. Batch 1 commonly has fewer than 256 active experts. Batches 4 and 16 generally activate all experts with skewed group sizes.
 
 ### DeepSeek-V4-Flash workload
 
@@ -98,16 +96,15 @@ The DeepSeek checkpoint is `DeepSeek-V4-Flash-IQ2XXS.gguf`, with sequence length
 | 4 | 8,192 | 49,152 | 192 |
 | 16 | 32,768 | 196,608 | 768 |
 
-Output A consumes logical input `[..., 8, 4096]` and preserves eight independent logical weights. It uses token rows M, not routed rows R, and includes the group-major to public token-major output conversion in the BF16 reference. The routed pair shares one Q8_1 workspace. DeepSeek backward decoders are now implemented and correctness-tested; their production dispatch and optimization remain in `docs/grouped_mmq_bwd_optimization.md`.
+Output A consumes logical input `[..., 8, 4096]` and preserves eight independent logical weights. It uses token rows M, not routed rows R, and includes the group-major to public token-major output conversion in the BF16 reference. The routed pair shares one Q8_1 workspace. DeepSeek backward decoders are now implemented and correctness-tested. Their production dispatch and optimization remain in `docs/grouped_mmq_bwd_optimization.md`.
 
 ## Measurement and acceptance
 
 `bench/benchmark_grouped_mmq_fwd.py` records complete packed latency, logical throughput, incremental allocation, packed shapes, quant type, route statistics, reference latency, dense-MMQ exactness, independent-reference error, and checkpoint-weighted estimates.
 
-Routed references are BF16 AITER Triton GMM with the benchmark-owned `bench/aiter_gmm_heuristics.py` `gmm_config`; active weights are independently dequantized during setup, not in the timed reference. The fixed output-A reference is BF16 `torch.bmm` over eight groups and includes public-layout conversion. AITER and BMM are references, not a claim about the maximum possible packed throughput.
+Routed references are BF16 AITER Triton GMM with the benchmark-owned `bench/aiter_gmm_heuristics.py` `gmm_config`. Active weights are independently dequantized during setup, not in the timed reference. The fixed output-A reference is BF16 `torch.bmm` over eight groups and includes public-layout conversion. AITER and BMM are references, not a claim about the maximum possible packed throughput.
 
 The four deterministic routing distributions are:
-
 - `uniform`: all 256 experts active with equal group sizes.
 - `skewed`: all 256 experts active with deterministic nonuniform sizes.
 - `sparse`: 192, 224, or 240 active experts at batches 1, 4, and 16.
@@ -116,14 +113,13 @@ The four deterministic routing distributions are:
 DeepSeek uses the same distribution families with top-six mean sizes 48, 192, and 768. The fixed output-A case has no route distribution.
 
 A retained change must satisfy:
-
-- exact grouped-versus-dense packed BF16 output for every production point;
-- the established independent-reference error envelope;
-- zero private segment, zero VGPR/SGPR spills, and no dynamic stack for every enforced production arithmetic entry;
-- no repeatable Qwen regression in the complete 60-point matrix;
-- no regression in the checkpoint-weighted Qwen estimate;
-- complete-operator timing, including quantization and workspace allocation;
-- device-resident routing metadata and current-stream behavior;
+- exact grouped-versus-dense packed BF16 output for every production point.
+- the established independent-reference error envelope.
+- zero private segment, zero VGPR/SGPR spills, and no dynamic stack for every enforced production arithmetic entry.
+- no repeatable Qwen regression in the complete 60-point matrix.
+- no regression in the checkpoint-weighted Qwen estimate.
+- complete-operator timing, including quantization and workspace allocation.
+- device-resident routing metadata and current-stream behavior.
 - dense controls as well as grouped controls when shared quantization or MMQ code changes.
 
 A movement above 1% in a fresh median triggers a sequential 25-repeat A/B control. Concurrent benchmark or profiler runs are not accepted.
@@ -131,12 +127,12 @@ A movement above 1% in a fresh median triggers a sequential 25-repeat A/B contro
 The current matrices can be reproduced with:
 
 ```bash
-python bench/benchmark_grouped_mmq_fwd.py \\
+PYTHONPATH=. python bench/benchmark_grouped_mmq_fwd.py \\
   --model ~/models/qwen3.6/Qwen3.6-35B-A3B-APEX-I-Mini.gguf \\
   --model-family qwen --warmup 3 --repeats 9 --correctness-rows 256 \\
   --output /tmp/grouped_mmq_fwd_qwen_retuning_final_9.json
 
-python bench/benchmark_grouped_mmq_fwd.py \\
+PYTHONPATH=. python bench/benchmark_grouped_mmq_fwd.py \\
   --model ~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf \\
   --model-family deepseek --warmup 3 --repeats 9 --correctness-rows 256 \\
   --output /tmp/grouped_mmq_fwd_ds4_retuning_final_9.json
@@ -146,7 +142,7 @@ python bench/benchmark_grouped_mmq_fwd.py \\
 
 ### Qwen
 
-The latest artifact is `/tmp/grouped_mmq_fwd_qwen_retuning_final_9.json`. It contains 60 points from five cases, three physical batches, and four distributions. The table below shows uniform routing for compact comparison; the win count covers all four distributions.
+The latest artifact is `/tmp/grouped_mmq_fwd_qwen_retuning_final_9.json`. It contains 60 points from five cases, three physical batches, and four distributions. The table below shows uniform routing for compact comparison. The win count covers all four distributions.
 
 | Case | Batch 1 packed/reference ms | Batch 4 packed/reference ms | Batch 16 packed/reference ms | Wins |
 |---|---:|---:|---:|---:|
@@ -156,7 +152,7 @@ The latest artifact is `/tmp/grouped_mmq_fwd_qwen_retuning_final_9.json`. It con
 | Down Q4_K | `1.646/3.593` | `5.941/7.927` | `23.967/44.618` | 12/12 |
 | Down Q5_K | `1.785/3.620` | `6.012/7.940` | `23.739/45.095` | 12/12 |
 
-Qwen packed arithmetic matches dense packed MMQ exactly at all 84 pair/single checks. Independent BF16-reference NRMSE is `0.00597-0.01653` across the matrix, consistent with the quantization-specific envelopes. The six losses are exactly the skewed, sparse, and boundary IQ2_S down points at batches 1 and 4; uniform IQ2_S down remains ahead.
+Qwen packed arithmetic matches dense packed MMQ exactly at all 84 pair/single checks. Independent BF16-reference NRMSE is `0.00597-0.01653` across the matrix, consistent with the quantization-specific envelopes. The six losses are exactly the skewed, sparse, and boundary IQ2_S down points at batches 1 and 4. Uniform IQ2_S down remains ahead.
 
 The latest checkpoint-weighted grouped projection estimate is faster than the AITER estimate in every measured bucket. Across the four distributions, the packed/reference speedup ranges are approximately:
 
@@ -191,7 +187,7 @@ They are superseded as current source-of-record timing by the consolidated-bundl
 
 ### Resource status
 
-The generalized bundle contains 108 packaged HSACOs. All enforced production resource gates pass with zero private bytes, zero VGPR/SGPR spills, and no dynamic stack. The broad all-artifact scan still reports known fallback spills; those fallback artifacts are not part of the production zero-spill contract.
+The generalized bundle contains 108 packaged HSACOs. All enforced production resource gates pass with zero private bytes, zero VGPR/SGPR spills, and no dynamic stack. The broad all-artifact scan still reports known fallback spills. Those fallback artifacts are not part of the production zero-spill contract.
 
 Representative retained arithmetic allocations from the retuning pass are:
 
@@ -215,25 +211,23 @@ The remaining Qwen deficit is nonuniform IQ2_S down at batches 1 and 4. Down lau
 DeepSeek fixed Q8_0 is also representation-limited. The complete public operator remains slower than BMM because the comparison begins from already dequantized BF16 weights. Quantization is not the dominant cost: accepted traces put multiplication at roughly 87-99% of retained operator kernel time depending on family and batch.
 
 The only worthwhile follow-ups are representation-level designs:
-
-- a compact lossless decoded-weight cache substantially smaller than BF16;
-- cross-call decoded-weight reuse;
-- a transient project-owned decoded dense stage amortized across projections or calls;
+- a compact lossless decoded-weight cache substantially smaller than BF16.
+- cross-call decoded-weight reuse.
+- a transient project-owned decoded dense stage amortized across projections or calls.
 - a persistent lossless integer-plus-scale representation consumed directly by grouped WMMA.
 
 Any such project must account for weight lifetime, memory footprint, cache invalidation, routing sparsity, allocation, and complete public-operator latency. It must not become an unconditional full BF16 shadow copy. The current final matrices are the baseline for that work.
 
 Closed directions for the current representation:
-
-- global J64, J128, or I128 rules;
-- eight-wave ownership of an I64 output tile without a valid reduction design;
-- complete decoded-weight LDS caching at the current 64-row tile;
-- down row-task descriptors or fixed-size persistent traversal;
-- split full/tail launches or replicated tail arithmetic;
-- compiler-managed local arrays as packed prefetch state;
-- wholesale direct-to-VGPR or both-operands direct-to-VGPR;
-- two-LDS pipelines, GSU, split-K, and grouped Stream-K;
-- broad swizzle/padding sweeps without measured LDS-bank evidence;
+- global J64, J128, or I128 rules.
+- eight-wave ownership of an I64 output tile without a valid reduction design.
+- complete decoded-weight LDS caching at the current 64-row tile.
+- down row-task descriptors or fixed-size persistent traversal.
+- split full/tail launches or replicated tail arithmetic.
+- compiler-managed local arrays as packed prefetch state.
+- wholesale direct-to-VGPR or both-operands direct-to-VGPR.
+- two-LDS pipelines, GSU, split-K, and grouped Stream-K.
+- broad swizzle/padding sweeps without measured LDS-bank evidence.
 - another shared quantizer rewrite while multiplication remains dominant.
 
 ## Historical optimization log
@@ -243,9 +237,8 @@ The entries below are ordered by experiment rather than by the current implement
 ### Baseline diagnosis
 
 The original grouped path used runtime shape state and a J128 serial row loop. Its historical artifact was `/tmp/grouped_mmq_fwd_baseline_full.json`. The original grouped Q4_K/Q5_K code reached 256 VGPRs with 512-520 private bytes per thread and 127-129 reported VGPR spills. The corresponding dense bodies were spill-free. Historical profiling showed:
-
-- gate/up Q3_K batch 1: 0.829 ms Q8_1 quantization and 10.767 ms for two grouped projections;
-- gate/up Q3_K batch 16: 7.894 ms quantization and 122.445 ms for two grouped projections;
+- gate/up Q3_K batch 1: 0.829 ms Q8_1 quantization and 10.767 ms for two grouped projections.
+- gate/up Q3_K batch 16: 7.894 ms quantization and 122.445 ms for two grouped projections.
 - down Q4_K batch 4: 0.916 ms quantization and 21.964 ms grouped arithmetic.
 
 The grouped multiplication was the first-order bottleneck. A pre-G1 down Q4_K counter run reported 18.44% occupancy and 69.73% L2 hit rate versus 23.20% and 71.68% for BF16 AITER. LDS bank stalls were only 0.0154%. This directed the first pass toward compile-time geometry and spill removal rather than cache or LDS-bank tuning.
@@ -255,11 +248,10 @@ The grouped multiplication was the first-order bottleneck. A pre-G1 down Q4_K co
 Status: retained.
 
 G1 combined:
-
-- compile-time J64;
-- fixed gate/up `(NRowsWeight, BlocksPerWeightRow)=(512,8)`;
-- fixed down `(2048,2)`;
-- no output-row fallback in exact production bodies;
+- compile-time J64.
+- fixed gate/up `(NRowsWeight, BlocksPerWeightRow)=(512,8)`.
+- fixed down `(2048,2)`.
+- no output-row fallback in exact production bodies.
 - fixed production K traversal while retaining J128 fallback kernels for other shapes.
 
 The focused artifact was `/tmp/grouped_step1_j64_fixed.json`. Representative improvements over the historical baseline were:
@@ -294,7 +286,7 @@ The extra LDS and residency loss outweighed decode reuse. A complete cache at th
 
 Status: rejected and reverted.
 
-G3 removed runtime N/K state but restored J128. It regressed every focused point by roughly 25-50% relative to G1. Q4_K and Q5_K still reached the register limit with private storage; IQ2_S was spill-free but still lost heavily. J128 is not a production tile for these grouped representations.
+G3 removed runtime N/K state but restored J128. It regressed every focused point by roughly 25-50% relative to G1. Q4_K and Q5_K still reached the register limit with private storage. IQ2_S was spill-free but still lost heavily. J128 is not a production tile for these grouped representations.
 
 ### G4: separate exact full-row and bounded-tail bodies
 
@@ -343,7 +335,7 @@ G7 replaces repeated block and activation-plane multiplication with affine point
 
 ### G8: device row-task descriptors for large gate/up groups
 
-Status: retained for gate/up; rejected for down.
+Status: retained for gate/up. Rejected for down.
 
 One device setup workgroup computes an atomics-free prefix sum and writes `(expert, row_start, row_end)` descriptors with capacity `ceil(R / 64) + G`. The descriptor arrays remain device-resident. The paired gate/up operator builds them once and reuses them for both projections.
 
@@ -389,7 +381,7 @@ Status: retained only in narrow bounded forms.
 
 A literal IQ2_S J64/J16/J32/J48 same-launch body reached 256 VGPRs, 1,644 private bytes, and 455 spills. A narrower Qwen J64/J32 tail body remained spill-free and improved batch-1 nonuniform routes by 2.8-9.0%, but regressed batch-4 and batch-16 uniform controls. It is retained only for `rows < 128 * num_groups`.
 
-The DeepSeek Q2_K J32/J16 body remained spill-free and improved batch 1 by 5.1-15.7%; large-row controls showed a repeatable regression. It is retained only for `rows < 64 * num_groups`.
+The DeepSeek Q2_K J32/J16 body remained spill-free and improved batch 1 by 5.1-15.7%. Large-row controls showed a repeatable regression. It is retained only for `rows < 64 * num_groups`.
 
 ### G14: pre-bundle last-version checkpoint
 
@@ -408,7 +400,7 @@ A 25-repeat control showed that unchanged Qwen kernels moved by more than 1% und
 
 Status: retained and generalized.
 
-Grouped-forward arithmetic was moved into independently compiled HSACOs with deterministic symbols and per-entry resource gates. The first repeated build exposed staging-path-derived compilation-unit IDs; deterministic per-symbol `-cuid` values made two-directory builds byte-identical. The standalone loader and packaging details now live in `docs/kernel_bundle.md`.
+Grouped-forward arithmetic was moved into independently compiled HSACOs with deterministic symbols and per-entry resource gates. The first repeated build exposed staging-path-derived compilation-unit IDs. Deterministic per-symbol `-cuid` values made two-directory builds byte-identical. The standalone loader and packaging details now live in `docs/kernel_bundle.md`.
 
 The standalone bundle exposed a repeatable Qwen Q5_K batch-1 nonuniform opportunity. J32 improved skewed, sparse, and boundary routes by approximately 14-16% while regressing uniform by 2.6-3.1%, so dispatch selected J32 only below `rows = 128 * num_groups`. This source-level branch survived the generalized bundle conversion.
 
@@ -441,7 +433,7 @@ Quantization was only about 9% of fixed Q8_0 batch-1 time and less than 1% of th
 
 ### D1: fixed-group Q8_0 output A
 
-Status: complete; J64 retained.
+Status: complete. J64 retained.
 
 J128 raised the fixed kernel to 256 VGPRs, 88 private bytes, and 21 spills, and regressed complete latency from `10.990/44.336/175.484 ms` to `15.153/60.563/242.127 ms`. J32 also failed the resource gate at 256 VGPRs, 344 private bytes, and 85 spills. The current J64 tile is the only accepted local tile family.
 
@@ -451,17 +443,17 @@ Two representation-local variants were then tested against same-build controls. 
 
 ### D2: routed IQ2_XXS gate/up
 
-Status: complete; J64/J80 retained.
+Status: complete. J64/J80 retained.
 
 Exact `(N,K)=(2048,4096)` J64 reduced the arithmetic body from 256 VGPRs with 360 private bytes and 117 spills to 229 VGPRs with zero private bytes and spills. Batch-1 uniform complete pair latency improved from `77.549 ms` to `33.581 ms`, and the complete 12-point route matrix improved by a 1.52x geometric mean. Batch-16 uniform exposed the cost of the smaller row tile, so a large-row alternative was measured.
 
-J96 reached 256 VGPRs, 76 private bytes, and 18 spills and was rejected. J32 reached 256 VGPRs, 156 private bytes, and 48 spills and was rejected. J80 stayed spill-free at 253 VGPRs and 51 SGPRs; it improved every batch-16 distribution over J64, but was 1.2-2.2% slower at batch 4. The retained threshold is J80 when `rows >= 512 * num_groups`; batch 1/4 use J64.
+J96 reached 256 VGPRs, 76 private bytes, and 18 spills and was rejected. J32 reached 256 VGPRs, 156 private bytes, and 48 spills and was rejected. J80 stayed spill-free at 253 VGPRs and 51 SGPRs. It improved every batch-16 distribution over J64, but was 1.2-2.2% slower at batch 4. The retained threshold is J80 when `rows >= 512 * num_groups`. Batch 1/4 use J64.
 
 ### D3: routed Q2_K down
 
-Status: complete; exact J32 with factor-4 unrolling and a J16 tail retained.
+Status: complete. Exact J32 with factor-4 unrolling and a J16 tail retained.
 
-Exact J64 increased the kernel to 2,784 private bytes and 1,188 spills and regressed batch-1 uniform by 37.1%. Runtime-shape J64 still used 3,068 private bytes and 1,132 spills and regressed 9.9%. J32 reduced the generic body to 500 private bytes and 135 spills and improved batch-1 uniform from `76.312 ms` to `37.029 ms`; exact `(N,K)=(4096,2048)` specialization then reduced this to 404 private bytes and 109 spills.
+Exact J64 increased the kernel to 2,784 private bytes and 1,188 spills and regressed batch-1 uniform by 37.1%. Runtime-shape J64 still used 3,068 private bytes and 1,132 spills and regressed 9.9%. J32 reduced the generic body to 500 private bytes and 135 spills and improved batch-1 uniform from `76.312 ms` to `37.029 ms`. Exact `(N,K)=(4096,2048)` specialization then reduced this to 404 private bytes and 109 spills.
 
 Splitting full and tail launches, and replicating invalid activation lanes, lowered some tail-body resource counts but lost complete-operator time because of the extra launch or clamp/address work. Both were reverted. A generator-owned `unroll 1` on the eight Q2_K scale/min phases produced a 14 KiB body at 122 VGPRs, 30 SGPRs, zero private bytes, zero spills, and no dynamic stack. Explicit unroll 2 remained spill-free at 158 VGPRs and was 1.28% better geometrically than unroll 1, but unroll 4 was faster on all 12 points while remaining spill-free at 208 VGPRs and 38 SGPRs. Factor 4 was retained.
 
@@ -471,7 +463,7 @@ Staging packed scale/min metadata across both J16 minitiles remained spill-free 
 
 Status: complete.
 
-The final DeepSeek dispatch is fixed Q8_0 J64, IQ2_XXS J64/J80, and Q2_K J32 with factor-4 unrolling and J16 small-row tails. The final isolated DeepSeek matrix had 39/39 exact packed-reference checks and won all 24 routed comparisons. Code-object isolation restored the Qwen control after the monolithic translation unit caused layout-sensitive Q5_K movement. The generalized bundle now preserves these kernel bodies and thresholds; packaging details are owned by `docs/kernel_bundle.md`.
+The final DeepSeek dispatch is fixed Q8_0 J64, IQ2_XXS J64/J80, and Q2_K J32 with factor-4 unrolling and J16 small-row tails. The final isolated DeepSeek matrix had 39/39 exact packed-reference checks and won all 24 routed comparisons. Code-object isolation restored the Qwen control after the monolithic translation unit caused layout-sensitive Q5_K movement. The generalized bundle now preserves these kernel bodies and thresholds. Packaging details are owned by `docs/kernel_bundle.md`.
 
 ## Post-bundle retuning decisions
 
@@ -493,7 +485,7 @@ The first candidate staged too few Q8_0 scales and raised independent-reference 
 
 Status: rejected.
 
-A fixed-only lossless workspace permutation remained exact and kept NRMSE at `0.006053-0.006062`. It measured `11.001/44.464/177.121 ms` versus `11.026/44.444/176.981 ms`; the largest movement was only 0.23%, with no durable batch-4 or batch-16 benefit. The extra quantizer/layout branch is not justified.
+A fixed-only lossless workspace permutation remained exact and kept NRMSE at `0.006053-0.006062`. It measured `11.001/44.464/177.121 ms` versus `11.026/44.444/176.981 ms`. The largest movement was only 0.23%, with no durable batch-4 or batch-16 benefit. The extra quantizer/layout branch is not justified.
 
 ### DeepSeek Q2_K scale/min metadata staging
 
@@ -512,13 +504,12 @@ A separate IQ2_S J64 artifact decoded both weight tiles once per output workgrou
 ### TensileLite and Composable Kernel
 
 TensileLite and Composable Kernel were used as generator and interface evidence, not as a performance ceiling. Their durable lessons are:
-
-- fixed-NK specialization removes dynamic scheduler state;
-- compile-time tile and matrix-instruction selection must be measured per type;
-- read, decode, LDS commit, LDS read, and WMMA lifetimes must be bounded;
-- affine SGPR/immediate offsets and pointer increments help exact full tiles;
-- extra LDS stages, C-shuffle, GSU, split-K, and persistent control require a resource and reduction argument;
-- host-built grouped descriptors are incompatible with the device-resident route ABI;
+- fixed-NK specialization removes dynamic scheduler state.
+- compile-time tile and matrix-instruction selection must be measured per type.
+- read, decode, LDS commit, LDS read, and WMMA lifetimes must be bounded.
+- affine SGPR/immediate offsets and pointer increments help exact full tiles.
+- extra LDS stages, C-shuffle, GSU, split-K, and persistent control require a resource and reduction argument.
+- host-built grouped descriptors are incompatible with the device-resident route ABI.
 - direct global-to-LDS does not perform GGUF decode, and activations remain in LDS because all waves reuse them.
 
 The relevant study sources include:
@@ -534,15 +525,14 @@ The useful grouped scheduling result was G8's compact device task list, not a co
 
 ### Compiler and ISA interpretation
 
-Every structural change is judged from the final code object. Source-level local-array intuition was not reliable. Raw ELF offsets, code-object placement, and padding are not optimization signals; normalized disassembly and resource metadata are.
+Every structural change is judged from the final code object. Source-level local-array intuition was not reliable. Raw ELF offsets, code-object placement, and padding are not optimization signals. Normalized disassembly and resource metadata are.
 
 The bundle transformation from `static __global__` bodies to `static __device__ __forceinline__` bodies under exported wrappers preserves compile-time template behavior. Controlled variants changing C++ standard, HIP/Torch defines, `-fPIC`, `-fno-gpu-rdc`, direct-HSACO mode, and related build flags did not explain representative ISA movement. The accepted explanation for the old monolithic movement was code-object layout and resource interaction, which the independent HSACO bundle removes from the arithmetic kernels.
 
 The strict assembly/performance overlap study remains useful as prioritization evidence:
-
-- dense forward: 0/2 strict over-2% overlaps;
-- dense backward: 7/7;
-- grouped forward: 3/3;
+- dense forward: 0/2 strict over-2% overlaps.
+- dense backward: 7/7.
+- grouped forward: 3/3.
 - grouped backward: 4/4.
 
 Assembly movement is therefore useful when it identifies resource or work-decomposition changes, but not as a substitute for complete public-operator timing.
@@ -559,7 +549,7 @@ Assembly movement is therefore useful when it identifies resource or work-decomp
 
 ## Validation and reproducibility
 
-The current source-only workflow keeps HSACOs ignored by Git and materializes them during local extension or wheel builds. Generic artifact, loader, and packaging behavior belongs in `docs/kernel_bundle.md`; this document records only the grouped-forward consequences and dispatch decisions.
+The current source-only workflow keeps HSACOs ignored by Git and materializes them during local extension or wheel builds. Generic artifact, loader, and packaging behavior belongs in `docs/kernel_bundle.md`. This document records only the grouped-forward consequences and dispatch decisions.
 
 The final validation set includes:
 
