@@ -1125,32 +1125,24 @@ std::tuple<Tensor, Tensor> grouped_mmq_pair_cuda(
 
 STABLE_TORCH_LIBRARY(torch_ggml_ops, m) {
     m.def("fixed_grouped_mmq(Tensor input, Tensor packed_weight) -> Tensor");
-    m.def(
-        "fixed_grouped_mmq_grad_input(Tensor grad_output, Tensor packed_weight) -> Tensor");
+    m.def("fixed_grouped_mmq_grad_input(Tensor grad_output, Tensor packed_weight) -> Tensor");
     m.def("mmq(Tensor input, Tensor packed_weight, int quant_type, int out_features) -> Tensor");
-    m.def(
-        "mmq_grad_input(Tensor grad_output, Tensor packed_weight, int quant_type, "
-        "int in_features) -> Tensor");
-    m.def(
-        "grouped_mmq_grad_input(Tensor grad_output, Tensor packed_weight, Tensor expert_indices, "
-        "Tensor expert_offsets, int quant_type, int in_features) -> Tensor");
-    m.def(
-        "grouped_mmq_pair_grad_input(Tensor first_grad_output, Tensor second_grad_output, "
-        "Tensor first_packed_weight, Tensor second_packed_weight, Tensor expert_indices, "
-        "Tensor expert_offsets, int quant_type, int in_features) -> Tensor");
-    m.def(
-        "grouped_mmq(Tensor input, Tensor packed_weight, Tensor expert_indices, "
-        "Tensor expert_offsets, int quant_type, int out_features) -> Tensor");
-    m.def(
-        "grouped_mmq_pair(Tensor input, Tensor first_packed_weight, Tensor second_packed_weight, "
-        "Tensor expert_indices, Tensor expert_offsets, int quant_type, int out_features) -> (Tensor, Tensor)");
+    m.def("mmq_grad_input(Tensor grad_output, Tensor packed_weight, int quant_type, "
+          "int in_features) -> Tensor");
+    m.def("grouped_mmq_grad_input(Tensor grad_output, Tensor packed_weight, Tensor expert_indices, "
+          "Tensor expert_offsets, int quant_type, int in_features) -> Tensor");
+    m.def("grouped_mmq_pair_grad_input(Tensor first_grad_output, Tensor second_grad_output, "
+          "Tensor first_packed_weight, Tensor second_packed_weight, Tensor expert_indices, "
+          "Tensor expert_offsets, int quant_type, int in_features) -> Tensor");
+    m.def("grouped_mmq(Tensor input, Tensor packed_weight, Tensor expert_indices, "
+          "Tensor expert_offsets, int quant_type, int out_features) -> Tensor");
+    m.def("grouped_mmq_pair(Tensor input, Tensor first_packed_weight, Tensor second_packed_weight, "
+          "Tensor expert_indices, Tensor expert_offsets, int quant_type, int out_features) -> (Tensor, Tensor)");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(torch_ggml_ops, CUDA, m) {
     m.impl("fixed_grouped_mmq", TORCH_BOX(&fixed_grouped_mmq_cuda));
-    m.impl(
-        "fixed_grouped_mmq_grad_input",
-        TORCH_BOX(&fixed_grouped_mmq_grad_input_cuda));
+    m.impl("fixed_grouped_mmq_grad_input", TORCH_BOX(&fixed_grouped_mmq_grad_input_cuda));
     m.impl("mmq", TORCH_BOX(&mmq_cuda));
     m.impl("mmq_grad_input", TORCH_BOX(&mmq_grad_input_cuda));
     m.impl("grouped_mmq_grad_input", TORCH_BOX(&grouped_mmq_grad_input_cuda));

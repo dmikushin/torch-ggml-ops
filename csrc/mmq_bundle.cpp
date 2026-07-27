@@ -1,4 +1,5 @@
 #include "mmq_bundle.h"
+
 #include "generated/mmq_bundle_table.cuh"
 
 #include <dlfcn.h>
@@ -18,6 +19,7 @@
 #include <vector>
 
 namespace torch_ggml_ops::mmq_bundle {
+
 namespace {
 
 constexpr int kQuantQ8_0 = 8;
@@ -83,8 +85,7 @@ std::filesystem::path bundle_directory() {
         info.dli_fname == nullptr) {
         fail("dladdr could not locate the extension shared object");
     }
-    return std::filesystem::path(info.dli_fname).parent_path() /
-        "kernels" / "gfx1151";
+    return std::filesystem::path(info.dli_fname).parent_path() / "kernels" / "gfx1151";
 }
 
 std::vector<std::uint8_t> read_artifact(const std::filesystem::path & path) {
@@ -115,25 +116,24 @@ LoadedKernel & resolve_kernel(MMQKernelId id) {
         return *found->second;
     }
 
-    const MMQKernelSpec & spec = mmq_kernel_spec(id);
-    const std::filesystem::path path = bundle_directory() / spec.filename;
+    const char * symbol = mmq_kernel_symbol(id);
+    std::filesystem::path path = bundle_directory() / symbol;
+    path += ".hsaco";
     auto loaded = std::make_unique<LoadedKernel>();
     loaded->image = read_artifact(path);
     const hipError_t load_status = hipModuleLoadData(
         &loaded->module, loaded->image.data());
     if (load_status != hipSuccess) {
-        fail(
-            "hipModuleLoadData failed for " + path.string() + " (" +
-            spec.symbol + "): " + hipGetErrorString(load_status));
+        fail("hipModuleLoadData failed for " + path.string() + " (" + symbol +
+             "): " + hipGetErrorString(load_status));
     }
     const hipError_t function_status = hipModuleGetFunction(
-        &loaded->function, loaded->module, spec.symbol);
+        &loaded->function, loaded->module, symbol);
     if (function_status != hipSuccess) {
         (void)hipModuleUnload(loaded->module);
         loaded->module = nullptr;
-        fail(
-            "hipModuleGetFunction failed for symbol " + std::string(spec.symbol) +
-            " in " + path.string() + ": " + hipGetErrorString(function_status));
+        fail("hipModuleGetFunction failed for symbol " + std::string(symbol) +
+             " in " + path.string() + ": " + hipGetErrorString(function_status));
     }
 
     LoadedKernel & result = *loaded;
@@ -152,7 +152,7 @@ void launch(
         unsigned int shared_memory,
         hipStream_t stream,
         void ** arguments) {
-    const MMQKernelSpec & spec = mmq_kernel_spec(id);
+    const char * symbol = mmq_kernel_symbol(id);
     LoadedKernel & loaded = resolve_kernel(id);
     const hipError_t status = hipModuleLaunchKernel(
         loaded.function,
@@ -167,9 +167,8 @@ void launch(
         arguments,
         nullptr);
     if (status != hipSuccess) {
-        fail(
-            "hipModuleLaunchKernel failed for " + std::string(spec.symbol) +
-            ": " + hipGetErrorString(status));
+        fail("hipModuleLaunchKernel failed for " + std::string(symbol) +
+             ": " + hipGetErrorString(status));
     }
 }
 
@@ -196,7 +195,7 @@ int backward_quant_index(std::int32_t quant_type) {
         case kQuantQ6_K: return 4;
         case kQuantIQ2_S: return 5;
         default: fail("unsupported quant_type " + std::to_string(quant_type) +
-            " for backward MMQ");
+                      " for backward MMQ");
     }
 }
 
@@ -210,7 +209,7 @@ int grouped_backward_quant_index(std::int32_t quant_type) {
         case kQuantIQ2_XXS: return 5;
         case kQuantIQ2_S: return 6;
         default: fail("unsupported quant_type " + std::to_string(quant_type) +
-            " for grouped backward MMQ");
+                      " for grouped backward MMQ");
     }
 }
 
@@ -1344,7 +1343,7 @@ void launch_grouped_backward_row_tasks(
             break;
         default:
             fail("unsupported grouped backward row-task quant_type " +
-                std::to_string(quant_type));
+                 std::to_string(quant_type));
     }
     void * arguments[]{
         &grad_output,

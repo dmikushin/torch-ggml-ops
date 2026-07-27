@@ -1,6 +1,22 @@
 import torch
 
 
+def mmq(
+    input: torch.Tensor,
+    packed_weight: torch.Tensor,
+    quant_type: int,
+    out_features: int,
+) -> torch.Tensor:
+    """Run packed GGUF WnA8 MMQ. Currently supports BF16 input and output."""
+
+    return torch.ops.torch_ggml_ops.mmq.default(
+        input,
+        packed_weight,
+        int(quant_type),
+        int(out_features),
+    )
+
+
 @torch.library.register_fake("torch_ggml_ops::mmq")
 def _mmq_fake(
     input: torch.Tensor,
@@ -34,7 +50,7 @@ def _mmq_backward(ctx, grad_output: torch.Tensor):
     if ctx.needs_input_grad[0]:
         (packed_weight,) = ctx.saved_tensors
         # AOTAutograd may supply a transposed synthetic cotangent. Production
-        # linear cotangents are contiguous; normalize only this autograd-owned
+        # linear cotangents are contiguous. Normalize only this autograd-owned
         # temporary while the public native operator keeps its fail-fast ABI.
         grad_input = torch.ops.torch_ggml_ops.mmq_grad_input.default(
             grad_output.contiguous(),
@@ -62,22 +78,6 @@ torch.library.register_autograd(
     "torch_ggml_ops::mmq_grad_input",
     _mmq_grad_input_backward,
 )
-
-
-def mmq(
-    input: torch.Tensor,
-    packed_weight: torch.Tensor,
-    quant_type: int,
-    out_features: int,
-) -> torch.Tensor:
-    """Run packed GGUF WnA8 MMQ. Currently supports BF16 input and output."""
-
-    return torch.ops.torch_ggml_ops.mmq.default(
-        input,
-        packed_weight,
-        int(quant_type),
-        int(out_features),
-    )
 
 
 __all__ = ["mmq"]
