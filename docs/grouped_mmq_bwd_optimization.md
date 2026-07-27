@@ -2,25 +2,24 @@
 
 ## Current status
 
-Grouped MMQ backward is production-tuned for the current Qwen and DeepSeek GGUF representations on gfx1151. The local kernel optimization pass is complete.
+Grouped MMQ backward is production-tuned for the current Qwen and DeepSeek GGUF representations on gfx1151. The exact FP32-accumulator pass is complete. The approximate-accumulator controls below are also complete. None met the combined numerical, resource, and latency requirements.
 
-Current source-of-record artifacts:
+Current source-of-record artifacts use the target-specific tuned AITER configurations:
 
 ```text
-Qwen final acceptance:     /tmp/grouped_mmq_bwd_qwen_tail_predicate_final_acceptance.json
-DeepSeek final acceptance: /tmp/grouped_mmq_bwd_ds4_tail_predicate_final_acceptance.json
-Qwen historical baseline:  /tmp/grouped_mmq_bwd_baseline_full.json
-Qwen pre-tail final:       /tmp/grouped_mmq_bwd_final_full.json
+Qwen:     /tmp/grouped_mmq_bwd_qwen_aiter_tuned_9.json
+DeepSeek: /tmp/grouped_mmq_bwd_ds4_aiter_tuned_9.json
 ```
 
 Latest outcome:
-- Qwen packed kernels win 35/60 individual case, batch, and routing points against predecoded BF16 AITER GMM.
-- Both Qwen fused gate/up families win all 24 points. The checkpoint-weighted Qwen estimate wins all 12 batch/routing combinations by `1.255-2.159x`.
-- DeepSeek wins all 27 references: fixed Q8_0 wins 3/3 against BF16 BMM, routed IQ2_XXS wins 12/12, and routed Q2_K wins 12/12 against predecoded BF16 AITER.
-- The checkpoint-weighted DeepSeek estimate wins all 12 batch/routing combinations by `1.453-2.067x`.
+- Qwen packed kernels win 33/60 individual case, batch, and routing points against predecoded BF16 AITER GMM.
+- Both Qwen fused gate/up families win all 24 points. The checkpoint-weighted Qwen estimate wins all 12 batch/routing combinations by `1.165-1.724x`.
+- DeepSeek fixed Q8_0 wins 3/3 against BF16 BMM. Routed IQ2_XXS wins 7/12 and routed Q2_K wins 5/12 against predecoded BF16 AITER.
+- Including fixed output A, the checkpoint-weighted DeepSeek estimate wins all B1 points by `1.247-1.324x`, is near parity at B4 (`0.979-1.014x`), and trails at B16 (`0.704-0.718x`).
 - Every retained specialized kernel has zero private storage, zero VGPR spills, zero SGPR spills, and no dynamic stack.
-- The complete gfx1151 bundle contains 118 kernels, including 32 grouped-backward entries. HSACOs are generated from source and are not committed.
-- Remaining work is limited to a separate model-owned compact representation for Qwen Q4_K/IQ2_S single-down weights. No local kernel experiment remains pending, and DeepSeek should stay packed.
+- The complete gfx1151 bundle contains 179 kernels, including 32 grouped-backward entries. HSACOs are generated from source and are not committed.
+- Direct BF16-C, BF16 slab, and normalized FP16-C controls are complete and rejected. Production continues to dispatch exact FP32 accumulation.
+- Prepared-weight work remains a separate model-owned project with explicit lifetime, invalidation, memory, cold-start, and sharing requirements.
 
 ## Latest results
 
@@ -30,11 +29,11 @@ The latest Qwen matrix uses `~/models/qwen3.6/Qwen3.6-35B-A3B-APEX-I-Mini.gguf` 
 
 | Family | Wins | Reference/packed latency range | Median | Packed latency by batch |
 | --- | ---: | ---: | ---: | --- |
-| Fused Q3_K gate/up | 12/12 | `1.596-3.006x` | `2.236x` | B1 `3.650-5.701 ms`, B4 `10.736-14.242 ms`, B16 `46.298-49.892 ms` |
-| Fused IQ2_S gate/up | 12/12 | `1.451-2.926x` | `2.175x` | B1 `4.076-6.171 ms`, B4 `10.885-14.703 ms`, B16 `46.758-49.303 ms` |
-| IQ2_S down | 1/12 | `0.813-1.294x` | `0.936x` | B1 `3.483-4.496 ms`, B4 `9.779-10.481 ms`, B16 `33.925-35.199 ms` |
-| Q4_K down | 4/12 | `0.795-1.360x` | `0.940x` | B1 `3.551-4.257 ms`, B4 `9.701-9.917 ms`, B16 `33.034-33.824 ms` |
-| Q5_K down | 6/12 | `0.814-1.310x` | `1.008x` | B1 `3.737-4.011 ms`, B4 `9.498-10.096 ms`, B16 `33.128-33.437 ms` |
+| Fused Q3_K gate/up | 12/12 | `1.448-2.335x` | `1.846x` | B1 `3.672-5.740 ms`, B4 `10.717-14.224 ms`, B16 `46.307-50.024 ms` |
+| Fused IQ2_S gate/up | 12/12 | `1.458-2.113x` | `1.774x` | B1 `4.070-6.187 ms`, B4 `10.838-14.636 ms`, B16 `46.420-49.232 ms` |
+| IQ2_S down | 3/12 | `0.711-1.393x` | `0.775x` | B1 `3.534-4.523 ms`, B4 `9.799-10.440 ms`, B16 `33.986-35.046 ms` |
+| Q4_K down | 3/12 | `0.753-1.468x` | `0.835x` | B1 `3.541-4.260 ms`, B4 `9.659-9.850 ms`, B16 `32.623-33.300 ms` |
+| Q5_K down | 3/12 | `0.740-1.493x` | `0.852x` | B1 `3.682-3.965 ms`, B4 `9.493-9.921 ms`, B16 `32.596-32.951 ms` |
 
 Q4_K and Q5_K include the final inactive-M row-task suppression. Relative to sequential 25-repeat false controls:
 - Q4_K improves every B4/B16 point by `5.27-11.60%`, with a `9.16%` geometric gain.
@@ -45,18 +44,18 @@ Checkpoint-weighted Qwen estimate, covering the five grouped-backward families a
 
 | Batch | Route | Packed ms | AITER ms | Speedup |
 | ---: | --- | ---: | ---: | ---: |
-| 1 | uniform | 307.4 | 574.2 | 1.868x |
-| 1 | skewed | 411.6 | 579.1 | 1.407x |
-| 1 | sparse | 381.2 | 478.5 | 1.255x |
-| 1 | boundary | 397.7 | 582.6 | 1.465x |
-| 4 | uniform | 826.7 | 1,339.3 | 1.620x |
-| 4 | skewed | 977.5 | 1,589.8 | 1.626x |
-| 4 | sparse | 958.6 | 1,511.8 | 1.577x |
-| 4 | boundary | 985.8 | 1,618.7 | 1.642x |
-| 16 | uniform | 3,200.5 | 6,908.3 | 2.159x |
-| 16 | skewed | 3,353.8 | 7,002.3 | 2.088x |
-| 16 | sparse | 3,351.2 | 7,088.9 | 2.115x |
-| 16 | boundary | 3,350.2 | 6,979.1 | 2.083x |
+| 1 | uniform | 312.7 | 466.9 | 1.493x |
+| 1 | skewed | 413.3 | 566.6 | 1.371x |
+| 1 | sparse | 383.0 | 595.8 | 1.556x |
+| 1 | boundary | 399.9 | 569.6 | 1.424x |
+| 4 | uniform | 823.9 | 1,090.3 | 1.323x |
+| 4 | skewed | 976.0 | 1,604.3 | 1.644x |
+| 4 | sparse | 960.5 | 1,556.8 | 1.621x |
+| 4 | boundary | 978.8 | 1,687.3 | 1.724x |
+| 16 | uniform | 3,186.7 | 3,738.0 | 1.173x |
+| 16 | skewed | 3,330.1 | 3,929.0 | 1.180x |
+| 16 | sparse | 3,346.3 | 3,899.5 | 1.165x |
+| 16 | boundary | 3,340.1 | 3,985.4 | 1.193x |
 
 The isolated single-down deficits do not overturn the checkpoint-weighted result. The fused pair families dominate the aggregate win because each combines two projections, keeps one FP32 accumulator set, rounds once, and allocates one output.
 
@@ -66,28 +65,28 @@ The latest DeepSeek matrix uses `~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf`. Ro
 
 | Family | Wins | Reference/packed latency range | Median | Packed latency by batch |
 | --- | ---: | ---: | ---: | --- |
-| Fixed Q8_0 output-A | 3/3 | `1.154-1.225x` | `1.193x` | B1 `6.146 ms`, B4 `25.460 ms`, B16 `97.206 ms` |
-| Fused IQ2_XXS gate/up | 12/12 | `1.531-2.401x` | `1.993x` | B1 `30.966-35.551 ms`, B4 `104.728-116.506 ms`, B16 `436.487-450.460 ms` |
-| Q2_K down | 12/12 | `1.267-2.157x` | `1.614x` | B1 `18.934-21.931 ms`, B4 `50.027-51.971 ms`, B16 `173.735-186.494 ms` |
+| Fixed Q8_0 output-A | 3/3 | `1.164-1.222x` | `1.177x` | B1 `6.171 ms`, B4 `24.936 ms`, B16 `96.303 ms` |
+| Fused IQ2_XXS gate/up | 7/12 | `0.599-1.483x` | `1.038x` | B1 `30.406-34.878 ms`, B4 `101.652-112.845 ms`, B16 `430.977-446.138 ms` |
+| Q2_K down | 5/12 | `0.692-1.128x` | `0.826x` | B1 `18.525-21.184 ms`, B4 `47.993-49.665 ms`, B16 `174.583-187.766 ms` |
 
 Checkpoint-weighted DeepSeek estimate includes 43 calls each of fixed output-A, fused gate/up, and routed down:
 
 | Batch | Route | Packed ms | BF16 reference ms | Speedup |
 | ---: | --- | ---: | ---: | ---: |
-| 1 | uniform | 2,410.0 | 4,981.5 | 2.067x |
-| 1 | skewed | 2,736.0 | 4,981.1 | 1.821x |
-| 1 | sparse | 2,596.0 | 3,909.4 | 1.506x |
-| 1 | boundary | 2,566.0 | 4,986.2 | 1.943x |
-| 4 | uniform | 7,806.5 | 11,342.8 | 1.453x |
-| 4 | skewed | 8,286.1 | 13,060.8 | 1.576x |
-| 4 | sparse | 8,149.6 | 12,799.8 | 1.571x |
-| 4 | boundary | 8,339.3 | 12,548.6 | 1.505x |
-| 16 | uniform | 30,419.4 | 59,413.1 | 1.953x |
-| 16 | skewed | 31,335.3 | 59,868.4 | 1.911x |
-| 16 | sparse | 31,477.9 | 58,700.3 | 1.865x |
-| 16 | boundary | 31,545.3 | 61,703.8 | 1.956x |
+| 1 | uniform | 2,369.4 | 3,137.4 | 1.324x |
+| 1 | skewed | 2,676.0 | 3,513.7 | 1.313x |
+| 1 | sparse | 2,566.2 | 3,347.9 | 1.305x |
+| 1 | boundary | 2,515.7 | 3,138.0 | 1.247x |
+| 4 | uniform | 7,574.2 | 7,683.5 | 1.014x |
+| 4 | skewed | 8,008.7 | 7,865.5 | 0.982x |
+| 4 | sparse | 7,863.4 | 7,698.5 | 0.979x |
+| 4 | boundary | 8,060.2 | 8,164.9 | 1.013x |
+| 16 | uniform | 30,180.1 | 21,312.0 | 0.706x |
+| 16 | skewed | 30,866.2 | 22,170.3 | 0.718x |
+| 16 | sparse | 31,272.8 | 22,010.5 | 0.704x |
+| 16 | boundary | 31,308.9 | 22,066.3 | 0.705x |
 
-DeepSeek does not need an expanded decoded representation. Every packed family already beats its ideal predecoded BF16 arithmetic reference before decode allocation or cache management is added.
+The tuned predecoded reference is now faster for most DeepSeek B4 routed points and all B16 routed points. This is evidence for a model-owned prepared representation, not an operator-internal hidden cache: the reference still excludes decode, storage, invalidation, and preparation costs.
 
 ## Scope and contracts
 
@@ -187,11 +186,11 @@ For Qwen 128-row tasks, expert-local task counts grow from 192-257 at B1 to 512-
 
 ### BF16 references
 
-Routed performance uses AITER Triton `gmm` configured by the benchmark-owned `bench/aiter_gmm_heuristics.py` `gmm_config`. Fixed Q8_0 uses BF16 BMM in the public fixed-group layout.
+Routed performance uses AITER Triton `gmm` configured by the benchmark-owned `bench/aiter_gmm_heuristics.py` exact table. Dispatch keys include total routed rows, K, N, and RHS layout. Unsupported shapes fail closed. Backward uses contiguous row-major logical weights. Fixed Q8_0 uses BF16 BMM in the public fixed-group layout.
 
 The timed references start with independently dequantized BF16 weights. Dequantization and active-expert selection are setup costs and are not included. This makes AITER an ideal predecoded arithmetic reference, not a complete packed-weight alternative.
 
-The Qwen heuristic selects M128/N128/K64 with 256 threads and 256 persistent programs for gate/up, and M64/N128/K64 with 256 threads and 256 persistent programs for down. AITER is a production reference, not a performance ceiling.
+The table contains target-specific B1/B4/B16 configurations for both Qwen and DeepSeek rather than a shape-only heuristic. AITER is a production reference, not a performance ceiling.
 
 For fused pairs, AITER runs two GMM calls and adds two BF16 outputs. It is the production performance reference but not a bitwise numerical oracle because the packed pair accumulates both projections in FP32 and rounds once.
 
@@ -224,7 +223,7 @@ PYTHONPATH=. python bench/benchmark_grouped_mmq_bwd.py \
   --batches 1,4,16 \
   --distributions uniform,skewed,sparse,boundary \
   --warmup 3 --repeats 9 \
-  --output /tmp/grouped_mmq_bwd_qwen_tail_predicate_final_acceptance.json
+  --output /tmp/grouped_mmq_bwd_qwen_aiter_tuned_9.json
 
 PYTHONPATH=. python bench/benchmark_grouped_mmq_bwd.py \
   --model ~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf \
@@ -232,7 +231,7 @@ PYTHONPATH=. python bench/benchmark_grouped_mmq_bwd.py \
   --batches 1,4,16 \
   --distributions uniform,skewed,sparse,boundary \
   --warmup 3 --repeats 9 \
-  --output /tmp/grouped_mmq_bwd_ds4_tail_predicate_final_acceptance.json
+  --output /tmp/grouped_mmq_bwd_ds4_aiter_tuned_9.json
 ```
 
 ## Production implementation
@@ -334,7 +333,9 @@ Qwen row-task metadata adds only about 9-10 KiB at batch 4 and 27-28 KiB at batc
 
 ### Local kernel work
 
-No evidence-backed local grouped-backward experiment remains pending.
+No evidence-backed local grouped-backward experiment remains pending. The approximate-accumulator sequence is also complete: direct paired BF16-C, K32/K64 FP32 slabs into BF16 state, and normalized paired FP16-C all failed accuracy, resource, or public-latency requirements.
+
+Wider-N approximate bodies and exact-grid static persistent scheduling remain conditional, not active work. Reopen them only after a new arithmetic mechanism first demonstrates lower register use, acceptable real-weight and dynamic-range error, zero private storage and spills, and better complete-operator latency in an existing N64 body. If that prerequisite is met, evaluate N128/N256 exact shapes before static grids from `{20,40,80,160,256}`. Keep batch-1 sparse dispatch unchanged until measured evidence supports a boundary.
 
 The following neighborhoods are closed by direct controls:
 - Runtime full/tail branching and split full/tail task lists.
@@ -368,7 +369,7 @@ Already rejected representation controls:
 - One transient projection needs 512 MiB of BF16 workspace and 528-768 MiB incremental peak memory.
 - Persistent BF16 shadows require 19 GiB for the remaining Q4_K/IQ2_S down tensors and 60 GiB for all benchmarked Qwen expert projections.
 - Persistent expansion is 6.24x for IQ2_S and 3.56x for Q4_K over GGUF storage.
-- Ideal predecoded AITER saves only 22.1 ms model-wide at B1 and 43.9 ms at B4 for the two down families, then loses 401.1 ms at B16.
+- For the Q4_K/IQ2_S down families, tuned predecoded AITER saves `15.6-33.2 ms` model-wide at B1 and `311.3-338.7 ms` at B16. B4 depends on routing: AITER saves `90.3 ms` for uniform routing, while packed wins the three nonuniform routes by `121.3-163.5 ms`.
 
 Acceptance gates for a compact representation:
 - Preserve lossless GGUF semantics and BF16 public inputs/outputs.
@@ -379,7 +380,7 @@ Acceptance gates for a compact representation:
 - Preserve pair one-rounding and output allocation when pair families use the representation.
 - State cold-call and steady-state memory/latency explicitly.
 
-DeepSeek should remain packed. Its kernels already beat ideal predecoded references at every measured point.
+DeepSeek remains packed in the current API, but the tuned predecoded reference now wins most B4 routed points and all B16 routed points. Any prepared alternative still requires explicit model-owned lifetime, invalidation, memory accounting, cold-start timing, and forward/backward sharing.
 
 ## Optimization logs
 
@@ -618,6 +619,21 @@ Artifacts:
 
 ## Rejected and closed experiments
 
+### Approximate accumulators
+
+The DeepSeek Q2_K M128/N64 controls kept FP32 and reduced-precision accumulation as separate generator problem types. The public default remained FP32 throughout.
+
+| Candidate | Resources | Accuracy and timing | Decision |
+| --- | --- | --- | --- |
+| Direct paired BF16-C | 122 VGPR, 31 SGPR, 4,096-byte LDS, no private storage or spills | `0.86089` NRMSE at 513 rows | Rejected for accuracy. Unpaired BF16-C reproduced the error, ruling out `op_sel` packing and stores |
+| Full-N K32/K64 FP32 slabs into BF16 | 256 VGPR, 647/2,069 spills, 1,568/5,248 private bytes | Not timed after the resource failure | Rejected by the production resource gate |
+| Pair-serial K32/K64 slabs | 215/212 VGPR, no private storage or spills | `0.01343/0.00959` NRMSE and `253.624/343.433 ms` versus `187.805 ms` FP32 | Rejected for 35.0%/82.9% latency regressions and higher register use |
+| Row-normalized paired FP16-C | 156 VGPR, 22 SGPR, 5,120-byte LDS, no private storage or spills | `0.00723-0.00727` NRMSE from input scale `1e-8` through `1e8`. `1,013.393 ms` with scaling and `250.303 ms` without the scale scan | Rejected. Even the no-scan lower bound was 33.3% slower |
+
+A standalone all-ones K16 chain explained the BF16 failure: output increased by 16 through 32 instructions, reached 512, and then remained at 512 through 128 instructions. Native BF16-C loses small products as persistent magnitude grows, so software probes that round a completed K16 dot product understated hardware error. No reduced-precision body improved registers and latency under an acceptable numerical contract, and all experiment code was reverted.
+
+### Earlier controls
+
 | Family | Candidate | Decision and reason |
 | --- | --- | --- |
 | Qwen common | Universal S2 | Half-empty 64-row groups regressed uniform B1 |
@@ -668,14 +684,14 @@ Do not replace fused pairs with two public outputs plus `torch.add`. That change
 
 ## Validation and packaging
 
-Final validation after the retained tail controls:
-- `67 passed, 14 warnings` from `PYTHONPATH=. pytest -q`.
+Final validation after consolidation and the retained controls:
+- `88 passed, 14 warnings` from the complete GPU suite.
 - Ruff and compileall pass.
 - `git diff --check` passes.
 - The in-tree extension builds successfully.
 - All resource-gated kernels pass zero-private, zero-spill, and no-dynamic-stack checks.
 - Two independent all-core builds pass `--verify-reproducible`.
-- Bundle freshness reports 118 current kernels.
+- Bundle freshness reports 179 current kernels.
 - Qwen 60-point and DeepSeek 27-point final acceptance matrices pass correctness.
 
 Validation commands:
@@ -707,8 +723,8 @@ The current bundle has 32 grouped-backward entries:
 ### Latest acceptance
 
 ```text
-/tmp/grouped_mmq_bwd_qwen_tail_predicate_final_acceptance.json
-/tmp/grouped_mmq_bwd_ds4_tail_predicate_final_acceptance.json
+/tmp/grouped_mmq_bwd_qwen_aiter_tuned_9.json
+/tmp/grouped_mmq_bwd_ds4_aiter_tuned_9.json
 /tmp/grouped_mmq_bwd_qwen_rowtask_tail_predicate_control_false_25.json
 /tmp/grouped_mmq_bwd_qwen_rowtask_tail_predicate_control_true_25.json
 /tmp/grouped_mmq_bwd_ds4_iq2xxs_tail_predicate_baseline_25.json
@@ -720,6 +736,12 @@ The current bundle has 32 grouped-backward entries:
 ### DeepSeek retained and rejected controls
 
 ```text
+/tmp/grouped_bwd_bf16_c_control_accuracy.json
+/tmp/grouped_bwd_bf16_c_candidate_accuracy.json
+/tmp/grouped_bwd_bf16_c_k32_9.json
+/tmp/grouped_bwd_bf16_c_k64_9.json
+/tmp/grouped_bwd_fp16_c_scaled_9.json
+/tmp/grouped_bwd_fp16_c_no_scale_floor_9.json
 /tmp/grouped_mmq_bwd_ds4_baseline_b1_b4.json
 /tmp/grouped_mmq_bwd_ds4_q80_m256_control_25.json
 /tmp/grouped_mmq_bwd_ds4_q80_m128_control_25.json

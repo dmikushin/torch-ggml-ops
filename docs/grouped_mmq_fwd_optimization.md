@@ -9,23 +9,23 @@ This document is the source of truth for grouped MMQ forward kernel behavior, di
 
 Dense MMQ forward and backward are documented separately in `docs/mmq_fwd_optimization.md` and `docs/mmq_bwd_optimization.md`. The generic HSACO bundle and loader contract are documented in `docs/kernel_bundle.md`.
 
-The bounded local optimization pass is complete for the current Qwen and DeepSeek packed representations. The retained dispatch is exact, resource-clean for all enforced production entries, and has no pending tile, scheduler, bounds, prefetch, LDS-cache, or synchronization sweep. Further gains require a representation-level change.
+The local kernel pass is complete for the current Qwen and DeepSeek packed representations. The retained dispatch is exact and resource-clean for all enforced production entries. Backward reduced-precision controls closed the approximate-accumulator prerequisite before forward implementation. Prepared-weight work remains outside this repository-local pass.
 
-Current source-of-record matrices are the latest same-build retuning artifacts:
+Current source-of-record matrices use the target-specific tuned AITER configurations:
 
 ```text
-/tmp/grouped_mmq_fwd_qwen_retuning_final_9.json
-/tmp/grouped_mmq_fwd_ds4_retuning_final_9.json
+/tmp/grouped_mmq_fwd_qwen_aiter_tuned_9.json
+/tmp/grouped_mmq_fwd_ds4_aiter_tuned_9.json
 ```
 
-They use warmup 3, 9 sequential repeats, correctness rows 256, and the consolidated MMQ bundle. Older G11, G14, G15, and pre-bundle artifacts remain below as historical evidence, but are not current aggregate performance controls.
+They use warmup 3, 9 sequential repeats, correctness rows 256, and the consolidated MMQ bundle.
 
-| Model | Matrix | Packed-reference checks | Reference wins | Remaining reference losses |
+| Model | Matrix | Packed-reference checks | Packed wins | Remaining packed losses |
 |---|---:|---:|---:|---|
-| Qwen | 60 points | 84/84 exact | 54/60 vs BF16 AITER | Six nonuniform IQ2_S down points at batches 1 and 4 |
-| DeepSeek-V4-Flash | 27 points | 39/39 exact | 24/24 routed points vs AITER | Fixed Q8_0 output A remains slower than BF16 BMM |
+| Qwen | 60 points | 84/84 exact | 45/60 vs BF16 AITER | IQ2_S gate/up at B16 and IQ2_S down except B1 uniform |
+| DeepSeek-V4-Flash | 27 points | 39/39 exact | 12/24 routed points vs AITER | Gate/up at B16, down at B4/B16, and fixed Q8_0 output A |
 
-The latest 9-repeat results show the same qualitative conclusions as the bracketed 25-repeat controls: Qwen wins every gate/up and Q4_K/Q5_K down point. DeepSeek wins every routed point. Fixed Q8_0 is a stable representation gap rather than a launch or compiler-layout issue.
+Qwen still wins every Q3_K gate/up and Q4_K/Q5_K down point. The tuned reference exposes B16 IQ2_S gate/up and broader IQ2_S down deficits. DeepSeek wins all routed B1 points and all gate/up B4 points, but AITER wins all routed B16 points and all down B4 points. Fixed Q8_0 remains slower than BF16 BMM.
 
 ## Retained production dispatch
 
@@ -102,7 +102,7 @@ Output A consumes logical input `[..., 8, 4096]` and preserves eight independent
 
 `bench/benchmark_grouped_mmq_fwd.py` records complete packed latency, logical throughput, incremental allocation, packed shapes, quant type, route statistics, reference latency, dense-MMQ exactness, independent-reference error, and checkpoint-weighted estimates.
 
-Routed references are BF16 AITER Triton GMM with the benchmark-owned `bench/aiter_gmm_heuristics.py` `gmm_config`. Active weights are independently dequantized during setup, not in the timed reference. The fixed output-A reference is BF16 `torch.bmm` over eight groups and includes public-layout conversion. AITER and BMM are references, not a claim about the maximum possible packed throughput.
+Routed references are BF16 AITER Triton GMM with the benchmark-owned `bench/aiter_gmm_heuristics.py` exact configuration table. Dispatch keys include total routed rows, K, N, and RHS layout. Unsupported shapes fail closed. Forward uses the transposed logical-weight view. Active weights are independently dequantized during setup, not in the timed reference. The fixed output-A reference is BF16 `torch.bmm` over eight groups and includes public-layout conversion. AITER and BMM are references, not a claim about the maximum possible packed throughput.
 
 The four deterministic routing distributions are:
 - `uniform`: all 256 experts active with equal group sizes.
@@ -130,51 +130,51 @@ The current matrices can be reproduced with:
 PYTHONPATH=. python bench/benchmark_grouped_mmq_fwd.py \\
   --model ~/models/qwen3.6/Qwen3.6-35B-A3B-APEX-I-Mini.gguf \\
   --model-family qwen --warmup 3 --repeats 9 --correctness-rows 256 \\
-  --output /tmp/grouped_mmq_fwd_qwen_retuning_final_9.json
+  --output /tmp/grouped_mmq_fwd_qwen_aiter_tuned_9.json
 
 PYTHONPATH=. python bench/benchmark_grouped_mmq_fwd.py \\
   --model ~/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf \\
   --model-family deepseek --warmup 3 --repeats 9 --correctness-rows 256 \\
-  --output /tmp/grouped_mmq_fwd_ds4_retuning_final_9.json
+  --output /tmp/grouped_mmq_fwd_ds4_aiter_tuned_9.json
 ```
 
 ## Latest evaluation
 
 ### Qwen
 
-The latest artifact is `/tmp/grouped_mmq_fwd_qwen_retuning_final_9.json`. It contains 60 points from five cases, three physical batches, and four distributions. The table below shows uniform routing for compact comparison. The win count covers all four distributions.
+The latest artifact is `/tmp/grouped_mmq_fwd_qwen_aiter_tuned_9.json`. It contains 60 points from five cases, three physical batches, and four distributions. The table below shows uniform routing for compact comparison. The win count covers all four distributions.
 
 | Case | Batch 1 packed/reference ms | Batch 4 packed/reference ms | Batch 16 packed/reference ms | Wins |
 |---|---:|---:|---:|---:|
-| Gate/up Q3_K | `3.687/13.393` | `14.889/34.426` | `60.372/91.313` | 12/12 |
-| Gate/up IQ2_S | `4.518/13.320` | `17.606/34.681` | `72.516/94.723` | 12/12 |
-| Down IQ2_S | `2.289/3.590` | `7.222/7.871` | `28.629/44.660` | 6/12 |
-| Down Q4_K | `1.646/3.593` | `5.941/7.927` | `23.967/44.618` | 12/12 |
-| Down Q5_K | `1.785/3.620` | `6.012/7.940` | `23.739/45.095` | 12/12 |
+| Gate/up Q3_K | `3.825/8.471` | `14.759/21.595` | `58.152/60.225` | 12/12 |
+| Gate/up IQ2_S | `4.497/8.471` | `17.427/21.596` | `68.014/60.144` | 8/12 |
+| Down IQ2_S | `2.316/2.854` | `7.270/6.138` | `27.484/24.242` | 1/12 |
+| Down Q4_K | `1.611/2.851` | `5.920/6.217` | `23.674/24.526` | 12/12 |
+| Down Q5_K | `1.793/2.862` | `6.012/6.201` | `23.486/24.363` | 12/12 |
 
-Qwen packed arithmetic matches dense packed MMQ exactly at all 84 pair/single checks. Independent BF16-reference NRMSE is `0.00597-0.01653` across the matrix, consistent with the quantization-specific envelopes. The six losses are exactly the skewed, sparse, and boundary IQ2_S down points at batches 1 and 4. Uniform IQ2_S down remains ahead.
+Qwen packed arithmetic matches dense packed MMQ exactly at all 84 pair/single checks. Independent BF16-reference NRMSE is `0.00597-0.01653` across the matrix, consistent with the quantization-specific envelopes. Q3_K gate/up and Q4_K/Q5_K down win all 36 points. IQ2_S gate/up wins B1/B4 and loses all four B16 points. IQ2_S down wins only B1 uniform.
 
-The latest checkpoint-weighted grouped projection estimate is faster than the AITER estimate in every measured bucket. Across the four distributions, the packed/reference speedup ranges are approximately:
+Across the four distributions, checkpoint-weighted packed/reference speedup ranges are:
 
 | Physical batch | Packed/reference speedup range |
 |---:|---:|
-| 1 | `1.94-2.79x` |
-| 4 | `1.73-1.86x` |
-| 16 | `1.40-1.49x` |
+| 1 | `1.540-1.846x` |
+| 4 | `1.125-1.224x` |
+| 16 | `0.954-0.973x` |
 
 The estimate covers checkpoint projection-call counts and two checkpointed executions per optimizer step. It excludes routing, activation functions, LoRA, and unrelated model work.
 
 ### DeepSeek-V4-Flash
 
-The latest artifact is `/tmp/grouped_mmq_fwd_ds4_retuning_final_9.json`. It contains 27 points: three fixed output-A points, 12 routed gate/up points, and 12 routed down points. The table shows uniform routing for the routed cases.
+The latest artifact is `/tmp/grouped_mmq_fwd_ds4_aiter_tuned_9.json`. It contains 27 points: three fixed output-A points, 12 routed gate/up points, and 12 routed down points. The table shows uniform routing for the routed cases.
 
 | Case | Batch 1 packed/reference ms | Batch 4 packed/reference ms | Batch 16 packed/reference ms | Wins |
 |---|---:|---:|---:|---:|
-| Fixed output A Q8_0 | `11.046/8.352` | `44.951/34.009` | `178.544/134.235` | 0/3 vs BMM |
-| Gate/up IQ2_XXS | `34.857/72.819` | `88.087/137.693` | `344.866/670.838` | 12/12 vs AITER |
-| Down Q2_K | `19.569/40.339` | `73.933/83.190` | `296.717/430.796` | 12/12 vs AITER |
+| Fixed output A Q8_0 | `10.957/8.413` | `44.351/33.156` | `175.233/128.155` | 0/3 vs BMM |
+| Gate/up IQ2_XXS | `33.498/54.272` | `81.320/126.065` | `321.699/314.718` | 8/12 vs AITER |
+| Down Q2_K | `18.151/25.873` | `68.101/51.498` | `278.992/141.815` | 4/12 vs AITER |
 
-All 39 fixed and paired projection checks are exact against dense packed MMQ. Independent BF16-reference NRMSE is `0.00602-0.01140`. Across route distributions, checkpoint-weighted packed/reference speedups are approximately `1.57-2.08x` at batch 1, `1.22-1.36x` at batch 4, and `1.64-1.83x` at batch 16. Fixed Q8_0 remains `0.75-0.76x` the BMM reference at all three batches.
+All 39 fixed and paired projection checks are exact against dense packed MMQ. Independent BF16-reference NRMSE is `0.00602-0.01140`. Including fixed output A, checkpoint-weighted packed/reference ratios are `1.403-1.632x` at batch 1, `0.964-1.087x` at batch 4, and `0.708-0.759x` at batch 16. Fixed Q8_0 remains `0.73-0.77x` the BMM reference.
 
 The earlier isolated accepted DeepSeek artifact and same-build Qwen control remain useful for code-object provenance:
 
@@ -183,11 +183,11 @@ The earlier isolated accepted DeepSeek artifact and same-build Qwen control rema
 /tmp/grouped_mmq_fwd_qwen_post_ds4_isolated_final.json
 ```
 
-They are superseded as current source-of-record timing by the consolidated-bundle retuning artifacts above.
+They are superseded as current source-of-record timing by the tuned-reference artifacts above.
 
 ### Resource status
 
-The generalized bundle contains 108 packaged HSACOs. All enforced production resource gates pass with zero private bytes, zero VGPR/SGPR spills, and no dynamic stack. The broad all-artifact scan still reports known fallback spills. Those fallback artifacts are not part of the production zero-spill contract.
+The complete bundle contains 179 source-built HSACOs. All enforced production resource gates pass with zero private bytes, zero VGPR/SGPR spills, and no dynamic stack. The broad all-artifact scan still reports known fallback spills. Those fallback artifacts are not part of the production zero-spill contract.
 
 Representative retained arithmetic allocations from the retuning pass are:
 
@@ -204,9 +204,11 @@ The Qwen row-task and Qwen down J64 entries are also enforced and spill-free. Ex
 
 ## Remaining bottleneck and work boundary
 
-No additional local schedule change is justified for the current packed representations.
+No additional local schedule or accumulator change is justified for the current packed representations. Backward established that direct native BF16-C is numerically invalid for long reductions, K32/K64 FP32 slabs increase resources and latency, and normalized FP16-C remains 33.3% slower even when scale calculation is removed. Forward approximate accumulation, wider J tiles based on reclaimed registers, and static persistent scheduling are therefore closed at their prerequisite.
 
-The remaining Qwen deficit is nonuniform IQ2_S down at batches 1 and 4. Down launches many output tiles per active expert, so each partial row tile repeats IQ2_S metadata interpretation, grid lookup, scale formation, packed load, and BF16 decoded-weight construction. G11 removed row division and source reconstruction from the partial activation load, but the WMMA tile still computes zero-padded rows and the packed weights still must be decoded for that tile. AITER starts from BF16 weights and avoids this decode cost.
+Reopen that sequence only after a new arithmetic mechanism demonstrates lower register use, acceptable real-weight and dynamic-range error, zero private storage and spills, and better public backward latency in an existing N64 body. Forward must then measure its existing geometry first, preserve integer MMQ and Q8_1 workspace semantics, and test only DeepSeek Q2_K J64, DeepSeek IQ2_XXS J128, or Qwen IQ2_S J128 where the latest B16 results justify it. Static grids from `{20,40,80,160,256}` come last.
+
+The tuned reference exposes representation deficits in Qwen IQ2_S down, Qwen IQ2_S gate/up at B16, DeepSeek Q2_K at B4/B16, and DeepSeek IQ2_XXS gate/up at B16. Partial routed tiles repeat packed metadata interpretation, scale formation, packed loads, and BF16 decoded-weight construction. The retained kernels have already removed unnecessary row decomposition and bounded-tail work, while AITER begins from predecoded BF16 weights.
 
 DeepSeek fixed Q8_0 is also representation-limited. The complete public operator remains slower than BMM because the comparison begins from already dequantized BF16 weights. Quantization is not the dominant cost: accepted traces put multiplication at roughly 87-99% of retained operator kernel time depending on family and batch.
 
@@ -232,7 +234,7 @@ Closed directions for the current representation:
 
 ## Historical optimization log
 
-The entries below are ordered by experiment rather than by the current implementation structure. A rejected entry records the reason it must not be silently retried. Timing values are historical controls and should not be compared directly with the latest retuning artifacts across different builds or instruction-cache states.
+The entries below are ordered by experiment rather than by the current implementation structure. A rejected entry records the reason it must not be silently retried. Timing values are historical controls and should not be compared directly with the latest tuned-reference artifacts across different builds or instruction-cache states.
 
 ### Baseline diagnosis
 
@@ -411,7 +413,7 @@ The old standalone matrices were:
 /tmp/grouped_mmq_fwd_qwen_kernel_bundle_final.json
 ```
 
-They established the current Qwen/DeepSeek shape-specific direction but are superseded for aggregate timing by the latest retuning artifacts at the top of this document.
+They established the current Qwen/DeepSeek shape-specific direction but are superseded for aggregate timing by the latest tuned-reference artifacts at the top of this document.
 
 ## DeepSeek phase log
 
@@ -468,6 +470,12 @@ The final DeepSeek dispatch is fixed Q8_0 J64, IQ2_XXS J64/J80, and Q2_K J32 wit
 ## Post-bundle retuning decisions
 
 These experiments were run after the standalone bundle conversion and are the final local retuning pass.
+
+### Approximate-accumulator prerequisite
+
+Status: closed before forward implementation.
+
+Backward tested the prerequisite mechanisms in a DeepSeek Q2_K M128/N64 body. Direct paired BF16-C reduced VGPR use but produced `0.86089` NRMSE. Resource-clean pair-serial K32/K64 BF16-state slabs regressed latency by 35.0%/82.9% while using more VGPRs. Row-normalized paired FP16-C remained scale-stable but used more VGPRs and was 33.3% slower even after removing the row-scale scan. No low-register arithmetic body survived, so copying these mechanisms into forward K128 sum arrays or using them to reopen J128 and persistent scheduling was not justified.
 
 ### Q5_K mixed J64/J32 body
 
@@ -567,6 +575,6 @@ The complete final matrices must be preserved as regression controls for future 
 
 The grouped MMQ forward pass is complete for the current packed Qwen and DeepSeek representations.
 
-The retained implementation uses compile-time exact shapes, J64/J32/J16/J80 only where measured, separate full and bounded tail bodies, device row tasks only for large gate/up groups, two-block down unrolling, pointer-increment gate/up traversal, and deterministic standalone HSACO artifacts. Qwen wins 54/60 latest reference comparisons and DeepSeek wins all 24 routed comparisons, with exact packed-reference outputs throughout.
+The retained implementation uses compile-time exact shapes, J64/J32/J16/J80 only where measured, separate full and bounded tail bodies, device row tasks only for large gate/up groups, two-block down unrolling, pointer-increment gate/up traversal, and deterministic standalone HSACO artifacts. Against the exact target-specific AITER table, Qwen wins 45/60 comparisons and DeepSeek wins 12/24 routed comparisons, with exact packed-reference outputs throughout.
 
-The remaining six Qwen losses and the fixed DeepSeek Q8_0 deficit are representation-level problems. No further local tile or scheduling sweep is planned until a compact reusable decoded representation or transient dense stage is available and can be evaluated end to end.
+The remaining losses are representation-level comparisons against already decoded BF16 weights. Reduced-precision accumulation is also closed by the completed backward controls. No further local tile, accumulator, or scheduling sweep is planned until a compact reusable decoded representation, a transient dense stage, or a new profile-supported arithmetic mechanism can be evaluated end to end.

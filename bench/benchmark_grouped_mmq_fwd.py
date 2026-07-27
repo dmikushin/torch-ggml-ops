@@ -354,7 +354,6 @@ def benchmark_routed_distribution(
     distribution_name: str,
     distribution_index: int,
     weights: RoutedWeights,
-    gmm_config: dict[str, int],
     top_k: int,
 ) -> dict[str, object]:
     rows = batch * args.sequence_length * top_k
@@ -363,6 +362,12 @@ def benchmark_routed_distribution(
     selected_logical = tuple(
         weight.index_select(0, expert_indices).transpose(1, 2)
         for weight in weights.logical
+    )
+    gmm_config = aiter_gmm_config(
+        rows,
+        case.in_features,
+        case.out_features,
+        selected_logical[0].stride(1) == 1,
     )
     input = make_bf16_input(
         rows,
@@ -447,7 +452,6 @@ def benchmark_routed_case(
     tensors: tuple[gguf.ReaderTensor, ...],
 ) -> list[dict[str, object]]:
     weights = load_routed_weights(case, tensors)
-    gmm_config = aiter_gmm_config(case.in_features, case.out_features)
     top_k = args.top_k if args.top_k is not None else case.top_k
     results = [
         benchmark_routed_distribution(
@@ -459,7 +463,6 @@ def benchmark_routed_case(
             distribution_name,
             distribution_index,
             weights,
-            gmm_config,
             top_k,
         )
         for batch_index, batch in enumerate(args.batches)
