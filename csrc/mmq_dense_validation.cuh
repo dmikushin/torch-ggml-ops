@@ -12,6 +12,7 @@ int64_t packed_block_bytes(int64_t quant_type) {
         case GGML_TYPE_IQ2_XXS: return sizeof(block_iq2_xxs);
         case GGML_TYPE_IQ2_S: return sizeof(block_iq2_s);
         case GGML_TYPE_IQ4_NL: return sizeof(block_iq4_nl);
+        case GGML_TYPE_IQ3_S: return sizeof(block_iq3_s);
         case GGML_TYPE_IQ4_XS: return sizeof(block_iq4_xs);
         default:
             STD_TORCH_CHECK(false, "unsupported quant_type: ", quant_type);

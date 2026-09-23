@@ -15,7 +15,8 @@ QUANTIZES_ACTIVATIONS = torch.version.hip is not None
 DENSE_MMQ_QUANT_TYPES = (
     frozenset({11, 12, 13, 14, 8})  # Q3_K, Q4_K, Q5_K, Q6_K, Q8_0
     if QUANTIZES_ACTIVATIONS
-    else frozenset({8, 12, 13, 14, 20, 23})  # Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS
+    # Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ3_S, IQ4_XS
+    else frozenset({8, 11, 12, 13, 14, 20, 21, 23})
 )
 
 

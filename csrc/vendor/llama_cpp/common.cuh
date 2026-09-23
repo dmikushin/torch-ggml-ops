@@ -77,6 +77,7 @@ enum ggml_type : int32_t {
     GGML_TYPE_Q6_K = 14,
     GGML_TYPE_IQ2_XXS = 16,
     GGML_TYPE_IQ4_NL = 20,
+    GGML_TYPE_IQ3_S = 21,
     GGML_TYPE_IQ2_S = 22,
     GGML_TYPE_IQ4_XS = 23,
     GGML_TYPE_COUNT = 40,
@@ -204,6 +205,15 @@ struct block_iq4_xs {
 };
 static_assert(sizeof(block_iq4_xs) == 136, "wrong iq4_xs block size");
 
+struct block_iq3_s {
+    half d;
+    uint8_t qs[QK_K / 4];
+    uint8_t qh[QK_K / 32];
+    uint8_t signs[QK_K / 8];
+    uint8_t scales[QK_K / 64];
+};
+static_assert(sizeof(block_iq3_s) == 110, "wrong iq3_s block size");
+
 static constexpr __host__ __device__ int ggml_cuda_get_physical_warp_size() {
     return 32;
 }
@@ -288,3 +298,4 @@ struct ggml_cuda_type_traits {
 
 #include "iq2_s_grid.cuh"
 #include "iq2_xxs_grid.cuh"
+#include "iq3_s_grid.cuh"

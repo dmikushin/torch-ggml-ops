@@ -2,7 +2,7 @@
 //
 // Operator schemas are identical to the HIP backend (csrc/mmq_hip.cu). Dense
 // MMQ forward and input-gradient are implemented by csrc/cuda/mmq_mma.cuh for
-// Q4_K, Q5_K, Q6_K, Q8_0, IQ4_NL and IQ4_XS on sm_80+. Unlike the HIP backend there is no
+// Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ3_S, IQ4_NL and IQ4_XS on sm_80+. Unlike the HIP backend there is no
 // exact-shape deployment table: every shape that passes validation is served
 // by the same tiled kernel. Grouped (MoE) operators are registered with the
 // same schemas but are not implemented on CUDA and fail with a clear error.
@@ -89,12 +89,16 @@ void dispatch_mma(
             return launch_mma<GGML_TYPE_IQ4_NL, backward>(a, w, c, rows, contraction, columns, w_rows, w_row_bytes, stream);
         case GGML_TYPE_IQ4_XS:
             return launch_mma<GGML_TYPE_IQ4_XS, backward>(a, w, c, rows, contraction, columns, w_rows, w_row_bytes, stream);
+        case GGML_TYPE_Q3_K:
+            return launch_mma<GGML_TYPE_Q3_K, backward>(a, w, c, rows, contraction, columns, w_rows, w_row_bytes, stream);
+        case GGML_TYPE_IQ3_S:
+            return launch_mma<GGML_TYPE_IQ3_S, backward>(a, w, c, rows, contraction, columns, w_rows, w_row_bytes, stream);
         default:
             STD_TORCH_CHECK(
                 false,
                 "quant_type ", quant_type,
-                " is not implemented by the CUDA MMQ backend (supported: Q8_0=8, Q4_K=12, "
-                "Q5_K=13, Q6_K=14, IQ4_NL=20, IQ4_XS=23)");
+                " is not implemented by the CUDA MMQ backend (supported: Q8_0=8, Q3_K=11, "
+                "Q4_K=12, Q5_K=13, Q6_K=14, IQ4_NL=20, IQ3_S=21, IQ4_XS=23)");
     }
 }
 

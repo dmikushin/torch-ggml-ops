@@ -11,6 +11,7 @@ CANONICAL_REPOSITORY = ("github.com", "ggml-org/llama.cpp")
 GENERATED_FILES = (
     "iq2_s_grid.cuh",
     "iq2_xxs_grid.cuh",
+    "iq3_s_grid.cuh",
     "mma.cuh",
     "mmq-load-targets.cuh",
     "mmq-vec-dot-q2-k-rolled.cuh",
@@ -267,6 +268,18 @@ def generate(root: Path) -> None:
     _write_generated(
         OUT / "iq2_xxs_grid.cuh",
         "#pragma once\n\n// IQ2_XXS grid codebook from llama.cpp.\n" + table + "\n",
+    )
+
+    table_start = common_text.index("GGML_TABLE_BEGIN(uint32_t, iq3s_grid, 512)")
+    table_end = common_text.index(table_end_marker, table_start) + len(table_end_marker)
+    table = common_text[table_start:table_end]
+    table = table.replace(
+        "GGML_TABLE_BEGIN(uint32_t, iq3s_grid, 512)",
+        "static const __device__ uint32_t iq3s_grid[512] = {",
+    ).replace(table_end_marker, "};")
+    _write_generated(
+        OUT / "iq3_s_grid.cuh",
+        "#pragma once\n\n// IQ3_S grid codebook from llama.cpp.\n" + table + "\n",
     )
 
     _write_generated(

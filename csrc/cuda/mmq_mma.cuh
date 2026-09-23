@@ -181,6 +181,45 @@ __device__ __forceinline__ uint4 decode8<GGML_TYPE_IQ4_XS>(const uint8_t * row, 
     return decode8_iq4(q, 4 * (jj >> 4), d);
 }
 
+// IQ3_S: the 8 values (ib, il) handled by one thread of llama.cpp's
+// dequantize_block_iq3_s (ggml-cuda/convert.cu), with ib = j / 32, il = (j % 32) / 8.
+template <>
+__device__ __forceinline__ uint4 decode8<GGML_TYPE_IQ3_S>(const uint8_t * row, int k) {
+    const block_iq3_s * x = reinterpret_cast<const block_iq3_s *>(row) + (k >> 8);
+    const int j = k & 255;
+    const int ib = j >> 5;
+    const int il = (j & 31) >> 3;
+    const uint8_t * qs = x->qs + 8 * ib;
+    const int qh = __ldg(x->qh + ib);
+    const uint32_t grid1 = iq3s_grid[__ldg(qs + 2 * il + 0) | ((qh << (8 - 2 * il)) & 256)];
+    const uint32_t grid2 = iq3s_grid[__ldg(qs + 2 * il + 1) | ((qh << (7 - 2 * il)) & 256)];
+    const float d = ldg_half(&x->d) * float(1 + 2 * ((__ldg(x->scales + ib / 2) >> 4 * (ib % 2)) & 0xf));
+    const int signs = __ldg(x->signs + 4 * ib + il);
+    float v[8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        v[i + 0] = d * float((grid1 >> (8 * i)) & 0xff) * ((signs >> (i + 0)) & 1 ? -1.0f : 1.0f);
+        v[i + 4] = d * float((grid2 >> (8 * i)) & 0xff) * ((signs >> (i + 4)) & 1 ? -1.0f : 1.0f);
+    }
+    return make_uint4(pack_bf16x2(v[0], v[1]), pack_bf16x2(v[2], v[3]),
+                      pack_bf16x2(v[4], v[5]), pack_bf16x2(v[6], v[7]));
+}
+
+// Q3_K through the upstream per-value decoder (csrc/ck/gguf_decode.cuh). Only a
+// handful of tensors use it in the target checkpoints, so reuse beats a
+// hand-vectorized variant.
+template <>
+__device__ __forceinline__ uint4 decode8<GGML_TYPE_Q3_K>(const uint8_t * row, int k) {
+    const char * packed_row = reinterpret_cast<const char *>(row);
+    float v[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        v[i] = torch_ggml_ops::ck::decode_gguf_value<GGML_TYPE_Q3_K>(packed_row, k >> 8, (k & 255) + i);
+    }
+    return make_uint4(pack_bf16x2(v[0], v[1]), pack_bf16x2(v[2], v[3]),
+                      pack_bf16x2(v[4], v[5]), pack_bf16x2(v[6], v[7]));
+}
+
 // ---------------------------------------------------------------------------
 // PTX wrappers
 // ---------------------------------------------------------------------------

@@ -66,6 +66,8 @@ _TENSORS = {
     "Q8_0": "blk.0.attn_v.weight",
     "IQ4_NL": "blk.0.ffn_up.weight",
     "IQ4_XS": "blk.0.ffn_gate.weight",
+    "Q3_K": "blk.0.ffn_up.weight",
+    "IQ3_S": "blk.0.ffn_down.weight",
 }
 
 
@@ -171,9 +173,9 @@ def test_tolerance_rejects_a_single_corrupted_block(quant_name):
     packed, quant_type, n, k, w32 = _weights(quant_name, 64)
     corrupted = packed.clone()
     # The fp16 super-block scale "d" is little-endian at bytes 0-1 (Q4_K, Q5_K,
-    # Q8_0, IQ4_NL, IQ4_XS) or 208-209 (Q6_K) of a block. XOR 0x04 on its high byte flips the
+    # Q8_0, IQ4_NL, IQ4_XS, IQ3_S) or 208-209 (Q6_K) or 108-109 (Q3_K) of a block. XOR 0x04 on its high byte flips the
     # lowest exponent bit, i.e. doubles or halves one block's scale in one row.
-    offset = 209 if quant_name == "Q6_K" else 1
+    offset = {"Q6_K": 209, "Q3_K": 109}.get(quant_name, 1)
     corrupted[5, offset] ^= 0x04
     x = _randn(16, k, seed=12)
     y = torch_ggml_ops.mmq(x, corrupted, quant_type, n)
@@ -246,10 +248,10 @@ def test_exported_type_set_matches_the_backend():
 
 def test_unsupported_quant_type_fails_clearly():
     k = 256
-    packed = torch.zeros(4, k // 256 * 110, dtype=torch.uint8, device="cuda")  # Q3_K geometry
+    packed = torch.zeros(4, k // 256 * 84, dtype=torch.uint8, device="cuda")  # Q2_K geometry
     x = _randn(8, k, seed=9)
     with pytest.raises(RuntimeError, match="not implemented by the CUDA MMQ backend"):
-        torch_ggml_ops.mmq(x, packed, int(gguf.GGMLQuantizationType.Q3_K), 4)
+        torch_ggml_ops.mmq(x, packed, int(gguf.GGMLQuantizationType.Q2_K), 4)
 
 
 def test_grouped_ops_fail_clearly():
