@@ -3,6 +3,29 @@
 // Minimal llama.cpp compatibility surface for the gfx1151 dense MMQ operator.
 // Derived from ggml/src/ggml-common.h, ggml/src/ggml-cuda/common.cuh, and ggml/src/ggml-cuda/vendors/hip.h.
 
+#if defined(__NVCC__)
+// NVIDIA build: only the GGUF block layouts and quant identifiers below are
+// shared with the CUDA kernels in csrc/cuda/. The RDNA MMA surface is HIP-only.
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <cstdint>
+#include <type_traits>
+
+#define WARP_SIZE 32
+#define GGML_CUDA_CC_AMPERE 800
+
+// Names used by the shared device helpers in csrc/ck/gguf_decode.cuh.
+using __hip_bfloat16 = __nv_bfloat16;
+using __hip_bfloat162 = __nv_bfloat162;
+
+// g++ (nvcc's host compiler) rejects members with constructors inside the
+// anonymous d/dmin aggregates below, so those use the trivial raw storage
+// types; both convert implicitly to half/half2 where a value is read.
+using ggml_half_member = __half_raw;
+using ggml_half2_member = __half2_raw;
+#else
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -26,6 +49,10 @@
 #define __shfl_up_sync(mask, var, delta, width) __shfl_up((var), (delta), (width))
 #define __shfl_xor_sync(mask, var, lane_mask, width) __shfl_xor((var), (lane_mask), (width))
 
+using ggml_half_member = half;
+using ggml_half2_member = half2;
+#endif // defined(__NVCC__)
+
 #define GGML_UNUSED(x) (void)(x)
 template <typename... Args>
 __host__ __device__ constexpr inline void ggml_unused_vars_impl(Args &&...) noexcept {}
@@ -35,8 +62,10 @@ __host__ __device__ constexpr inline void ggml_unused_vars_impl(Args &&...) noex
 
 using ggml_half = half;
 using ggml_half2 = half2;
+#if !defined(__NVCC__)
 using nv_bfloat16 = __hip_bfloat16;
 using nv_bfloat162 = __hip_bfloat162;
+#endif
 
 // GGML quantization identifiers used by the checkpoint.
 enum ggml_type : int32_t {
@@ -92,10 +121,10 @@ struct block_q2_K {
     uint8_t qs[QK_K / 4];
     union {
         struct {
-            half d;
-            half dmin;
+            ggml_half_member d;
+            ggml_half_member dmin;
         };
-        half2 dm;
+        ggml_half2_member dm;
     };
 };
 static_assert(sizeof(block_q2_K) == 84, "wrong q2_K block size");
@@ -111,10 +140,10 @@ static_assert(sizeof(block_q3_K) == 110, "wrong q3_K block size");
 struct block_q4_K {
     union {
         struct {
-            half d;
-            half dmin;
+            ggml_half_member d;
+            ggml_half_member dmin;
         };
-        half2 dm;
+        ggml_half2_member dm;
     };
     uint8_t scales[K_SCALE_SIZE];
     uint8_t qs[QK_K / 2];
@@ -124,10 +153,10 @@ static_assert(sizeof(block_q4_K) == 144, "wrong q4_K block size");
 struct block_q5_K {
     union {
         struct {
-            half d;
-            half dmin;
+            ggml_half_member d;
+            ggml_half_member dmin;
         };
-        half2 dm;
+        ggml_half2_member dm;
     };
     uint8_t scales[K_SCALE_SIZE];
     uint8_t qh[QK_K / 8];
@@ -186,6 +215,8 @@ static __device__ __forceinline__ void ggml_cuda_memcpy_1(
     }
 }
 
+#if !defined(__NVCC__)
+// CUDA provides these SIMD intrinsics natively.
 using int8x4_t = int8_t __attribute__((ext_vector_type(4)));
 using uint8x4_t = uint8_t __attribute__((ext_vector_type(4)));
 
@@ -211,6 +242,7 @@ static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigne
     }
     return c;
 }
+#endif // !defined(__NVCC__)
 
 static __device__ __forceinline__ int get_int_b2(const void * x, const int i32) {
     const uint16_t * x16 = static_cast<const uint16_t *>(x);

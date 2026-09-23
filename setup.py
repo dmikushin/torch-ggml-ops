@@ -5,17 +5,25 @@ import subprocess
 import sys
 from pathlib import Path
 
+import torch
 from setuptools import find_packages, setup
 from torch.utils import cpp_extension
 
 ROOT = Path(__file__).resolve().parent
 CSRC = ROOT / "csrc"
 PACKAGE_KERNEL_DIR = ROOT / "torch_ggml_ops" / "kernels" / "gfx1151"
-SOURCES = [
-    "csrc/mmq_hip.cu",
-    "csrc/mmq_bundle.cpp",
-    "csrc/mmq_bundle_loader.cpp",
-]
+# ROCm builds use the exact-key GGTensile bundle; CUDA builds compile the tiled
+# BF16 tensor-core kernels in csrc/cuda/ directly into the extension.
+IS_ROCM = torch.version.hip is not None
+SOURCES = (
+    [
+        "csrc/mmq_hip.cu",
+        "csrc/mmq_bundle.cpp",
+        "csrc/mmq_bundle_loader.cpp",
+    ]
+    if IS_ROCM
+    else ["csrc/mmq_cuda.cu"]
+)
 HEADER_DEPENDENCIES = [
     path.relative_to(ROOT).as_posix()
     for pattern in ("*.h", "*.cuh")
@@ -47,6 +55,9 @@ _enable_ccache()
 
 class BuildExtension(cpp_extension.BuildExtension):
     def run(self) -> None:
+        if not IS_ROCM:
+            super().run()
+            return
         subprocess.run(
             [sys.executable, "tools/mmq_deployment_bundle.py"],
             cwd=ROOT,
@@ -70,6 +81,8 @@ class BuildExtension(cpp_extension.BuildExtension):
 stable_defines = [
     "-DTORCH_TARGET_VERSION=0x020A000000000000",
     "-DTORCH_STABLE_ONLY",
+    # The stable C shim declares the CUDA stream accessor only under USE_CUDA.
+    *([] if IS_ROCM else ["-DUSE_CUDA"]),
 ]
 
 setup(

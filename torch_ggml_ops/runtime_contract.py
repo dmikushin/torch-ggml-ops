@@ -1,14 +1,21 @@
 """Shared Python facts for the native MMQ launch contracts."""
 
+import torch
+
 QUANT_WORKSPACE_BLOCK_VALUES = 128
 QUANT_WORKSPACE_BLOCK_BYTES = 144
 PAIRED_ROW_TASK_ROWS = 64
 PAIRED_ROW_TASK_QUANT_TYPES = frozenset({11, 22})
+# The ROCm kernels quantize activations to Q8_1 in a caller-owned workspace.
+# The CUDA kernels multiply BF16 activations directly and take an empty one.
+QUANTIZES_ACTIVATIONS = torch.version.hip is not None
 
 
 def quant_workspace_elements(numel: int) -> int:
     """Return the uint8 workspace elements required by quantization."""
     assert numel >= 0
+    if not QUANTIZES_ACTIVATIONS:
+        return 0
     return (numel // QUANT_WORKSPACE_BLOCK_VALUES) * QUANT_WORKSPACE_BLOCK_BYTES
 
 

@@ -28,11 +28,21 @@ int64_t packed_row_bytes(int64_t quant_type, int64_t in_features) {
 constexpr int64_t kQuantWorkspaceBlockBytes = 144;
 constexpr int64_t kQuantWorkspaceBlockValues = 4 * QK8_1;
 
-hipStream_t current_stream(const Tensor & tensor) {
+#if defined(__NVCC__)
+using gpu_stream_t = cudaStream_t;
+// The CUDA kernels multiply BF16 activations directly and never quantize them
+// to Q8_1, so the forward workspace contract is empty on CUDA.
+constexpr bool kQuantizesActivations = false;
+#else
+using gpu_stream_t = hipStream_t;
+constexpr bool kQuantizesActivations = true;
+#endif
+
+gpu_stream_t current_stream(const Tensor & tensor) {
     void * stream_pointer = nullptr;
     TORCH_ERROR_CODE_CHECK(
         aoti_torch_get_current_cuda_stream(tensor.get_device_index(), &stream_pointer));
-    return static_cast<hipStream_t>(stream_pointer);
+    return static_cast<gpu_stream_t>(stream_pointer);
 }
 
 void validate_explicit_buffer(
@@ -137,18 +147,22 @@ DenseMMQShape validate_dense_mmq(
     STD_TORCH_CHECK(
         reinterpret_cast<uintptr_t>(packed_weight.const_data_ptr()) % 16 == 0,
         "packed_weight data pointer must be 16-byte aligned");
+#if !defined(__NVCC__)
     torch_ggml_ops::mmq_bundle::require_exact_deployment(
         torch_ggml_ops::mmq_bundle::kOrdinaryForward,
         static_cast<int32_t>(quant_type),
         static_cast<int>(rows),
         static_cast<int>(out_features),
         static_cast<int>(in_features));
+#endif
     return {
         static_cast<int>(rows),
         static_cast<int>(in_features),
         static_cast<int>(out_features),
-        rows * (in_features / kQuantWorkspaceBlockValues) *
-            kQuantWorkspaceBlockBytes,
+        kQuantizesActivations
+            ? rows * (in_features / kQuantWorkspaceBlockValues) *
+                kQuantWorkspaceBlockBytes
+            : 0,
     };
 }
 
@@ -196,12 +210,14 @@ DenseMMQShape validate_dense_mmq_backward(
     STD_TORCH_CHECK(
         reinterpret_cast<uintptr_t>(packed_weight.const_data_ptr()) % 16 == 0,
         "packed_weight data pointer must be 16-byte aligned");
+#if !defined(__NVCC__)
     torch_ggml_ops::mmq_bundle::require_exact_deployment(
         torch_ggml_ops::mmq_bundle::kOrdinaryBackward,
         static_cast<int32_t>(quant_type),
         static_cast<int>(rows),
         static_cast<int>(in_features),
         static_cast<int>(out_features));
+#endif
     return {
         static_cast<int>(rows),
         static_cast<int>(in_features),
