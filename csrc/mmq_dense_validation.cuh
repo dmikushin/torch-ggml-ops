@@ -11,13 +11,17 @@ int64_t packed_block_bytes(int64_t quant_type) {
         case GGML_TYPE_Q6_K: return sizeof(block_q6_K);
         case GGML_TYPE_IQ2_XXS: return sizeof(block_iq2_xxs);
         case GGML_TYPE_IQ2_S: return sizeof(block_iq2_s);
+        case GGML_TYPE_IQ4_NL: return sizeof(block_iq4_nl);
+        case GGML_TYPE_IQ4_XS: return sizeof(block_iq4_xs);
         default:
             STD_TORCH_CHECK(false, "unsupported quant_type: ", quant_type);
     }
 }
 
 int64_t packed_block_values(int64_t quant_type) {
-    return quant_type == GGML_TYPE_Q8_0 ? QK8_0 : QK_K;
+    return quant_type == GGML_TYPE_Q8_0 ? QK8_0
+        : quant_type == GGML_TYPE_IQ4_NL ? QK4_NL
+        : QK_K;
 }
 
 int64_t packed_row_bytes(int64_t quant_type, int64_t in_features) {

@@ -9,6 +9,14 @@ PAIRED_ROW_TASK_QUANT_TYPES = frozenset({11, 22})
 # The ROCm kernels quantize activations to Q8_1 in a caller-owned workspace.
 # The CUDA kernels multiply BF16 activations directly and take an empty one.
 QUANTIZES_ACTIVATIONS = torch.version.hip is not None
+# GGML quant type ids that the dense ``mmq`` operators accept on this backend.
+# ROCm additionally requires an exact deployed (M, N, K) key; CUDA accepts any
+# shape whose input width is a multiple of 256.
+DENSE_MMQ_QUANT_TYPES = (
+    frozenset({11, 12, 13, 14, 8})  # Q3_K, Q4_K, Q5_K, Q6_K, Q8_0
+    if QUANTIZES_ACTIVATIONS
+    else frozenset({8, 12, 13, 14, 20, 23})  # Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS
+)
 
 
 def quant_workspace_elements(numel: int) -> int:

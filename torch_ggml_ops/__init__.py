@@ -8,6 +8,7 @@ from ._mmq_autograd import (
     MMQFunction,
 )
 from ._mmq_cuda import mmq_grad_input_inplace, mmq_inplace
+from .runtime_contract import DENSE_MMQ_QUANT_TYPES
 
 fixed_grouped_mmq = FixedGroupedMMQFunction.apply
 grouped_mmq = GroupedMMQFunction.apply
@@ -15,6 +16,7 @@ grouped_mmq_pair = GroupedMMQPairFunction.apply
 mmq = MMQFunction.apply
 
 __all__ = [
+    "DENSE_MMQ_QUANT_TYPES",
     "fixed_grouped_mmq",
     "grouped_mmq",
     "grouped_mmq_pair",

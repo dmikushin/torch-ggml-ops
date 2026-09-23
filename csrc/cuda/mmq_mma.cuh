@@ -28,32 +28,8 @@ using torch_ggml_ops::ck::k_min;
 using torch_ggml_ops::ck::k_scale;
 
 // ---------------------------------------------------------------------------
-// GGUF block geometry
+// GGUF block decoding
 // ---------------------------------------------------------------------------
-
-template <ggml_type type>
-struct quant_traits;
-
-template <>
-struct quant_traits<GGML_TYPE_Q8_0> {
-    static constexpr int block_values = QK8_0;
-    static constexpr int block_bytes = sizeof(block_q8_0);
-};
-template <>
-struct quant_traits<GGML_TYPE_Q4_K> {
-    static constexpr int block_values = QK_K;
-    static constexpr int block_bytes = sizeof(block_q4_K);
-};
-template <>
-struct quant_traits<GGML_TYPE_Q5_K> {
-    static constexpr int block_values = QK_K;
-    static constexpr int block_bytes = sizeof(block_q5_K);
-};
-template <>
-struct quant_traits<GGML_TYPE_Q6_K> {
-    static constexpr int block_values = QK_K;
-    static constexpr int block_bytes = sizeof(block_q6_K);
-};
 
 static __device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
     const __nv_bfloat162 pair = __floats2bfloat162_rn(lo, hi);
@@ -158,6 +134,51 @@ __device__ __forceinline__ uint4 decode8<GGML_TYPE_Q8_0>(const uint8_t * row, in
     }
     return make_uint4(pack_bf16x2(v[0], v[1]), pack_bf16x2(v[2], v[3]),
                       pack_bf16x2(v[4], v[5]), pack_bf16x2(v[6], v[7]));
+}
+
+// IQ4_NL / IQ4_XS non-linear 4-bit codebook (kvalues_iq4nl in ggml-common.h),
+// as four little-endian words so a lookup is one __byte_perm, not a
+// divergent constant-memory load.
+static __device__ __forceinline__ int iq4nl_value(int index) {
+    constexpr uint32_t t0 = 0xBFAD9881u;   // -127, -104,  -83,  -65
+    constexpr uint32_t t1 = 0xF6EADDCFu;   //  -49,  -35,  -22,  -10
+    constexpr uint32_t t2 = 0x26190D01u;   //    1,   13,   25,   38
+    constexpr uint32_t t3 = 0x71594535u;   //   53,   69,   89,  113
+    const uint32_t word = index < 8 ? __byte_perm(t0, t1, index) : __byte_perm(t2, t3, index & 7);
+    return static_cast<int8_t>(word & 0xff);
+}
+
+// 8 values of one 32-value IQ4 group: nibbles of qs[jj % 16 ...], low nibble
+// for jj < 16, high nibble for jj >= 16.
+static __device__ __forceinline__ uint4 decode8_iq4(uint2 q, int shift, float d) {
+    float v[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        v[i] = d * float(iq4nl_value((byte_of(q, i) >> shift) & 0x0f));
+    }
+    return make_uint4(pack_bf16x2(v[0], v[1]), pack_bf16x2(v[2], v[3]),
+                      pack_bf16x2(v[4], v[5]), pack_bf16x2(v[6], v[7]));
+}
+
+template <>
+__device__ __forceinline__ uint4 decode8<GGML_TYPE_IQ4_NL>(const uint8_t * row, int k) {
+    const uint8_t * block = row + (k >> 5) * int(sizeof(block_iq4_nl));
+    const int jj = k & 31;
+    const uint2 q = load8_u16(block + 2 + (jj & 15));
+    return decode8_iq4(q, 4 * (jj >> 4), ldg_half(block));
+}
+
+template <>
+__device__ __forceinline__ uint4 decode8<GGML_TYPE_IQ4_XS>(const uint8_t * row, int k) {
+    const block_iq4_xs * block = reinterpret_cast<const block_iq4_xs *>(row) + (k >> 8);
+    const int j = k & 255;
+    const int ib = j >> 5;
+    const int jj = j & 31;
+    const int low = (__ldg(block->scales_l + (ib >> 1)) >> (4 * (ib & 1))) & 0x0f;
+    const int high = (__ldg(&block->scales_h) >> (2 * ib)) & 0x03;
+    const float d = ldg_half(&block->d) * float((low | (high << 4)) - 32);
+    const uint2 q = __ldg(reinterpret_cast<const uint2 *>(block->qs + 16 * ib + (jj & 15)));
+    return decode8_iq4(q, 4 * (jj >> 4), d);
 }
 
 // ---------------------------------------------------------------------------

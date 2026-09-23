@@ -23,7 +23,7 @@ Tolerances, as normalized RMSE = ||actual - ref|| / ||ref||:
   admits near-tie rounding flips. This criterion does not dilute with output
   size, unlike NRMSE.
 * vs ``bf16``: ``BF16_NRMSE`` = 2e-3. The unavoidable output-rounding floor
-  was measured at 1.63e-3..1.69e-3 for all four types (random normal inputs);
+  was measured at 1.63e-3..1.69e-3 for Q4_K/Q5_K/Q6_K/Q8_0 (random normal inputs);
   an indexing or scale bug produces errors of order 1.
 * vs ``fp32``: ``FP32_NRMSE`` = 5e-3. Rounding decoded weights to BF16 adds
   another ~1.65e-3 (measured) on top of the output rounding.
@@ -64,6 +64,8 @@ _TENSORS = {
     "Q5_K": "blk.0.ffn_down.weight",
     "Q6_K": "output.weight",
     "Q8_0": "blk.0.attn_v.weight",
+    "IQ4_NL": "blk.0.ffn_up.weight",
+    "IQ4_XS": "blk.0.ffn_gate.weight",
 }
 
 
@@ -169,7 +171,7 @@ def test_tolerance_rejects_a_single_corrupted_block(quant_name):
     packed, quant_type, n, k, w32 = _weights(quant_name, 64)
     corrupted = packed.clone()
     # The fp16 super-block scale "d" is little-endian at bytes 0-1 (Q4_K, Q5_K,
-    # Q8_0) or 208-209 (Q6_K) of a block. XOR 0x04 on its high byte flips the
+    # Q8_0, IQ4_NL, IQ4_XS) or 208-209 (Q6_K) of a block. XOR 0x04 on its high byte flips the
     # lowest exponent bit, i.e. doubles or halves one block's scale in one row.
     offset = 209 if quant_name == "Q6_K" else 1
     corrupted[5, offset] ^= 0x04
@@ -234,6 +236,12 @@ def test_compiles_fullgraph():
         return torch_ggml_ops.mmq(x, packed, quant_type, n)
 
     torch.testing.assert_close(f(x, packed), torch_ggml_ops.mmq(x, packed, quant_type, n), rtol=0, atol=0)
+
+
+def test_exported_type_set_matches_the_backend():
+    assert torch_ggml_ops.DENSE_MMQ_QUANT_TYPES == {
+        int(gguf.GGMLQuantizationType[name]) for name in _TENSORS
+    }
 
 
 def test_unsupported_quant_type_fails_clearly():
